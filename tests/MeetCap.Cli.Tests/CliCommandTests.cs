@@ -206,10 +206,19 @@ public class CliCommandTests
 
         try
         {
-            var result = harness.Run("--config-dir", alternate, "config", "init");
+            // Assert on the rendered path first so a failure reports the directory the
+            // command actually resolved instead of only a missing file.
+            var pathResult = harness.Run("--config-dir", alternate, "config", "path");
+            Assert.Equal(0, pathResult.ExitCode);
+            Assert.Contains(alternate, pathResult.Output);
 
-            Assert.Equal(0, result.ExitCode);
-            Assert.True(File.Exists(Path.Combine(alternate, "config.toml")));
+            var initResult = harness.Run("--config-dir", alternate, "config", "init");
+            Assert.Equal(0, initResult.ExitCode);
+            Assert.Contains(alternate, initResult.Output);
+            Assert.True(
+                File.Exists(Path.Combine(alternate, "config.toml")),
+                $"expected config.toml under {alternate}; output was: {initResult.Output}");
+            Assert.False(File.Exists(harness.ConfigFilePath));
         }
         finally
         {

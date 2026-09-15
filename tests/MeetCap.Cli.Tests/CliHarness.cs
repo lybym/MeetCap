@@ -43,11 +43,13 @@ internal sealed class CliHarness : IDisposable
         using var output = new StringWriter();
         using var error = new StringWriter();
 
+        // No explicit store: the harness relies on the production store resolution so
+        // the one-shot --config-dir override is exercised end to end.
         var exitCode = Program.Run(
             args,
             Environment,
-            _store,
-            new InvocationConfiguration { Output = output, Error = error });
+            configurationStore: null,
+            invocationConfiguration: new InvocationConfiguration { Output = output, Error = error });
 
         // Capture the text after Run returns; the harness owns the writers and the
         // production pipeline does not write once Run has completed.
