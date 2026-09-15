@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>MeetCap.Cli</RootNamespace>
+    <AssemblyName>meetcap</AssemblyName>
+    <PackageId>MeetCap.Cli</PackageId>
+    <Description>MeetCap command-line interface and composition root.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MeetCap.Core\MeetCap.Core.csproj" />
+    <ProjectReference Include="..\MeetCap.Persistence\MeetCap.Persistence.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="10.0.12" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="10.0.12" />
+  </ItemGroup>
+
+</Project>

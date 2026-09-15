@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <RootNamespace>MeetCap.Persistence</RootNamespace>
+    <AssemblyName>MeetCap.Persistence</AssemblyName>
+    <PackageId>MeetCap.Persistence</PackageId>
+    <Description>MeetCap local persistence: TOML configuration store and SQLite migration bootstrap.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MeetCap.Core\MeetCap.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Numbered migration scripts applied in order by SqliteMigrator. -->
+    <EmbeddedResource Include="Migrations\*.sql" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.12" />
+    <PackageReference Include="Tomlyn" Version="2.10.1" />
+  </ItemGroup>
+
+</Project>
