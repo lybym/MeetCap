@@ -87,21 +87,73 @@ public class SqliteMigratorTests
     }
 
     [Fact]
-    public void Migrate_RecordsVersionOne()
+    public void Migrate_RecordsEveryEmbeddedVersion()
     {
         var db = NewDb();
         try
         {
             new SqliteMigrator().Migrate(db);
             using var c = Open(db);
-            Assert.Equal(1, Count(c, "SELECT COUNT(*) FROM schema_migrations"));
-            Assert.Equal(1, Count(c, "SELECT version FROM schema_migrations"));
+            var expected = ExpectedVersions();
+            Assert.Equal(expected.Count, Count(c, "SELECT COUNT(*) FROM schema_migrations"));
+
+            using var cmd = new SqliteCommand("SELECT version FROM schema_migrations ORDER BY version", c);
+            var applied = new List<int>();
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                applied.Add(reader.GetInt32(0));
+            }
+
+            Assert.Equal(expected, applied);
         }
         finally
         {
             Cleanup(db);
         }
     }
+
+    [Fact]
+    public void Migrations_ClaimDistinctVersionNumbers()
+    {
+        // Two scripts sharing a version would make the second one look already applied,
+        // so its tables would never be created at runtime. This asserts the embedded set
+        // is well formed. Version 0002 is deliberately free because the M1 capture
+        // migration (issue #3, PR #12) claims it.
+        var versions = new SqliteMigrator().GetMigrations().Select(m => m.Version).ToArray();
+
+        Assert.Equal(versions.Length, versions.Distinct().Count());
+        Assert.Contains(1, versions);
+        Assert.Contains(3, versions);
+        Assert.DoesNotContain(2, versions);
+    }
+
+    [Fact]
+    public void Migrate_CreatesAsrJobsTableWithStatusCheckConstraint()
+    {
+        var db = NewDb();
+        try
+        {
+            new SqliteMigrator().Migrate(db);
+            using var c = Open(db);
+            Assert.True(TableExists(c, "asr_jobs"));
+
+            using var cmd = new SqliteCommand(
+                "INSERT INTO asr_jobs (id, session_id, source, tier, provider, input_artifact, status, " +
+                "provider_request_id, created_at, updated_at) " +
+                "VALUES ('job_1', 'ses_1', 'import', 'standard', 'volcengine', 'audio/import/a.wav', " +
+                "'not_a_status', 'req', @now, @now)", c);
+            cmd.Parameters.AddWithValue("@now", "2026-09-15T00:00:00Z");
+            Assert.ThrowsAny<SqliteException>(() => cmd.ExecuteNonQuery());
+        }
+        finally
+        {
+            Cleanup(db);
+        }
+    }
+
+    private static IReadOnlyList<int> ExpectedVersions() =>
+        new SqliteMigrator().GetMigrations().Select(m => m.Version).OrderBy(v => v).ToArray();
 
     [Fact]
     public void Migrate_IsIdempotent()
@@ -113,7 +165,7 @@ public class SqliteMigratorTests
             migrator.Migrate(db);
             migrator.Migrate(db); // must not throw or duplicate
             using var c = Open(db);
-            Assert.Equal(1, Count(c, "SELECT COUNT(*) FROM schema_migrations"));
+            Assert.Equal(ExpectedVersions().Count, Count(c, "SELECT COUNT(*) FROM schema_migrations"));
         }
         finally
         {
@@ -179,8 +231,8 @@ public class SqliteMigratorTests
             Assert.Empty(failures);
             using var c = Open(db);
             Assert.True(TableExists(c, "sessions"));
-            Assert.Equal(1, Count(c, "SELECT COUNT(*) FROM schema_migrations"));
-            Assert.Equal(1, Count(c, "SELECT version FROM schema_migrations"));
+            Assert.True(TableExists(c, "asr_jobs"));
+            Assert.Equal(ExpectedVersions().Count, Count(c, "SELECT COUNT(*) FROM schema_migrations"));
         }
         finally
         {
@@ -198,11 +250,11 @@ public class SqliteMigratorTests
             migrator.Migrate(db);
 
             // A second run stands in for a later process start: it must observe the
-            // already-applied version instead of failing on the primary key.
+            // already-applied versions instead of failing on the primary key.
             new SqliteMigrator().Migrate(db);
 
             using var c = Open(db);
-            Assert.Equal(1, Count(c, "SELECT COUNT(*) FROM schema_migrations"));
+            Assert.Equal(ExpectedVersions().Count, Count(c, "SELECT COUNT(*) FROM schema_migrations"));
         }
         finally
         {

@@ -12,6 +12,9 @@
   <ItemGroup>
     <ProjectReference Include="..\MeetCap.Core\MeetCap.Core.csproj" />
     <ProjectReference Include="..\MeetCap.Persistence\MeetCap.Persistence.csproj" />
+    <ProjectReference Include="..\MeetCap.AudioPipeline\MeetCap.AudioPipeline.csproj" />
+    <ProjectReference Include="..\MeetCap.Asr\MeetCap.Asr.csproj" />
+    <ProjectReference Include="..\MeetCap.Asr.Volcengine\MeetCap.Asr.Volcengine.csproj" />
   </ItemGroup>
 
   <ItemGroup>

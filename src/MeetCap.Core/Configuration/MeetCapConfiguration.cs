@@ -20,6 +20,8 @@ public sealed class MeetCapConfiguration
 
     public StorageSection Storage { get; set; } = new();
 
+    public MediaSection Media { get; set; } = new();
+
     public AsrSection Asr { get; set; } = new();
 
     public SpeakersSection Speakers { get; set; } = new();

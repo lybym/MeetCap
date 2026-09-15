@@ -27,6 +27,32 @@ Imported recordings remain a first-class workflow:
 meetcap import .\meeting.m4a --title "Project Review"
 ```
 
+## Implemented so far
+
+M0 (skeleton) and M3 (import + file ASR) are implemented:
+
+```powershell
+meetcap config init
+meetcap config validate
+meetcap config show
+meetcap status
+meetcap import .\meeting.m4a --title "Project Review"   # inspect, normalize, file ASR, transcript
+meetcap asr resume                                     # continue queued/retried ASR jobs
+```
+
+An import:
+
+1. inspects the file with FFprobe and normalizes it with FFmpeg only when required;
+2. copies the source into `sessions/<id>/audio/import/` (the original file is never modified);
+3. creates a normal session with `source_type=import` and queues a persistent file-ASR job;
+4. retains the raw provider response and writes `transcript/raw.jsonl` plus `transcript/live.md`.
+
+Provider speaker labels are preserved exactly as anonymous, session-scoped data. They are never
+treated as persistent human identities.
+
+Real Volcengine transcription is not verified by CI: no credentials are available there, so the
+provider boundary is mocked in tests.
+
 ## Planned CLI
 
 ```powershell

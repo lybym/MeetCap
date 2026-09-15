@@ -71,6 +71,12 @@ public sealed class SqliteMigrator
     }
 
     /// <summary>The migration resources bundled with this assembly, ordered by version.</summary>
+    /// <remarks>
+    /// Versions are keyed in <c>schema_migrations(version INTEGER PRIMARY KEY)</c>, so
+    /// two scripts claiming the same number would make the second one silently look
+    /// already-applied and its tables would never be created. That is a silent schema
+    /// corruption, so a duplicate version is rejected loudly instead.
+    /// </remarks>
     internal IReadOnlyList<(int Version, string ResourceName)> GetMigrations()
     {
         var names = _assembly.GetManifestResourceNames()
@@ -78,8 +84,21 @@ public sealed class SqliteMigrator
             .Select(n => (Version: TryParseVersion(n), ResourceName: n))
             .Where(t => t.Version.HasValue)
             .Select(t => (t.Version!.Value, t.ResourceName))
-            .OrderBy(t => t.Value)
+            .OrderBy(t => t.Value, Comparer<int>.Default)
+            .ThenBy(t => t.ResourceName, StringComparer.Ordinal)
             .ToList();
+
+        var duplicate = names
+            .GroupBy(t => t.Value)
+            .FirstOrDefault(group => group.Count() > 1);
+        if (duplicate is not null)
+        {
+            throw new InvalidOperationException(
+                $"Migration version {duplicate.Key} is claimed by more than one script: " +
+                string.Join(", ", duplicate.Select(t => t.ResourceName)) +
+                ". Rename one of them to the next free version so that every migration is applied.");
+        }
+
         return names;
     }
 

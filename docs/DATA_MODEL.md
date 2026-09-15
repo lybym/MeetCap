@@ -33,6 +33,9 @@ sessions/<session-id>/
       000002.wav
     loopback/
       000001.wav
+    import/
+      meeting.m4a
+      normalized.wav
 
   asr/
     batches/
@@ -53,6 +56,12 @@ sessions/<session-id>/
 
 For offline mode, `audio/loopback/` is absent.
 
+`audio/import/` holds the materialized import source and, when normalization was required,
+the normalized derivative. `transcript/raw.jsonl` is the mandatory normalized transcript;
+`transcript/live.md` is its Markdown rendering. `final.jsonl` / `final.md` arrive with speaker
+attribution and optional post-processing (M6+); an M3 import session stops at `raw.jsonl` +
+`live.md`.
+
 ## 3. `session.json`
 
 ```json
@@ -67,6 +76,28 @@ For offline mode, `audio/loopback/` is absent.
   "tracks": ["mic", "loopback"]
 }
 ```
+
+Import sessions add the source artifact mapping (M3), which is what preserves provenance
+without ever mutating the user's original file:
+
+```json
+{
+  "source_artifacts": [
+    {
+      "role": "original",
+      "original_path": "C:\\recordings\\meeting.m4a",
+      "stored_path": "C:\\...\\sessions\\ses_01...\\audio\\import\\meeting.m4a",
+      "file_name": "meeting.m4a",
+      "byte_length": 12345678,
+      "sha256": "..."
+    }
+  ]
+}
+```
+
+`role` is `original` or `normalized`. The mapping lives in the durable session document
+rather than a new table: section 11 forbids creating tables ahead of their feature, and
+section 6 already indexes the artifact each ASR job consumed through `input_artifact`.
 
 ## 4. `events.jsonl`
 
@@ -120,13 +151,40 @@ status
 provider_request_id
 attempt_count
 next_retry_at
+request_metadata_path
 raw_response_path
 normalized_result_path
 error_code
 error_message
+duration_ms
+speaker_info_requested
+speaker_info_returned
+estimated_cost_cny
+submitted_at
+completed_at
 created_at
 updated_at
 ```
+
+Status values (section 12 of `ARCHITECTURE.md`): `pending`, `submitting`, `submitted`,
+`polling`, `succeeded`, `retry_wait`, `failed`, `cancelled`.
+
+Notes:
+
+- `provider_request_id` is allocated when the job is created and persisted **before** the
+  first submit. It is the provider's task identifier, so a retry — including a retry after a
+  process restart — addresses the same task instead of creating a second billable one.
+- `input_artifact` is stored session-relative (for example `audio/import/normalized.wav`) so
+  the artifact contract survives moving the data root.
+- `attempt_count` is incremented when the job enters `submitting`, so a submit that never
+  returns still consumes an attempt and cannot retry forever.
+- `next_retry_at` makes the backoff durable: a restart resumes the same schedule.
+- `request_metadata_path` points at `asr/jobs/<job-id>/request.json`, which is sanitized —
+  credentials and authorization headers never appear in it, and the inline audio payload is
+  replaced by its byte count.
+- `raw_response_path` and `normalized_result_path` point at `response.json` and
+  `normalized.jsonl`. The raw response is written before parsing so a parser fix never
+  requires re-billing the same audio.
 
 ## 7. Transcript segment
 
@@ -233,4 +291,11 @@ JSONL is the stable machine-consumption format. Agents should not need to parse 
 SQLite schema is created and evolved by numbered, embedded SQL migration scripts applied by `SqliteMigrator` (`src/MeetCap.Persistence/Storage/SqliteMigrator.cs`). Applied versions are recorded in `schema_migrations`. Re-running migrations is idempotent; already-applied migrations are skipped.
 
 - **0001_sessions** (M0): creates `schema_migrations` and the `sessions` table (section 1) with `CHECK` constraints on `mode` (`offline`/`online`/`import`) and `source_type` (`live`/`import`), plus convenience indexes on `status` and `started_at`.
-- Later milestones add `audio_chunks`, `asr_jobs`, `speakers`, `speaker_embeddings` and `speaker_assignments` as their features are implemented, each as a new numbered migration. No table is created ahead of its feature (section 11).
+- **0003_asr_jobs** (M3): creates the `asr_jobs` table (section 6) with a `CHECK` constraint on `status` and indexes on `status`, `session_id`, and `next_retry_at`.
+- Later milestones add `audio_chunks`, `speakers`, `speaker_embeddings` and `speaker_assignments` as their features are implemented, each as a new numbered migration. No table is created ahead of its feature (section 11).
+
+Version `0002` is intentionally unused in this repository's `main` line: it is claimed by the
+M1 capture migration (`0002_audio_chunks.sql`, issue #3), which is developed in parallel. Two
+scripts claiming one version would make the second look already applied and its tables would
+never be created, so `SqliteMigrator` now also fails loudly if two embedded scripts resolve to
+the same version.

@@ -1,0 +1,161 @@
+using MeetCap.Core.Asr;
+using MeetCap.Core.Sessions;
+
+namespace MeetCap.Asr.Tests;
+
+/// <summary>In-memory provider boundary. No test reaches the live service.</summary>
+internal sealed class FakeAsrProvider : IAsrProvider
+{
+    private readonly Queue<AsrPollResult> _polls = new();
+
+    public string Name => "volcengine";
+
+    public List<AsrFileRequest> Submissions { get; } = new();
+
+    public List<string> PolledRequestIds { get; } = new();
+
+    /// <summary>Overrides the submit behaviour; throw to script a failure.</summary>
+    public Func<AsrFileRequest, AsrSubmission>? OnSubmit { get; set; }
+
+    /// <summary>Overrides polling. When null the queued results are used.</summary>
+    public Func<AsrFileRequest, AsrPollResult>? OnPoll { get; set; }
+
+    public void EnqueuePoll(params AsrPollResult[] results)
+    {
+        foreach (var result in results)
+        {
+            _polls.Enqueue(result);
+        }
+    }
+
+    public Task<AsrSubmission> SubmitFileAsync(AsrFileRequest request, CancellationToken cancellationToken = default)
+    {
+        Submissions.Add(request);
+        if (OnSubmit is not null)
+        {
+            return Task.FromResult(OnSubmit(request));
+        }
+
+        return Task.FromResult(new AsrSubmission
+        {
+            ProviderRequestId = request.ProviderRequestId,
+            SanitizedRequestJson = "{\"job_id\":\"" + request.JobId + "\"}",
+        });
+    }
+
+    public Task<AsrPollResult> GetResultAsync(
+        AsrSubmission submission,
+        AsrFileRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        PolledRequestIds.Add(submission.ProviderRequestId);
+        if (OnPoll is not null)
+        {
+            return Task.FromResult(OnPoll(request));
+        }
+
+        return Task.FromResult(_polls.Count > 0 ? _polls.Dequeue() : AsrPollResult.Pending());
+    }
+}
+
+/// <summary>Deterministic normalizer stand-in, so processor tests do not depend on provider JSON.</summary>
+internal sealed class FakeNormalizer : IAsrResponseNormalizer
+{
+    public Func<string, AsrNormalizationContext, AsrNormalizationResult>? OnNormalize { get; set; }
+
+    public AsrNormalizationResult Normalize(string rawResponseJson, AsrNormalizationContext context)
+    {
+        if (OnNormalize is not null)
+        {
+            return OnNormalize(rawResponseJson, context);
+        }
+
+        return new AsrNormalizationResult
+        {
+            Segments = new[]
+            {
+                new Core.Transcripts.TranscriptSegment
+                {
+                    SegmentId = "seg_1",
+                    SessionId = context.SessionId,
+                    Source = context.Source,
+                    StartMs = 0,
+                    EndMs = 1000,
+                    RawText = "hello",
+                    SpeakerLabel = "speaker_1",
+                    ProviderJobId = context.JobId,
+                },
+            },
+            SpeakerInfoReturned = true,
+        };
+    }
+}
+
+internal sealed class InMemoryAsrJobStore : IAsrJobStore
+{
+    private readonly Dictionary<string, AsrJob> _jobs = new(StringComparer.Ordinal);
+
+    public void Create(AsrJob job) => _jobs[job.Id] = job;
+
+    public AsrJob? Get(string jobId) => _jobs.TryGetValue(jobId, out var job) ? job : null;
+
+    public IReadOnlyList<AsrJob> ListBySession(string sessionId) =>
+        _jobs.Values.Where(j => j.SessionId == sessionId).OrderBy(j => j.CreatedAt).ToArray();
+
+    public IReadOnlyList<AsrJob> ListResumable(DateTimeOffset now, int limit, string? sessionId = null)
+    {
+        if (limit <= 0)
+        {
+            return Array.Empty<AsrJob>();
+        }
+
+        return _jobs.Values
+            .Where(j => AsrJobStatuses.IsResumable(j.Status))
+            .Where(j => j.NextRetryAt is null || j.NextRetryAt <= now)
+            .Where(j => sessionId is null || j.SessionId == sessionId)
+            .OrderBy(j => j.CreatedAt)
+            .ThenBy(j => j.Id, StringComparer.Ordinal)
+            .Take(limit)
+            .ToArray();
+    }
+
+    public void Update(AsrJob job) => _jobs[job.Id] = job;
+
+    public int CountByStatus(AsrJobStatus status) => _jobs.Values.Count(j => j.Status == status);
+}
+
+internal sealed class InMemorySessionStore : ISessionStore
+{
+    private readonly Dictionary<string, Session> _sessions = new(StringComparer.Ordinal);
+
+    public void Create(Session session) => _sessions[session.Id] = session;
+
+    public Session? Get(string sessionId) => _sessions.TryGetValue(sessionId, out var session) ? session : null;
+
+    public void Update(Session session) => _sessions[session.Id] = session;
+
+    public int CountActive() => _sessions.Values.Count(s => SessionStatus.IsActive(s.Status));
+}
+
+/// <summary>Records events instead of writing events.jsonl; session.json is not the concern here.</summary>
+internal sealed class RecordingArtifactWriter : ISessionArtifactWriter
+{
+    public List<string> Events { get; } = new();
+
+    public void EnsureLayout(SessionArtifactPaths paths) => Directory.CreateDirectory(paths.SessionDirectory);
+
+    public string WriteSessionDocument(SessionArtifactPaths paths, SessionDocument document)
+    {
+        EnsureLayout(paths);
+        File.WriteAllText(paths.SessionJson, "{}");
+        return paths.SessionJson;
+    }
+
+    public SessionDocument? ReadSessionDocument(SessionArtifactPaths paths) => null;
+
+    public void AppendEvent(
+        SessionArtifactPaths paths,
+        string name,
+        long atMs,
+        IReadOnlyDictionary<string, object?>? details = null) => Events.Add(name);
+}

@@ -1,4 +1,5 @@
 using MeetCap.Core.Configuration;
+using System.Reflection;
 using Xunit;
 
 namespace MeetCap.Core.Tests.Architecture;
@@ -60,6 +61,136 @@ public class CoreDependencyBoundaryTests
             "PackageReference",
             File.ReadAllText(csproj),
             StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// M3 added the ASR, media, and transcript abstractions to Core. They are the
+    /// contracts the new infrastructure projects implement, so the boundary is asserted
+    /// from the other direction too: not only must Core avoid *referencing*
+    /// FFMpegCore/Polly/Volcengine/SQLite assemblies, none of their types may appear in
+    /// Core's public API surface, or a provider type would have leaked into the domain
+    /// contract.
+    /// </summary>
+    [Fact]
+    public void CorePublicApiSurface_ExposesNoInfrastructureTypes()
+    {
+        var assembly = typeof(MeetCapConfiguration).Assembly;
+        var violations = new List<string>();
+
+        foreach (var type in assembly.GetExportedTypes())
+        {
+            foreach (var candidate in Flatten(type))
+            {
+                RecordIfForbidden(candidate, $"{type.FullName} (declaration)", violations);
+            }
+
+            const BindingFlags flags = BindingFlags.Public | BindingFlags.Instance
+                | BindingFlags.Static | BindingFlags.DeclaredOnly;
+            foreach (var member in type.GetMembers(flags))
+            {
+                foreach (var candidate in TypesOf(member))
+                {
+                    foreach (var flattened in Flatten(candidate))
+                    {
+                        RecordIfForbidden(flattened, $"{type.FullName}.{member.Name}", violations);
+                    }
+                }
+            }
+        }
+
+        Assert.True(
+            violations.Count == 0,
+            "MeetCap.Core's public API must expose no infrastructure types, but exposes: " +
+            string.Join(
+                "; ",
+                violations.Distinct(StringComparer.Ordinal).OrderBy(v => v, StringComparer.Ordinal)));
+    }
+
+    /// <summary>
+    /// The contracts M3 adds are the ones infrastructure must implement. Asserting they
+    /// exist keeps a future refactor from quietly moving a contract into an adapter.
+    /// </summary>
+    [Fact]
+    public void M3Contracts_AreOwnedByCore()
+    {
+        var assembly = typeof(MeetCapConfiguration).Assembly;
+        string[] expected =
+        {
+            "MeetCap.Core.Asr.IAsrProvider",
+            "MeetCap.Core.Asr.IAsrJobStore",
+            "MeetCap.Core.Asr.IAsrResponseNormalizer",
+            "MeetCap.Core.Media.IMediaPipeline",
+            "MeetCap.Core.Sessions.ISessionStore",
+            "MeetCap.Core.Sessions.ISessionArtifactWriter",
+            "MeetCap.Core.Transcripts.ITranscriptStore",
+            "MeetCap.Core.Transcripts.TranscriptSegment",
+        };
+
+        foreach (var name in expected)
+        {
+            Assert.NotNull(assembly.GetType(name));
+        }
+    }
+
+    private static void RecordIfForbidden(Type type, string owner, List<string> violations)
+    {
+        var assemblyName = type.Assembly.GetName().Name ?? string.Empty;
+        if (IsForbidden(assemblyName))
+        {
+            violations.Add($"{owner} -> {type.FullName} [{assemblyName}]");
+        }
+    }
+
+    private static IEnumerable<Type> TypesOf(MemberInfo member)
+    {
+        switch (member)
+        {
+            case PropertyInfo property:
+                yield return property.PropertyType;
+                break;
+            case FieldInfo field:
+                yield return field.FieldType;
+                break;
+            case MethodInfo method:
+                yield return method.ReturnType;
+                foreach (var parameter in method.GetParameters())
+                {
+                    yield return parameter.ParameterType;
+                }
+
+                break;
+            case ConstructorInfo constructor:
+                foreach (var parameter in constructor.GetParameters())
+                {
+                    yield return parameter.ParameterType;
+                }
+
+                break;
+        }
+    }
+
+    private static IEnumerable<Type> Flatten(Type type)
+    {
+        yield return type;
+
+        if (type.IsGenericType)
+        {
+            foreach (var argument in type.GetGenericArguments())
+            {
+                foreach (var nested in Flatten(argument))
+                {
+                    yield return nested;
+                }
+            }
+        }
+
+        if (type.HasElementType && type.GetElementType() is { } element)
+        {
+            foreach (var nested in Flatten(element))
+            {
+                yield return nested;
+            }
+        }
     }
 
     private static bool IsForbidden(string assemblyName)
