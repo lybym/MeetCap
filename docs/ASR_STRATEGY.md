@@ -25,7 +25,7 @@ Seed-ASR 2.0 recording-file recognition: 0.8 RMB/hour
 Seed-ASR 2.0 streaming recognition:      1.0 RMB/hour
 ```
 
-Pricing and resource IDs are provider configuration, not hard-coded product guarantees.
+Pricing, service capabilities, and resource IDs are provider configuration, not hard-coded product guarantees.
 
 References:
 
@@ -37,7 +37,7 @@ References:
 ## 3. Default live-session algorithm
 
 ```text
-WASAPI capture
+NAudio/WASAPI capture
     |
     v
 60-second durable chunks
@@ -52,7 +52,10 @@ closed chunks
 persistent file-ASR job
     |
     v
-provider submit/query
+Volcengine submit/query
+    |
+    +--> transcript + timestamps
+    +--> anonymous speaker labels (where supported)
     |
     v
 raw response
@@ -105,6 +108,10 @@ Permanent auth/configuration errors become `failed`.
 
 Retry state must survive restart.
 
+Polly SHOULD handle transient request execution concerns such as exponential backoff, jitter, timeout, and circuit-breaker behavior inside the Volcengine adapter.
+
+The persistent SQLite ASR job state machine remains authoritative across process restarts. Polly does not replace it.
+
 ## 7. No automatic streaming fallback
 
 Forbidden:
@@ -129,19 +136,51 @@ If enabled, the application may perform a final long-context file-ASR pass after
 
 Online mode submits mic and loopback separately, so billable audio can approach twice wall-clock duration. This is acceptable initially because source attribution is more important than premature VAD optimization.
 
-## 10. Speaker diarization
+## 10. Speaker diarization vs persistent identity
 
-Use provider-returned speaker labels where available. Do not add a second diarization engine until real recordings demonstrate the need.
+These are separate responsibilities.
+
+### Anonymous diarization
+
+Default MVP source:
+
+```text
+Volcengine BigASR
+  -> timestamps
+  -> speaker_0 / speaker_1 / ...
+```
+
+When supported by the configured service tier/API, MeetCap requests speaker information and preserves it in normalized segments.
+
+Provider speaker labels are anonymous and session/provider scoped. They are not persistent identities and must never be treated as stable names.
+
+Do not add a second default diarization engine until real recordings demonstrate the need.
+
+### Persistent speaker identity
 
 Identity remains local:
 
 ```text
-provider speaker label
- -> collect utterances
- -> local embedding
- -> registry candidates
- -> manual confirmation
+provider anonymous speaker label
+ -> collect clean utterances
+ -> select useful 5-15s samples where practical
+ -> sherpa-onnx
+ -> 3D-Speaker ERes2Net-base embedding
+ -> local Speaker Registry
+ -> ranked candidates
+ -> threshold/margin policy
+ -> manual confirmation where needed
 ```
+
+The initial reference model is:
+
+```text
+3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx
+```
+
+This path is intended for enrollment, embedding extraction, verification, and identification. It is not the default MVP diarization path.
+
+Manual speaker assignment always wins over automatic inference.
 
 ## 11. Hotwords
 
@@ -151,6 +190,22 @@ Hotword configuration must be possible without code changes. Raw ASR responses r
 
 Imported media should prefer one provider file request when within provider limits. If splitting is required, preserve original timestamps and split mapping.
 
+Media inspection/normalization should be implemented through the `MeetCap.AudioPipeline` abstraction using FFprobe/FFmpeg, preferably via FFMpegCore in the .NET implementation.
+
 ## 13. Observability
 
-For every ASR job record provider, tier, source track, duration, submit/complete time, retries, provider request ID, success/error code, estimated cost, and raw response path. Never log credentials.
+For every ASR job record:
+
+- provider;
+- tier;
+- source track;
+- duration;
+- submit/complete time;
+- retries;
+- provider request ID;
+- success/error code;
+- whether speaker info was requested/returned;
+- estimated cost;
+- raw response path.
+
+Never log credentials.
