@@ -1,3 +1,4 @@
+using System.CommandLine;
 using MeetCap.Core.Configuration;
 using MeetCap.Persistence.Configuration;
 using Xunit;

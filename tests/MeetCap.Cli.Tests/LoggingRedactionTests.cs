@@ -38,7 +38,7 @@ public class LoggingRedactionTests
     {
         var secrets = RegistryWith(Sentinel);
         using var writer = new StringWriter();
-        using var logger = CliLoggingFactory.Create(secrets, writer, LogLevel.Information);
+        var logger = CliLoggingFactory.Create(secrets, writer, LogLevel.Information);
 
         logger.Information("submitting batch with credential={Credential}", Sentinel);
         logger.Error(new InvalidOperationException($"provider rejected {Sentinel}"), "call failed");
@@ -53,7 +53,7 @@ public class LoggingRedactionTests
     {
         var secrets = RegistryWith(Sentinel, "app-id-12345");
         using var writer = new StringWriter();
-        using var logger = CliLoggingFactory.Create(secrets, writer, LogLevel.Information);
+        var logger = CliLoggingFactory.Create(secrets, writer, LogLevel.Information);
 
         logger.Information("app={AppId}", "app-id-12345");
 
@@ -82,7 +82,7 @@ public class LoggingRedactionTests
     public void NoRegisteredSecret_NothingIsMasked_RegistryIsLoadBearing()
     {
         using var writer = new StringWriter();
-        using var logger = CliLoggingFactory.Create(new SecretRegistry(), writer, LogLevel.Information);
+        var logger = CliLoggingFactory.Create(new SecretRegistry(), writer, LogLevel.Information);
 
         // With no loaded configuration the registry is empty, so an unknown value is
         // written verbatim. Commands therefore must load configuration before logging.
@@ -96,7 +96,7 @@ public class LoggingRedactionTests
     {
         var secrets = RegistryWith(Sentinel);
         using var writer = new StringWriter();
-        using var logger = CliLoggingFactory.Create(secrets, writer, LogLevel.Information);
+        var logger = CliLoggingFactory.Create(secrets, writer, LogLevel.Information);
 
         logger.Information("value={Value}", Sentinel);
 
