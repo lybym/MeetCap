@@ -120,7 +120,7 @@ internal static class CommandTree
         command.SetAction(parseResult =>
         {
             var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment);
-            return ConfigCommand.Show(context, context.ConfigurationStore);
+            return ConfigCommand.Show(context);
         });
         return command;
     }

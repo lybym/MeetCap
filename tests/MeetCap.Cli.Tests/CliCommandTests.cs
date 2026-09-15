@@ -228,4 +228,62 @@ public class CliCommandTests
             }
         }
     }
+
+    [Fact]
+    public void ConfigShow_AppliesDataRootOverrideToEffectiveConfigurationWithoutRewritingTheFile()
+    {
+        using var harness = CliHarness.Create();
+        harness.WriteConfig(ConfigWithSecrets(PersistedDataRoot));
+
+        var before = File.ReadAllText(harness.ConfigFilePath);
+        var result = harness.Run("--data-root", OverrideDataRoot, "config", "show");
+
+        Assert.Equal(0, result.ExitCode);
+
+        // The printed effective configuration carries the one-shot override...
+        Assert.Contains(OverrideDataRoot, result.Output);
+
+        // ...while the persisted value is not shown as effective and the file on disk
+        // is byte-for-byte untouched (CONFIGURATION.md rules 3, 4 and 7).
+        Assert.DoesNotContain(PersistedDataRoot, result.Output);
+        Assert.Equal(before, File.ReadAllText(harness.ConfigFilePath));
+        Assert.Contains(PersistedDataRoot, File.ReadAllText(harness.ConfigFilePath));
+
+        // Redaction must survive the override path in the very same invocation.
+        Assert.Contains(SecretSentinel, File.ReadAllText(harness.ConfigFilePath));
+        Assert.DoesNotContain(SecretSentinel, result.Output);
+        Assert.Contains("***", result.Output);
+    }
+
+    [Fact]
+    public void ConfigShow_WithoutDataRootOverride_ShowsThePersistedDataRoot()
+    {
+        using var harness = CliHarness.Create();
+        harness.WriteConfig(ConfigWithSecrets(PersistedDataRoot));
+
+        var result = harness.Run("config", "show");
+
+        // Only an explicitly supplied flag overrides config.toml; an absent flag must
+        // not silently replace the persisted value (CONFIGURATION.md section 2).
+        Assert.Equal(0, result.ExitCode);
+        Assert.Contains(PersistedDataRoot, result.Output);
+        Assert.DoesNotContain(OverrideDataRoot, result.Output);
+    }
+
+    [Fact]
+    public void StatusAndConfigShow_AgreeOnTheEffectiveDataRoot()
+    {
+        using var harness = CliHarness.Create();
+        harness.WriteConfig(ConfigWithSecrets(PersistedDataRoot));
+
+        var status = harness.Run("--data-root", OverrideDataRoot, "status");
+        var show = harness.Run("--data-root", OverrideDataRoot, "config", "show");
+
+        // Both commands read the effective configuration through the same path, so the
+        // override cannot be reflected in one and omitted from the other.
+        Assert.Equal(0, status.ExitCode);
+        Assert.Equal(0, show.ExitCode);
+        Assert.Contains($"data root: {OverrideDataRoot}", status.Output);
+        Assert.Contains(OverrideDataRoot, show.Output);
+    }
 }

@@ -67,19 +67,23 @@ internal static class ConfigCommand
         return 1;
     }
 
-    public static int Show(CliContext context, IConfigurationStore store)
+    public static int Show(CliContext context)
     {
-        var load = store.Load();
-        context.Secrets.UpdateFrom(load.Configuration);
+        // Show the *effective* configuration for this invocation: one-shot CLI
+        // arguments outrank config.toml (docs/CONFIGURATION.md section 2) and rule 7
+        // requires the effective configuration to be printable. Applying them here
+        // mutates only the in-memory copy, so config.toml is never rewritten (rule 4).
+        var effective = context.LoadEffectiveConfiguration();
+        var load = effective.Load;
 
         if (load.LoadError is not null)
         {
             context.Error.WriteLine($"meetcap config show: {load.LoadError} (showing defaults)");
         }
 
-        var toml = store.ToToml(load.Configuration);
+        var toml = effective.Store.ToToml(effective.Configuration);
         var redacted = SecretRedactor.Redact(toml, context.Secrets.Values);
-        context.Out.WriteLine($"# {store.ConfigFilePath}");
+        context.Out.WriteLine($"# {effective.Store.ConfigFilePath}");
         context.Out.WriteLine(redacted);
         Logger(context).LogInformation("Configuration shown with secrets redacted");
         return 0;

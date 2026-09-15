@@ -13,12 +13,12 @@ internal static class StatusCommand
 {
     public static Task<int> Run(CliContext context)
     {
-        var store = context.ConfigurationStore;
-        var load = store.Load();
-        context.Secrets.UpdateFrom(load.Configuration);
+        // Shared effective-configuration path: `status` and `config show` must agree on
+        // what "effective" means, including the one-shot --data-root override.
+        var effective = context.LoadEffectiveConfiguration();
+        var store = effective.Store;
 
-        var dataRoot = context.DataRootOverride
-            ?? Environment.ExpandEnvironmentVariables(load.Configuration.Storage.DataRoot);
+        var dataRoot = effective.DataRoot;
         var dbPath = Path.Combine(dataRoot, "meetcap.db");
         var database = new MeetCapDatabase(dbPath);
 
