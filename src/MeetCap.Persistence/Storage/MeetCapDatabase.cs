@@ -37,7 +37,7 @@ public sealed class MeetCapDatabase
     }
 
     /// <summary>Creates the database and applies all pending migrations.</summary>
-    public void EnsureMigrated() => new SqliteMigrator(_dbPath).Migrate(_dbPath);
+    public void EnsureMigrated() => new SqliteMigrator().Migrate(_dbPath);
 
     /// <summary>Count of sessions in a non-terminal state. Zero before any session exists.</summary>
     public int CountActiveSessions()
