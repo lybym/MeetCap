@@ -13,6 +13,17 @@ public static class ConfigurationValidator
     private static readonly HashSet<string> s_asrTiers = new(StringComparer.Ordinal) { "standard", "idle", "turbo" };
     private static readonly HashSet<string> s_speakerIdentityProviders =
         new(StringComparer.Ordinal) { "sherpa_onnx_3dspeaker" };
+    private static readonly IReadOnlyDictionary<string, string> s_legacyFlatSpeakerKeyInstructions =
+        new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["speakers.provider"] =
+                "Remove it and set [speakers.identity] provider = \"sherpa_onnx_3dspeaker\" " +
+                "after confirming that identity provider is appropriate for your deployment.",
+            ["speakers.match_threshold"] =
+                "Move its value to [speakers.identity] match_threshold.",
+            ["speakers.match_margin"] =
+                "Move its value to [speakers.identity] match_margin.",
+        };
     private static readonly HashSet<string> s_logLevels = new(StringComparer.Ordinal)
         { "Trace", "Debug", "Information", "Warning", "Error", "Critical" };
 
@@ -36,6 +47,14 @@ public static class ConfigurationValidator
         {
             foreach (var key in unknownKeys)
             {
+                if (s_legacyFlatSpeakerKeyInstructions.TryGetValue(key, out var migrationInstruction))
+                {
+                    result.AddError(
+                        $"Legacy configuration key '{key}' is not supported by this config layout. " +
+                        migrationInstruction);
+                    continue;
+                }
+
                 result.AddWarning($"Unknown configuration key '{key}' will be ignored.");
             }
         }

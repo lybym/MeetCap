@@ -93,7 +93,7 @@ public class ExampleConfigurationTests
     }
 
     [Fact]
-    public void LegacyFlatSpeakerKeys_AreReportedAsUnknownInsteadOfSilentlyIgnored()
+    public void LegacyFlatSpeakerKeys_BlockValidationWithMigrationInstructions()
     {
         var dir = NewDir();
         try
@@ -101,18 +101,35 @@ public class ExampleConfigurationTests
             Directory.CreateDirectory(dir);
             File.WriteAllText(
                 Path.Combine(dir, "config.toml"),
-                "config_version = 1\n\n[speakers]\nprovider = \"local\"\nmatch_threshold = 0.5\n");
+                "config_version = 1\n\n[speakers]\nprovider = \"local\"\nmatch_threshold = 0.5\nmatch_margin = 0.1\n");
 
             var load = new TomlConfigurationStore(dir).Load();
 
-            // Pre-#9 flat keys are never dropped silently: they surface as unknown keys
-            // so `meetcap config validate` can tell the user the value is not in effect.
+            // Pre-#9 flat keys are detected by the persistence layer, then promoted to
+            // validation errors. A v1 configuration must not pass validation while its
+            // speaker policy quietly falls back to new defaults.
             Assert.Contains("speakers.provider", load.UnknownKeys);
             Assert.Contains("speakers.match_threshold", load.UnknownKeys);
+            Assert.Contains("speakers.match_margin", load.UnknownKeys);
 
             var validation = ConfigurationValidator.Validate(load.Configuration, load.UnknownKeys);
-            Assert.True(validation.IsValid);
-            Assert.Contains(validation.Warnings, w => w.Contains("speakers.match_threshold"));
+            Assert.False(validation.IsValid);
+            Assert.Contains(
+                validation.Errors,
+                error => error ==
+                    "Legacy configuration key 'speakers.provider' is not supported by this config layout. " +
+                    "Remove it and set [speakers.identity] provider = \"sherpa_onnx_3dspeaker\" " +
+                    "after confirming that identity provider is appropriate for your deployment.");
+            Assert.Contains(
+                validation.Errors,
+                error => error ==
+                    "Legacy configuration key 'speakers.match_threshold' is not supported by this config layout. " +
+                    "Move its value to [speakers.identity] match_threshold.");
+            Assert.Contains(
+                validation.Errors,
+                error => error ==
+                    "Legacy configuration key 'speakers.match_margin' is not supported by this config layout. " +
+                    "Move its value to [speakers.identity] match_margin.");
         }
         finally
         {

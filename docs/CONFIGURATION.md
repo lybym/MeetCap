@@ -251,3 +251,10 @@ A running session uses a configuration snapshot captured at session start. Editi
 ## 13. Config migration
 
 The file contains `config_version = 1`. Breaking changes require migration or an actionable validation error.
+
+The pre-speaker-identity flat keys `speakers.provider`, `speakers.match_threshold`, and
+`speakers.match_margin` are rejected even when `config_version = 1`; they cannot silently
+fall back to the current identity defaults. Remove `speakers.provider` and explicitly set
+`[speakers.identity] provider = "sherpa_onnx_3dspeaker"` after confirming it is appropriate
+for the deployment. Move the two numeric values into `[speakers.identity]` as
+`match_threshold` and `match_margin`, respectively.
