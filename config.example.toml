@@ -1,0 +1,64 @@
+config_version = 1
+
+[app]
+default_title = "Untitled Meeting"
+
+[capture]
+default_mode = "offline"
+chunk_seconds = 60
+buffer_seconds = 5
+flush_interval_ms = 1000
+
+[capture.offline]
+microphone_device_id = "default"
+
+[capture.online]
+microphone_device_id = "default"
+loopback_mode = "system"
+render_device_id = "default"
+# Future:
+# process_name = "WeMeet.exe"
+
+[storage]
+data_root = "%LOCALAPPDATA%\\MeetCap"
+minimum_free_space_gb = 5
+
+[asr]
+enabled = true
+strategy = "file"
+file_batch_seconds = 300
+service_tier = "standard"
+streaming_enabled = false
+retry_max_attempts = 8
+retry_initial_seconds = 5
+retry_max_seconds = 300
+final_full_session_pass = false
+
+[asr.volcengine]
+app_id = ""
+credential = "env:MEETCAP_VOLCENGINE_ACCESS_TOKEN"
+resource_id = "volc.bigasr.auc"
+hotword_table_id = ""
+
+[speakers]
+enabled = true
+provider = "local"
+owner_name = ""
+auto_suggest = true
+match_threshold = 0.82
+match_margin = 0.08
+manual_assignment_locked = true
+
+[transcript]
+write_jsonl = true
+write_markdown = true
+live_markdown = true
+include_source = true
+include_timestamps = true
+
+[logging]
+level = "Information"
+session_log = true
+
+[retention]
+automatic_delete = false
