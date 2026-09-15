@@ -1,6 +1,5 @@
 namespace MeetCap.Persistence.Storage;
 
-using System.Diagnostics;
 using System.Reflection;
 using System.Text.RegularExpressions;
 using Microsoft.Data.Sqlite;
@@ -12,56 +11,45 @@ using Microsoft.Data.Sqlite;
 /// active milestone are created; later milestones add their own migrations.
 /// </summary>
 /// <remarks>
-/// Two processes can start the CLI at the same time against the same data root.
-/// Each migration runs in its own transaction so DDL and its version row commit
-/// together, and the whole migration sequence additionally runs under a
-/// file-system lock (<c>&lt;database&gt;.migration.lock</c>) so concurrent
-/// first-run migrations serialize instead of racing the <c>schema_migrations</c>
-/// primary key. A caller that loses the race re-reads the applied set after
-/// acquiring the lock and simply observes the winner's work as already applied.
+/// This is deliberately the "equivalently thin migration layer" allowed by
+/// docs/ARCHITECTURE.md section 2: one embedded SQL script per version, applied in
+/// its own transaction so the DDL and its version row commit together. It
+/// introduces no coordination protocol, no persistent bookkeeping artifact, and
+/// no timeout semantics — docs/DEVELOPMENT.md section 3 requires an explicitly
+/// authorized reliability requirement before adding machinery of that kind.
+/// <para>
+/// Concurrency safety therefore comes only from the database contract itself:
+/// migration SQL is guarded by <c>IF NOT EXISTS</c> and the version row is
+/// recorded with <c>INSERT OR IGNORE</c>, so a version that another process
+/// recorded first is treated as an already-applied migration rather than a
+/// primary-key failure. SQLite's own write lock ordering is left to SQLite.
+/// </para>
 /// </remarks>
 public sealed class SqliteMigrator
 {
-    /// <summary>How long a migration waits for a competing migrator before failing.</summary>
+    /// <summary>
+    /// How long a migration waits on SQLite's own write lock before failing.
+    /// </summary>
     internal const int BusyTimeoutSeconds = 30;
-
-    private const int LockRetryDelayMilliseconds = 10;
 
     private readonly Assembly _assembly = typeof(SqliteMigrator).Assembly;
 
-    /// <summary>Creates a migrator for the database at <paramref name="dbPath"/>.</summary>
-    public SqliteMigrator(string dbPath)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(dbPath);
-        DbPath = dbPath;
-    }
-
-    /// <summary>The database file this migrator was created for.</summary>
-    public string DbPath { get; }
-
     /// <summary>
     /// Creates the database (if absent) and applies all pending migrations.
-    /// Safe to call concurrently from multiple processes.
     /// </summary>
     public void Migrate(string dbPath)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(dbPath);
 
-        // The lock file lives beside the database, so the directory must exist before
-        // the lock can be created (a clean data directory is the normal first run).
         var dir = Path.GetDirectoryName(dbPath);
         if (!string.IsNullOrEmpty(dir))
         {
             Directory.CreateDirectory(dir);
         }
 
-        using var migrationLock = AcquireMigrationLock(dbPath);
-
         using var conn = new SqliteConnection(BuildConnectionString(dbPath));
         conn.Open();
 
-        // A competing migrator may have applied migrations while this caller waited
-        // for the lock, so the applied set is read only once the lock is held.
         EnsureMigrationsTable(conn);
         var applied = GetAppliedVersions(conn);
         foreach (var (version, resourceName) in GetMigrations())
@@ -103,40 +91,10 @@ public sealed class SqliteMigrator
             // Local-first CLI: short-lived per-command access. Disabling pooling keeps
             // the database file reliably releasable (inspectable local artifacts).
             Pooling = false,
+            // Bounded wait on SQLite's own lock, so a second process migrating the
+            // same clean database queues behind the first instead of failing fast.
             DefaultTimeout = BusyTimeoutSeconds,
         }.ToString();
-
-    /// <summary>
-    /// Acquires the cross-process migration lock, waiting up to
-    /// <see cref="BusyTimeoutSeconds"/> for a competing migrator to finish. The
-    /// returned stream owns the lock for the duration of the migration sequence.
-    /// </summary>
-    public static FileStream AcquireMigrationLock(string dbPath)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(dbPath);
-        var lockPath = dbPath + ".migration.lock";
-        var stopwatch = Stopwatch.StartNew();
-        var delay = LockRetryDelayMilliseconds;
-
-        while (true)
-        {
-            try
-            {
-                return new FileStream(
-                    lockPath,
-                    FileMode.OpenOrCreate,
-                    FileAccess.ReadWrite,
-                    FileShare.None);
-            }
-            catch (IOException) when (stopwatch.Elapsed < TimeSpan.FromSeconds(BusyTimeoutSeconds))
-            {
-                // Another migrator holds the lock; back off and retry until the budget
-                // is exhausted, then let the failure surface with an actionable error.
-                Thread.Sleep(delay);
-                delay = Math.Min(delay * 2, 250);
-            }
-        }
-    }
 
     private static int? TryParseVersion(string resourceName)
     {
@@ -183,9 +141,10 @@ public sealed class SqliteMigrator
 
     private static void RecordApplied(SqliteConnection conn, SqliteTransaction tx, int version)
     {
-        // Insert-or-ignore keeps the version row idempotent even if the lock is ever
-        // bypassed (for example by an older migrator): the schema work is
-        // IF NOT EXISTS, so the first recorded row remains authoritative.
+        // INSERT OR IGNORE, not INSERT: if another process recorded this version
+        // after our applied-set read, the migration is still complete and the
+        // already-recorded row is authoritative. This is what keeps the thin
+        // migration layer free of any cross-process lock protocol.
         using var cmd = new SqliteCommand(
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (@version, @at)",
             conn,
