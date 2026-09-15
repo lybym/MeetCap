@@ -9,14 +9,15 @@ using Microsoft.Extensions.Logging;
 /// Implements <c>meetcap status</c>. M0 reports configuration/data-root/database
 /// state and confirms no session is active (no sessions exist yet).
 /// </summary>
-public static class StatusCommand
+internal static class StatusCommand
 {
-    public static int Run(IConfigurationStore store, SecretRegistry secrets, ILogger logger, string? dataRootOverride)
+    public static Task<int> Run(CliContext context)
     {
+        var store = context.ConfigurationStore;
         var load = store.Load();
-        secrets.UpdateFrom(load.Configuration);
+        context.Secrets.UpdateFrom(load.Configuration);
 
-        var dataRoot = dataRootOverride
+        var dataRoot = context.DataRootOverride
             ?? Environment.ExpandEnvironmentVariables(load.Configuration.Storage.DataRoot);
         var dbPath = Path.Combine(dataRoot, "meetcap.db");
         var database = new MeetCapDatabase(dbPath);
@@ -24,15 +25,20 @@ public static class StatusCommand
         var dbInitialized = database.IsInitialized();
         var activeSessions = database.CountActiveSessions();
 
-        Console.Out.WriteLine($"config: {store.ConfigFilePath} ({(store.Exists() ? "present" : "missing")})");
-        Console.Out.WriteLine($"data root: {dataRoot}");
-        Console.Out.WriteLine($"database: {dbPath} ({(dbInitialized ? "initialized" : "not initialized")})");
-        Console.Out.WriteLine(activeSessions > 0
+        context.Out.WriteLine($"config: {store.ConfigFilePath} ({(store.Exists() ? "present" : "missing")})");
+        context.Out.WriteLine($"data root: {dataRoot}");
+        context.Out.WriteLine($"database: {dbPath} ({(dbInitialized ? "initialized" : "not initialized")})");
+        context.Out.WriteLine(activeSessions > 0
             ? $"sessions: {activeSessions} active"
             : "sessions: none active");
 
-        logger.LogInformation("status: dataRoot={DataRoot} dbInitialized={DbInit} activeSessions={Active}",
-            dataRoot, dbInitialized, activeSessions);
-        return 0;
+        context.LoggerFactory
+            .CreateLogger(CliContext.LoggerCategory)
+            .LogInformation(
+                "status: dataRoot={DataRoot} dbInitialized={DbInit} activeSessions={Active}",
+                dataRoot,
+                dbInitialized,
+                activeSessions);
+        return Task.FromResult(0);
     }
 }

@@ -5,6 +5,7 @@
     <Project Path="src/MeetCap.Persistence/MeetCap.Persistence.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/MeetCap.Cli.Tests/MeetCap.Cli.Tests.csproj" />
     <Project Path="tests/MeetCap.Core.Tests/MeetCap.Core.Tests.csproj" />
     <Project Path="tests/MeetCap.Persistence.Tests/MeetCap.Persistence.Tests.csproj" />
   </Folder>

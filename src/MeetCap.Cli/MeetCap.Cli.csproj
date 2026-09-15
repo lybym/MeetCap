@@ -15,8 +15,17 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- #9 / docs/ARCHITECTURE.md section 2: System.CommandLine for parsing and command hierarchy. -->
+    <PackageReference Include="System.CommandLine" Version="2.0.5" />
+    <!-- #9 / docs/ARCHITECTURE.md section 2: Serilog for structured logging. -->
+    <PackageReference Include="Serilog" Version="4.3.0" />
+    <!-- Bridges Serilog to the Microsoft.Extensions.Logging ILogger used by command handlers. -->
+    <PackageReference Include="Serilog.Extensions.Logging" Version="9.0.0" />
     <PackageReference Include="Microsoft.Extensions.Logging" Version="10.0.12" />
-    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="10.0.12" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="MeetCap.Cli.Tests" />
   </ItemGroup>
 
 </Project>

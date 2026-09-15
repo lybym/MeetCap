@@ -75,7 +75,7 @@ public class SqliteMigratorTests
         var db = NewDb();
         try
         {
-            new SqliteMigrator().Migrate(db);
+            new SqliteMigrator(db).Migrate(db);
             using var c = Open(db);
             Assert.True(TableExists(c, "sessions"));
             Assert.True(TableExists(c, "schema_migrations"));
@@ -92,7 +92,7 @@ public class SqliteMigratorTests
         var db = NewDb();
         try
         {
-            new SqliteMigrator().Migrate(db);
+            new SqliteMigrator(db).Migrate(db);
             using var c = Open(db);
             Assert.Equal(1, Count(c, "SELECT COUNT(*) FROM schema_migrations"));
             Assert.Equal(1, Count(c, "SELECT version FROM schema_migrations"));
@@ -109,7 +109,7 @@ public class SqliteMigratorTests
         var db = NewDb();
         try
         {
-            var migrator = new SqliteMigrator();
+            var migrator = new SqliteMigrator(db);
             migrator.Migrate(db);
             migrator.Migrate(db); // must not throw or duplicate
             using var c = Open(db);
@@ -127,11 +127,118 @@ public class SqliteMigratorTests
         var db = NewDb();
         try
         {
-            new SqliteMigrator().Migrate(db);
+            new SqliteMigrator(db).Migrate(db);
             using var c = Open(db);
             Assert.ThrowsAny<SqliteException>(() => InsertSession(c, mode: "hybrid"));
             InsertSession(c, mode: "offline");
             Assert.Equal(1, Count(c, "SELECT COUNT(*) FROM sessions"));
+        }
+        finally
+        {
+            Cleanup(db);
+        }
+    }
+
+    [Fact]
+    public void Migrate_ConcurrentFirstRun_SerializesAndRecordsEachVersionOnce()
+    {
+        var db = NewDb();
+        try
+        {
+            const int migrators = 4;
+            using var start = new Barrier(migrators);
+            var failures = new System.Collections.Concurrent.ConcurrentQueue<Exception>();
+            var threads = new Thread[migrators];
+
+            for (var i = 0; i < migrators; i++)
+            {
+                threads[i] = new Thread(() =>
+                {
+                    try
+                    {
+                        // Every thread races to migrate the same clean database, which is
+                        // what two CLI processes starting together do.
+                        start.SignalAndWait();
+                        new SqliteMigrator(db).Migrate(db);
+                    }
+                    catch (Exception ex)
+                    {
+                        failures.Enqueue(ex);
+                    }
+                });
+                threads[i].Start();
+            }
+
+            foreach (var thread in threads)
+            {
+                Assert.True(thread.Join(TimeSpan.FromSeconds(60)), "concurrent migration did not finish in time");
+            }
+
+            Assert.Empty(failures);
+            using var c = Open(db);
+            Assert.True(TableExists(c, "sessions"));
+            Assert.Equal(1, Count(c, "SELECT COUNT(*) FROM schema_migrations"));
+            Assert.Equal(1, Count(c, "SELECT version FROM schema_migrations"));
+        }
+        finally
+        {
+            Cleanup(db);
+        }
+    }
+
+    [Fact]
+    public void Migrate_RetryAfterCompetingMigrator_IsIdempotent()
+    {
+        var db = NewDb();
+        try
+        {
+            var migrator = new SqliteMigrator(db);
+            migrator.Migrate(db);
+
+            // A second migrator instance (as another process would create) must observe
+            // the already-applied version instead of failing on the primary key.
+            var second = new SqliteMigrator(db);
+            second.Migrate(db);
+
+            using var c = Open(db);
+            Assert.Equal(1, Count(c, "SELECT COUNT(*) FROM schema_migrations"));
+        }
+        finally
+        {
+            Cleanup(db);
+        }
+    }
+
+    [Fact]
+    public void MigrationLock_BlocksSecondAcquireUntilReleased()
+    {
+        var db = NewDb();
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(db)!);
+
+            using (var first = SqliteMigrator.AcquireMigrationLock(db))
+            {
+                Assert.NotNull(first);
+
+                // While the lock is held, a competing acquisition must block rather than
+                // proceed, which is what prevents the schema_migrations race.
+                var acquired = new ManualResetEventSlim(false);
+                var competitor = new Thread(() =>
+                {
+                    using var second = SqliteMigrator.AcquireMigrationLock(db);
+                    acquired.Set();
+                });
+                competitor.IsBackground = true;
+                competitor.Start();
+
+                Assert.False(acquired.Wait(TimeSpan.FromMilliseconds(250)), "lock was acquired while already held");
+
+                acquired.Reset();
+            }
+
+            using var reacquired = SqliteMigrator.AcquireMigrationLock(db);
+            Assert.NotNull(reacquired);
         }
         finally
         {

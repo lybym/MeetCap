@@ -1,16 +1,18 @@
 namespace MeetCap.Cli;
 
-using System.Linq;
-using MeetCap.Cli.Commands;
+using System.CommandLine;
+using System.CommandLine.Parsing;
 using MeetCap.Cli.Logging;
+using MeetCap.Core.Configuration;
 using MeetCap.Core.Secrets;
 using MeetCap.Persistence.Configuration;
 using Microsoft.Extensions.Logging;
 
 /// <summary>
-/// MeetCap CLI entry point and composition root. Parses global options, wires the
-/// configuration store, secret registry and redacting logger, then dispatches to
-/// thin command handlers. Commands never duplicate business rules (docs/DEVELOPMENT.md §8).
+/// MeetCap CLI entry point and composition root. Builds the System.CommandLine
+/// hierarchy, wires the configuration store, secret registry, and the Serilog
+/// logging pipeline, then invokes the parsed command. Commands never duplicate
+/// business rules (docs/DEVELOPMENT.md section 8).
 /// </summary>
 public static class Program
 {
@@ -27,91 +29,101 @@ public static class Program
         }
     }
 
-    private static int Run(string[] args)
+    /// <summary>
+    /// Runs one CLI invocation. The optional parameters exist so integration tests
+    /// can drive the real command tree with a temporary configuration store and
+    /// captured output writers without mutating process state.
+    /// </summary>
+    internal static int Run(
+        string[] args,
+        CliEnvironment? environment = null,
+        IConfigurationStore? configurationStore = null,
+        InvocationConfiguration? invocationConfiguration = null,
+        ParserConfiguration? parserConfiguration = null,
+        bool disposeLogger = true)
     {
-        string? configDir = null;
-        string? dataRoot = null;
-        var rest = new List<string>();
+        ArgumentNullException.ThrowIfNull(args);
+        environment ??= CliEnvironment.Instance;
 
-        for (var i = 0; i < args.Length; i++)
-        {
-            switch (args[i])
-            {
-                case "--config-dir":
-                    configDir = TakeValue(args, ref i, "--config-dir");
-                    break;
-                case "--data-root":
-                    dataRoot = TakeValue(args, ref i, "--data-root");
-                    break;
-                case "-h":
-                case "--help":
-                    PrintUsage(Console.Error);
-                    return 0;
-                default:
-                    rest.Add(args[i]);
-                    break;
-            }
-        }
-
-        var effectiveConfigDir = configDir
-            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "MeetCap");
+        var output = invocationConfiguration?.Output ?? Console.Out;
+        var error = invocationConfiguration?.Error ?? Console.Error;
 
         var secrets = new SecretRegistry();
-        using var loggerFactory = LoggerFactory.Create(builder =>
-        {
-            builder.AddProvider(new RedactingConsoleLoggerProvider(secrets, LogLevel.Information, Console.Error));
-            builder.SetMinimumLevel(LogLevel.Information);
-        });
-        var logger = loggerFactory.CreateLogger("MeetCap");
+        var levelSwitch = new Serilog.Core.LoggingLevelSwitch();
+        var logger = CliLoggingFactory.Create(secrets, error, levelSwitch: levelSwitch);
 
-        var store = new TomlConfigurationStore(effectiveConfigDir);
+        // The factory forwards Microsoft.Extensions.Logging calls (used by the
+        // command handlers) into the Serilog pipeline configured above.
+        using var loggerFactory = new Serilog.Extensions.Logging.SerilogLoggerFactory(logger, dispose: true);
 
-        if (rest.Count == 0)
+        var store = configurationStore ?? new TomlConfigurationStore(environment.DefaultConfigDirectory);
+        var root = CommandTree.Build(store, secrets, loggerFactory, output, error, environment);
+        var parseResult = CommandLineParser.Parse(root, args, parserConfiguration);
+
+        if (parseResult.Errors.Count > 0)
         {
-            PrintUsage(Console.Error);
-            return 2;
+            WriteParseErrors(parseResult, error);
+            return 1;
         }
 
-        var verb = rest[0];
-        var sub = rest.Count > 1 ? rest[1] : null;
-        var subArgs = rest.Count > 2 ? rest.Skip(2).ToArray() : Array.Empty<string>();
+        ApplyConfiguredLogLevel(store, levelSwitch);
 
-        logger.LogInformation("MeetCap CLI starting (config-dir={ConfigDir})", effectiveConfigDir);
-
-        return verb switch
+        try
         {
-            "config" => ConfigCommand.Run(sub, subArgs, store, secrets, logger),
-            "status" => StatusCommand.Run(store, secrets, logger, dataRoot),
-            _ => UnknownVerb(verb),
-        };
-    }
-
-    private static int UnknownVerb(string verb)
-    {
-        Console.Error.WriteLine($"meetcap: unknown command '{verb}'.");
-        PrintUsage(Console.Error);
-        return 2;
-    }
-
-    private static string TakeValue(string[] args, ref int i, string name)
-    {
-        if (i + 1 >= args.Length)
-        {
-            throw new InvalidOperationException($"Option {name} requires a value.");
+            return parseResult.Invoke(invocationConfiguration);
         }
-
-        return args[++i];
+        finally
+        {
+            if (disposeLogger)
+            {
+                logger.Dispose();
+            }
+        }
     }
 
-    private static void PrintUsage(TextWriter writer)
+    private static void WriteParseErrors(ParseResult parseResult, TextWriter error)
     {
-        writer.WriteLine("Usage: meetcap [--config-dir <path>] [--data-root <path>] <command> [args]");
-        writer.WriteLine();
-        writer.WriteLine("Commands:");
-        writer.WriteLine("  config init [--force]      Write a default config.toml");
-        writer.WriteLine("  config path                Print the config.toml path");
-        writer.WriteLine("  config validate            Validate config.toml (keys and values)");
-        writer.WriteLine("  config show               Print effective configuration (secrets redacted)");
-        writer.WriteLine("  status                     Show recording/database/session status");
+        foreach (var parseError in parseResult.Errors)
+        {
+            error.WriteLine($"meetcap: {parseError.Message}");
+        }
     }
+
+    /// <summary>
+    /// Applies <c>[logging] level</c> from the configuration file to the live
+    /// Serilog level switch. Configuration problems are reported later by the
+    /// commands themselves; a missing or unreadable file must not block the CLI.
+    /// </summary>
+    private static void ApplyConfiguredLogLevel(IConfigurationStore store, Serilog.Core.LoggingLevelSwitch levelSwitch)
+    {
+        try
+        {
+            var load = store.Load();
+            if (load.LoadError is not null)
+            {
+                return;
+            }
+
+            if (Enum.TryParse<LogLevel>(load.Configuration.Logging.Level, ignoreCase: true, out var level))
+            {
+                levelSwitch.MinimumLevel = MapLevel(level);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Logging configuration is best-effort at startup; command execution
+            // still reports configuration problems with actionable errors.
+        }
+    }
+
+    private static Serilog.Events.LogEventLevel MapLevel(LogLevel level) => level switch
+    {
+        LogLevel.Trace => Serilog.Events.LogEventLevel.Verbose,
+        LogLevel.Debug => Serilog.Events.LogEventLevel.Debug,
+        LogLevel.Information => Serilog.Events.LogEventLevel.Information,
+        LogLevel.Warning => Serilog.Events.LogEventLevel.Warning,
+        LogLevel.Error => Serilog.Events.LogEventLevel.Error,
+        LogLevel.Critical => Serilog.Events.LogEventLevel.Fatal,
+        _ => Serilog.Events.LogEventLevel.Fatal,
+    };
 }
