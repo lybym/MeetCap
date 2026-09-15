@@ -111,8 +111,9 @@ public sealed class SqliteMigrator
     /// <see cref="BusyTimeoutSeconds"/> for a competing migrator to finish. The
     /// returned stream owns the lock for the duration of the migration sequence.
     /// </summary>
-    internal static FileStream AcquireMigrationLock(string dbPath)
+    public static FileStream AcquireMigrationLock(string dbPath)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(dbPath);
         var lockPath = dbPath + ".migration.lock";
         var stopwatch = Stopwatch.StartNew();
         var delay = LockRetryDelayMilliseconds;

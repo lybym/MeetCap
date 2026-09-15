@@ -69,6 +69,7 @@ internal static class CommandTree
         command.SetAction(parseResult =>
             ConfigCommand.Init(
                 CreateContext(parseResult, store, secrets, loggerFactory, output, error, environment),
+                store,
                 force: parseResult.GetValue(force)));
         return command;
     }
@@ -84,7 +85,8 @@ internal static class CommandTree
         var command = new Command("path", "Print the config.toml path.");
         command.SetAction(parseResult =>
             ConfigCommand.PrintPath(
-                CreateContext(parseResult, store, secrets, loggerFactory, output, error, environment)));
+                CreateContext(parseResult, store, secrets, loggerFactory, output, error, environment),
+                store));
         return command;
     }
 
@@ -99,7 +101,8 @@ internal static class CommandTree
         var command = new Command("validate", "Validate config.toml keys and values.");
         command.SetAction(parseResult =>
             ConfigCommand.Validate(
-                CreateContext(parseResult, store, secrets, loggerFactory, output, error, environment)));
+                CreateContext(parseResult, store, secrets, loggerFactory, output, error, environment),
+                store));
         return command;
     }
 
@@ -114,7 +117,8 @@ internal static class CommandTree
         var command = new Command("show", "Print the effective configuration with secrets redacted.");
         command.SetAction(parseResult =>
             ConfigCommand.Show(
-                CreateContext(parseResult, store, secrets, loggerFactory, output, error, environment)));
+                CreateContext(parseResult, store, secrets, loggerFactory, output, error, environment),
+                store));
         return command;
     }
 

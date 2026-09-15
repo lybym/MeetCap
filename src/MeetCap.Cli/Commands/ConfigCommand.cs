@@ -1,6 +1,7 @@
 namespace MeetCap.Cli.Commands;
 
 using MeetCap.Core.Configuration;
+using MeetCap.Core.Secrets;
 using Microsoft.Extensions.Logging;
 
 /// <summary>
