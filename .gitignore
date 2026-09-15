@@ -1,0 +1,35 @@
+# Build
+bin/
+obj/
+artifacts/
+TestResults/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# Local runtime data
+data/
+sessions/
+*.db
+*.db-shm
+*.db-wal
+
+# Secrets / local configuration
+config.toml
+.env
+.env.*
+
+# Audio
+*.wav
+*.flac
+*.mp3
+*.m4a
+*.ogg
+
+# OS
+Thumbs.db
+.DS_Store
