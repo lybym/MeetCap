@@ -32,6 +32,16 @@ internal static class ImportCommand
             return 2;
         }
 
+        // Report a missing source before anything else: it is the cheapest precondition and
+        // the most common mistake, and it must not depend on the FFmpeg toolchain or the
+        // provider being reachable.
+        var sourcePath = Path.GetFullPath(file);
+        if (!File.Exists(sourcePath))
+        {
+            context.Error.WriteLine($"meetcap import: import source not found: {sourcePath}");
+            return 1;
+        }
+
         if (!CommandSupport.TryLoadConfiguration(context, out var configuration, out var dataRoot, out var failure))
         {
             return failure;
@@ -76,7 +86,7 @@ internal static class ImportCommand
         try
         {
             result = await service.ImportAsync(
-                new ImportRequest { SourcePath = file, Title = title, Tier = tier },
+                new ImportRequest { SourcePath = sourcePath, Title = title, Tier = tier },
                 cancellationToken).ConfigureAwait(false);
         }
         catch (MediaProbeException ex)
