@@ -10,6 +10,7 @@ The design deliberately prioritizes:
 4. **Local, inspectable artifacts over opaque application state.**
 5. **Configuration-file-driven behavior.**
 6. **CLI-first operation; no GUI in the MVP.**
+7. **Reuse mature OSS for infrastructure; keep MeetCap-specific reliability semantics in MeetCap.**
 
 ## Supported meeting modes
 
@@ -56,12 +57,39 @@ meetcap config validate
 - C# 14
 - .NET 10 LTS
 - Windows 10 22H2 / Windows 11
-- NAudio / WASAPI
-- SQLite
-- FFmpeg
-- Volcengine Seed-ASR / recording-file ASR
-- Local speaker-embedding provider behind an abstraction
+- NAudio 3 / WASAPI for microphone, system loopback, and supported process loopback capture
+- System.CommandLine for CLI composition
+- Tomlyn for TOML configuration
+- Serilog for structured logging
+- Microsoft.Data.Sqlite for local persistence
+- FluentMigrator or an equivalently thin migration layer
+- FFmpeg/FFprobe through FFMpegCore for media inspection and normalization
+- Polly for transient provider HTTP resilience
+- Volcengine BigASR / recording-file ASR for transcription and anonymous speaker labels
+- sherpa-onnx + 3D-Speaker ERes2Net-base for local speaker embeddings and persistent identity matching
 - JSONL + Markdown artifacts
+
+The default MVP speaker path is:
+
+```text
+Volcengine BigASR
+  -> transcript + timestamps + anonymous speaker labels
+  -> select clean speech for each anonymous speaker
+  -> sherpa-onnx
+  -> 3D-Speaker ERes2Net-base
+  -> local Speaker Registry
+  -> persistent speaker identity
+```
+
+sherpa-onnx is not the default MVP diarization engine. Local diarization remains an optional fallback/extension if real recordings demonstrate that provider diarization is insufficient.
+
+MeetCap intentionally keeps the following as product-owned logic instead of outsourcing them to generic frameworks:
+
+- durable audio spool and crash recovery;
+- persistent ASR job state machine;
+- transcript normalization and dual-track timeline merge;
+- speaker registry semantics and manual-lock policy;
+- artifact contract and local storage layout.
 
 See `docs/ARCHITECTURE.md` for the authoritative architecture.
 
