@@ -126,14 +126,14 @@ public class CliCommandTests
     }
 
     [Fact]
-    public void UnknownVerb_IsReported()
+    public void UnknownVerb_IsRejectedByTheParser()
     {
         using var harness = CliHarness.Create();
 
         var result = harness.Run("bogus");
 
         Assert.NotEqual(0, result.ExitCode);
-        Assert.Contains("unknown command 'bogus'", result.Error);
+        Assert.Contains("Unrecognized command or argument", result.Error);
     }
 
     [Fact]
@@ -178,11 +178,24 @@ public class CliCommandTests
     {
         using var harness = CliHarness.Create();
 
-        var result = harness.Run("status", "--data-root", harness.DataRoot);
+        var result = harness.Run("--data-root", harness.DataRoot, "status");
 
         Assert.Equal(0, result.ExitCode);
         Assert.Contains("sessions: none active", result.Output);
         Assert.Contains(harness.DataRoot, result.Output);
+    }
+
+    [Fact]
+    public void GlobalDataRootOptionAfterVerb_IsRejectedByTheParser()
+    {
+        using var harness = CliHarness.Create();
+
+        // Global options belong to the root command; the framework reports them as
+        // unrecognized when they appear after the verb.
+        var result = harness.Run("status", "--data-root", harness.DataRoot);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("Unrecognized command or argument", result.Error);
     }
 
     [Fact]

@@ -25,13 +25,14 @@ internal class CliEnvironment
 internal sealed class CliContext
 {
     private readonly ParseResult _parseResult;
+    private readonly Func<string, IConfigurationStore> _storeFactory;
     private readonly CliEnvironment _environment;
 
     public CliContext(
         ParseResult parseResult,
         TextWriter output,
         TextWriter error,
-        IConfigurationStore configurationStore,
+        Func<string, IConfigurationStore> storeFactory,
         SecretRegistry secrets,
         ILoggerFactory loggerFactory,
         CliEnvironment? environment = null)
@@ -39,7 +40,7 @@ internal sealed class CliContext
         _parseResult = parseResult ?? throw new ArgumentNullException(nameof(parseResult));
         Out = output ?? throw new ArgumentNullException(nameof(output));
         Error = error ?? throw new ArgumentNullException(nameof(error));
-        ConfigurationStore = configurationStore ?? throw new ArgumentNullException(nameof(configurationStore));
+        _storeFactory = storeFactory ?? throw new ArgumentNullException(nameof(storeFactory));
         Secrets = secrets ?? throw new ArgumentNullException(nameof(secrets));
         LoggerFactory = loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory));
         _environment = environment ?? CliEnvironment.Instance;
@@ -47,8 +48,6 @@ internal sealed class CliContext
 
     /// <summary>Logger category used by every command handler.</summary>
     public const string LoggerCategory = "MeetCap";
-
-    public IConfigurationStore ConfigurationStore { get; }
 
     public SecretRegistry Secrets { get; }
 
@@ -72,6 +71,12 @@ internal sealed class CliContext
     /// configured <c>storage.data_root</c>. One-shot overrides never rewrite config.toml.
     /// </summary>
     public string? DataRootOverride => GlobalOptions.GetDataRoot(_parseResult);
+
+    /// <summary>
+    /// The configuration store for the effective <see cref="ConfigDirectory"/>.
+    /// Resolved per command so a one-shot <c>--config-dir</c> override is honored.
+    /// </summary>
+    public IConfigurationStore ConfigurationStore => _storeFactory(ConfigDirectory);
 }
 
 /// <summary>

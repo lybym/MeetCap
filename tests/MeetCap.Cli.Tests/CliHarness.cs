@@ -14,6 +14,7 @@ namespace MeetCap.Cli.Tests;
 internal sealed class CliHarness : IDisposable
 {
     private readonly string _root;
+    private readonly IConfigurationStore _store;
 
     private CliHarness(string root)
     {
@@ -22,7 +23,7 @@ internal sealed class CliHarness : IDisposable
         DataRoot = Path.Combine(root, "data");
         Directory.CreateDirectory(ConfigDirectory);
         Directory.CreateDirectory(DataRoot);
-        Store = new TomlConfigurationStore(ConfigDirectory);
+        _store = new TomlConfigurationStore(ConfigDirectory);
         Environment = new TestCliEnvironment(ConfigDirectory);
     }
 
@@ -32,13 +33,11 @@ internal sealed class CliHarness : IDisposable
 
     public string DataRoot { get; }
 
-    public IConfigurationStore Store { get; }
-
     public CliEnvironment Environment { get; }
 
-    public string ConfigFilePath => Store.ConfigFilePath;
+    public string ConfigFilePath => _store.ConfigFilePath;
 
-    /// <summary>Runs <c>meetcap</c> with the harness config directory and captures output.</summary>
+    /// <summary>Runs <c>meetcap</c> with the harness configuration store and captures output.</summary>
     public CliResult Run(params string[] args)
     {
         using var output = new StringWriter();
@@ -47,13 +46,12 @@ internal sealed class CliHarness : IDisposable
         var exitCode = Program.Run(
             args,
             Environment,
-            Store,
+            _store,
             new InvocationConfiguration { Output = output, Error = error });
 
-        // Read the captured text before the writers are disposed; the command tree
-        // writes through these instances and Run returns after the pipeline flushed.
-        var captured = new CliResult(exitCode, output.ToString(), error.ToString());
-        return captured;
+        // Capture the text after Run returns; the harness owns the writers and the
+        // production pipeline does not write once Run has completed.
+        return new CliResult(exitCode, output.ToString(), error.ToString());
     }
 
     public void WriteConfig(string toml) => File.WriteAllText(ConfigFilePath, toml);

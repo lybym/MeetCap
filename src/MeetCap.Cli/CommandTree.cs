@@ -15,16 +15,16 @@ using Microsoft.Extensions.Logging;
 internal static class CommandTree
 {
     public static RootCommand Build(
-        IConfigurationStore store,
         SecretRegistry secrets,
         ILoggerFactory loggerFactory,
+        Func<string, IConfigurationStore> storeFactory,
         TextWriter output,
         TextWriter error,
         CliEnvironment? environment = null)
     {
-        ArgumentNullException.ThrowIfNull(store);
         ArgumentNullException.ThrowIfNull(secrets);
         ArgumentNullException.ThrowIfNull(loggerFactory);
+        ArgumentNullException.ThrowIfNull(storeFactory);
         ArgumentNullException.ThrowIfNull(output);
         ArgumentNullException.ThrowIfNull(error);
 
@@ -33,10 +33,10 @@ internal static class CommandTree
         root.Options.Add(GlobalOptions.DataRoot);
 
         var configCommand = new Command("config", "Inspect and initialize MeetCap configuration.");
-        configCommand.Subcommands.Add(BuildConfigInit(store, secrets, loggerFactory, output, error, environment));
-        configCommand.Subcommands.Add(BuildConfigPath(store, secrets, loggerFactory, output, error, environment));
-        configCommand.Subcommands.Add(BuildConfigValidate(store, secrets, loggerFactory, output, error, environment));
-        configCommand.Subcommands.Add(BuildConfigShow(store, secrets, loggerFactory, output, error, environment));
+        configCommand.Subcommands.Add(BuildConfigInit(secrets, loggerFactory, storeFactory, output, error, environment));
+        configCommand.Subcommands.Add(BuildConfigPath(secrets, loggerFactory, storeFactory, output, error, environment));
+        configCommand.Subcommands.Add(BuildConfigValidate(secrets, loggerFactory, storeFactory, output, error, environment));
+        configCommand.Subcommands.Add(BuildConfigShow(secrets, loggerFactory, storeFactory, output, error, environment));
 
         var statusCommand = new Command("status", "Show database and session status (no session is active in M0).");
 
@@ -46,15 +46,15 @@ internal static class CommandTree
         root.SetAction(parseResult => RequireVerb(parseResult, root, error));
         configCommand.SetAction(parseResult => RequireSubcommand(parseResult, configCommand, error));
         statusCommand.SetAction((parseResult, _) =>
-            StatusCommand.Run(CreateContext(parseResult, store, secrets, loggerFactory, output, error, environment)));
+            StatusCommand.Run(CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment)));
 
         return root;
     }
 
     private static Command BuildConfigInit(
-        IConfigurationStore store,
         SecretRegistry secrets,
         ILoggerFactory loggerFactory,
+        Func<string, IConfigurationStore> storeFactory,
         TextWriter output,
         TextWriter error,
         CliEnvironment? environment)
@@ -67,70 +67,73 @@ internal static class CommandTree
         var command = new Command("init", "Write a default config.toml.");
         command.Options.Add(force);
         command.SetAction(parseResult =>
-            ConfigCommand.Init(
-                CreateContext(parseResult, store, secrets, loggerFactory, output, error, environment),
-                store,
-                force: parseResult.GetValue(force)));
+        {
+            var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment);
+            return ConfigCommand.Init(context, context.ConfigurationStore, parseResult.GetValue(force));
+        });
         return command;
     }
 
     private static Command BuildConfigPath(
-        IConfigurationStore store,
         SecretRegistry secrets,
         ILoggerFactory loggerFactory,
+        Func<string, IConfigurationStore> storeFactory,
         TextWriter output,
         TextWriter error,
         CliEnvironment? environment)
     {
         var command = new Command("path", "Print the config.toml path.");
         command.SetAction(parseResult =>
-            ConfigCommand.PrintPath(
-                CreateContext(parseResult, store, secrets, loggerFactory, output, error, environment),
-                store));
+        {
+            var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment);
+            return ConfigCommand.PrintPath(context, context.ConfigurationStore);
+        });
         return command;
     }
 
     private static Command BuildConfigValidate(
-        IConfigurationStore store,
         SecretRegistry secrets,
         ILoggerFactory loggerFactory,
+        Func<string, IConfigurationStore> storeFactory,
         TextWriter output,
         TextWriter error,
         CliEnvironment? environment)
     {
         var command = new Command("validate", "Validate config.toml keys and values.");
         command.SetAction(parseResult =>
-            ConfigCommand.Validate(
-                CreateContext(parseResult, store, secrets, loggerFactory, output, error, environment),
-                store));
+        {
+            var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment);
+            return ConfigCommand.Validate(context, context.ConfigurationStore);
+        });
         return command;
     }
 
     private static Command BuildConfigShow(
-        IConfigurationStore store,
         SecretRegistry secrets,
         ILoggerFactory loggerFactory,
+        Func<string, IConfigurationStore> storeFactory,
         TextWriter output,
         TextWriter error,
         CliEnvironment? environment)
     {
         var command = new Command("show", "Print the effective configuration with secrets redacted.");
         command.SetAction(parseResult =>
-            ConfigCommand.Show(
-                CreateContext(parseResult, store, secrets, loggerFactory, output, error, environment),
-                store));
+        {
+            var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment);
+            return ConfigCommand.Show(context, context.ConfigurationStore);
+        });
         return command;
     }
 
     private static CliContext CreateContext(
         ParseResult parseResult,
-        IConfigurationStore store,
         SecretRegistry secrets,
         ILoggerFactory loggerFactory,
+        Func<string, IConfigurationStore> storeFactory,
         TextWriter output,
         TextWriter error,
         CliEnvironment? environment)
-        => new(parseResult, output, error, store, secrets, loggerFactory, environment);
+        => new(parseResult, output, error, storeFactory, secrets, loggerFactory, environment);
 
     /// <summary>
     /// Error action for <c>meetcap</c> without a verb. Mirrors the documented usage

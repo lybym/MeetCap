@@ -55,8 +55,13 @@ public static class Program
         // command handlers) into the Serilog pipeline configured above.
         using var loggerFactory = new Serilog.Extensions.Logging.SerilogLoggerFactory(logger, dispose: true);
 
-        var store = configurationStore ?? new TomlConfigurationStore(environment.DefaultConfigDirectory);
-        var root = CommandTree.Build(store, secrets, loggerFactory, output, error, environment);
+        // Store construction is deferred so the one-shot --config-dir override is
+        // honored by every command. The default store below is only used to read
+        // [logging] level before the command runs.
+        Func<string, IConfigurationStore> storeFactory = directory =>
+            configurationStore ?? new TomlConfigurationStore(directory);
+
+        var root = CommandTree.Build(secrets, loggerFactory, storeFactory, output, error, environment);
         var parseResult = CommandLineParser.Parse(root, args, parserConfiguration);
 
         if (parseResult.Errors.Count > 0)
@@ -65,7 +70,9 @@ public static class Program
             return 1;
         }
 
-        ApplyConfiguredLogLevel(store, levelSwitch);
+        ApplyConfiguredLogLevel(
+            configurationStore ?? new TomlConfigurationStore(environment.DefaultConfigDirectory),
+            levelSwitch);
 
         // The logger factory owns the Serilog logger and closes/flushes it when this
         // method returns.
