@@ -2,11 +2,11 @@ namespace MeetCap.Cli.Logging;
 
 using System.IO;
 using MeetCap.Core.Secrets;
+using Microsoft.Extensions.Logging;
 using Serilog;
 using Serilog.Core;
 using Serilog.Events;
 using Serilog.Formatting.Display;
-using Microsoft.Extensions.Logging;
 
 /// <summary>
 /// Builds the production logging pipeline. Serilog is the logging framework
@@ -26,7 +26,7 @@ internal static class CliLoggingFactory
     public static Serilog.ILogger Create(
         SecretRegistry secrets,
         TextWriter writer,
-        MSLogLevel minimumLevel = MSLogLevel.Information,
+        LogLevel minimumLevel = LogLevel.Information,
         LoggingLevelSwitch? levelSwitch = null)
     {
         ArgumentNullException.ThrowIfNull(secrets);
@@ -49,7 +49,8 @@ internal static class CliLoggingFactory
 
     /// <summary>
     /// Creates the redaction formatter over the CLI's console output template.
-    /// Exposed so tests can assert that redaction happens in the real pipeline.
+    /// Redaction lives in the formatter so every sink configured with it inherits
+    /// the guarantee that credential material never reaches the output.
     /// </summary>
     public static Serilog.Formatting.ITextFormatter CreateFormatter(SecretRegistry secrets)
     {
@@ -57,14 +58,14 @@ internal static class CliLoggingFactory
         return new RedactingTextFormatter(new MessageTemplateTextFormatter(OutputTemplate), secrets);
     }
 
-    private static LogEventLevel MapLevel(MSLogLevel level) => level switch
+    private static LogEventLevel MapLevel(LogLevel level) => level switch
     {
-        MSLogLevel.Trace => LogEventLevel.Verbose,
-        MSLogLevel.Debug => LogEventLevel.Debug,
-        MSLogLevel.Information => LogEventLevel.Information,
-        MSLogLevel.Warning => LogEventLevel.Warning,
-        MSLogLevel.Error => LogEventLevel.Error,
-        MSLogLevel.Critical => LogEventLevel.Fatal,
+        LogLevel.Trace => LogEventLevel.Verbose,
+        LogLevel.Debug => LogEventLevel.Debug,
+        LogLevel.Information => LogEventLevel.Information,
+        LogLevel.Warning => LogEventLevel.Warning,
+        LogLevel.Error => LogEventLevel.Error,
+        LogLevel.Critical => LogEventLevel.Fatal,
         _ => LogEventLevel.Fatal,
     };
 }

@@ -29,6 +29,16 @@ public sealed class SqliteMigrator
 
     private readonly Assembly _assembly = typeof(SqliteMigrator).Assembly;
 
+    /// <summary>Creates a migrator for the database at <paramref name="dbPath"/>.</summary>
+    public SqliteMigrator(string dbPath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(dbPath);
+        DbPath = dbPath;
+    }
+
+    /// <summary>The database file this migrator was created for.</summary>
+    public string DbPath { get; }
+
     /// <summary>
     /// Creates the database (if absent) and applies all pending migrations.
     /// Safe to call concurrently from multiple processes.
