@@ -8,6 +8,10 @@ The central development rule is:
 
 > Prove recording reliability before spending meaningful effort on transcription intelligence.
 
+A second implementation rule applies across milestones:
+
+> Reuse mature OSS for commodity capabilities; keep MeetCap-specific durability, state-machine, timeline, artifact, and speaker-registry semantics explicit in MeetCap.
+
 ---
 
 # M0 - Repository and executable skeleton
@@ -20,12 +24,14 @@ Produce a runnable Windows CLI with configuration loading and session metadata.
 
 - .NET 10 solution
 - projects defined in `ARCHITECTURE.md`
-- CLI entry point
-- structured logging
-- config loader for `%APPDATA%\MeetCap\config.toml`
-- SQLite bootstrap/migrations
+- System.CommandLine CLI entry point
+- Serilog structured logging
+- Tomlyn-backed config loader for `%APPDATA%\MeetCap\config.toml`
+- Microsoft.Data.Sqlite bootstrap
+- schema migrations using FluentMigrator or an equivalently thin migration layer
 - `meetcap config init`
 - `meetcap config validate`
+- `meetcap config show`
 - `meetcap status`
 - CI build/test on Windows
 
@@ -58,9 +64,10 @@ Make the application trustworthy as a recorder.
 
 - list audio devices
 - select configured microphone
+- NAudio 3 / WASAPI capture behind `MeetCap.WindowsAudio`
 - `meetcap start --mode offline`
-- microphone WASAPI capture
 - session-relative timing
+- preserve useful device/QPC timing metadata exposed by NAudio
 - 60-second recoverable chunks
 - `.part` lifecycle
 - chunk validation
@@ -105,6 +112,8 @@ Prove "record first" invariants.
 
 Network, ASR, and speaker modules can all be disabled and recording remains stable.
 
+The spool, `.part -> CLOSED` lifecycle, crash recovery, and gap semantics remain MeetCap-owned logic.
+
 ---
 
 # M3 - Import + file ASR
@@ -119,22 +128,23 @@ Preserve the original file-transcription workflow and integrate Volcengine file 
 meetcap import .\meeting.m4a
 ```
 
-- media inspection
-- normalization only when required
-- persistent ASR job queue
+- media inspection through FFprobe/FFMpegCore
+- FFmpeg normalization only when required
+- persistent ASR job queue in SQLite
 - Volcengine file-ASR provider
 - submit/query handling
-- retries
+- Polly-based transient HTTP resilience inside the provider adapter
+- persistent retry/job state independent from Polly
 - raw provider response
 - normalized transcript JSONL
 - Markdown transcript
-- speaker labels returned by ASR where available
+- request/preserve anonymous speaker labels and timestamps where Volcengine supports them
 
 ## Exit criteria
 
 Existing recordings can be converted to final transcript artifacts without any live-capture code path.
 
-This milestone is the first end-to-end ASR proof.
+This milestone is the first end-to-end ASR proof and the first proof that provider diarization labels can be preserved in the normalized transcript model.
 
 ---
 
@@ -152,6 +162,7 @@ Continuously produce transcript artifacts without defaulting to streaming ASR.
 - submit batches as they close
 - append `transcript/live.md`
 - append `transcript/raw.jsonl`
+- preserve anonymous provider speaker labels
 - queue when offline
 - resume after network recovery
 - flush remaining batch at stop
@@ -174,11 +185,12 @@ Capture online meetings without mixing local and remote audio.
 
 - system loopback enumeration
 - online mode
-- simultaneous mic + loopback capture
+- simultaneous mic + loopback capture using NAudio
 - independent chunk streams
 - independent file-ASR batches
 - unified timeline merger
 - source labels in transcript
+- allow `system` loopback and, where supported, `process` loopback as capture-source options
 
 ## Exit criteria
 
@@ -193,31 +205,63 @@ and a merged transcript with correct source attribution.
 
 No hybrid mode is introduced.
 
+Process-specific loopback does not create a new meeting mode and should reuse NAudio support rather than custom raw WASAPI activation code where practical.
+
 ---
 
 # M6 - Speaker registry and voiceprint matching
 
 ## Goal
 
-Reduce repeated manual speaker labeling across meetings.
+Reduce repeated manual speaker labeling across meetings by resolving anonymous ASR speaker labels to persistent local identities.
+
+## Default MVP pipeline
+
+```text
+Volcengine BigASR
+  -> text + timestamps + anonymous speaker labels
+  -> select clean speech for each anonymous speaker
+  -> sherpa-onnx
+  -> 3D-Speaker ERes2Net-base
+  -> local Speaker Registry
+  -> ranked identity candidates
+```
+
+sherpa-onnx + 3D-Speaker is used for speaker enrollment, embedding extraction, verification, and identification. It is **not** the default MVP diarization engine.
 
 ## Deliverables
 
 - speaker entity
-- embedding provider abstraction
-- enroll command
+- `ISpeakerIdentityProvider` abstraction
+- sherpa-onnx-backed identity provider
+- 3D-Speaker ERes2Net-base ONNX model integration
+- initial reference model: `3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx`
+- `meetcap speakers list`
+- `meetcap speakers enroll <name>`
 - extract clean speaker samples
 - multiple embeddings per person
 - candidate similarity ranking
+- configurable threshold and match margin
 - manual assignment command
 - manual lock
 - local-only voiceprint persistence
+- use provider-returned anonymous speaker labels as the default cluster source
+
+## Identity policy
+
+```text
+manual assignment
+> high-confidence historical match
+> anonymous ASR speaker label
+```
+
+Unknown/low-confidence speakers remain unknown.
 
 ## Exit criteria
 
 Previously enrolled people appear as useful candidates in later recordings and manual assignment always overrides automatic inference.
 
-Do not require 100% automatic naming.
+A local diarization pipeline is not required for MVP unless real-world validation demonstrates that Volcengine speaker separation is inadequate.
 
 ---
 
@@ -236,10 +280,13 @@ Improve recognition quality without changing recording reliability.
 - selectable standard/idle/turbo service tier
 - optional full-session final re-ASR flag
 - cost accounting per ASR job
+- measure anonymous speaker-label quality on real meetings
 
 ## Exit criteria
 
 Technical terms can be improved through configuration without code changes.
+
+Provider diarization quality is measured before introducing a second default diarization stack.
 
 ---
 
@@ -278,6 +325,21 @@ Possible items:
 - cross-meeting search
 
 These are not prerequisites for MVP.
+
+---
+
+# Optional speaker diarization fallback
+
+Only after real recordings justify it, evaluate a provider abstraction such as:
+
+```text
+SpeakerDiarizationProvider
+  -> Volcengine ASR speaker labels       # default
+  -> SherpaOnnx diarization              # optional local fallback
+  -> other benchmark providers           # evaluation only
+```
+
+Do not introduce Python/PyTorch into the default Windows runtime merely to duplicate diarization already available from the configured ASR provider.
 
 ---
 

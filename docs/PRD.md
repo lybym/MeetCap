@@ -1,6 +1,6 @@
 # MeetCap MVP PRD
 
-**Version:** 0.2  
+**Version:** 0.3  
 **Status:** Product baseline  
 **Platform:** Windows  
 **Product form:** Resident CLI  
@@ -22,8 +22,8 @@ MeetCap turns the workflow into a local-first pipeline that the user owns:
 Windows audio
   -> durable local recording
   -> file-first ASR
-  -> speaker diarization
-  -> speaker identity matching
+  -> anonymous speaker labels
+  -> local speaker identity matching
   -> persistent transcript files
   -> optional terminology correction / meeting analysis later
 ```
@@ -56,6 +56,8 @@ If two requirements conflict, the higher priority wins.
 6. Configuration is persisted in a human-editable configuration file.
 7. No GUI is required for MVP.
 8. No hybrid-meeting mode exists in the first product scope.
+9. Mature OSS SHOULD be reused for commodity capabilities when it does not compromise MeetCap reliability semantics.
+10. MeetCap-specific durability, job-state, timeline, artifact, and speaker-registry semantics remain explicit product-owned logic.
 
 ---
 
@@ -76,10 +78,13 @@ Microphone
 durable audio chunks
     |
     v
-file ASR + diarization
+Volcengine file ASR
+    |
+    +--> transcript + timestamps
+    +--> anonymous speaker labels
     |
     v
-speaker matching
+local speaker identity matching
 ```
 
 Only the microphone track is captured.
@@ -97,17 +102,15 @@ Microphone ----------------> local track
 Windows loopback ----------> remote track
 ```
 
-The tracks MUST remain separate.
-
-The application MUST NOT mix them before ASR.
+The tracks MUST remain separate and MUST NOT be mixed before ASR.
 
 Semantic assumptions:
 
 - `mic` is primarily the local user.
 - `loopback` contains remote participants.
-- remote participants are diarized and matched inside the loopback track.
+- remote participants receive provider anonymous speaker labels and are later matched against the local speaker registry.
 
-Process-specific loopback is desirable but is not required for the first capture milestone.
+System loopback is sufficient for the first online-capture milestone. Process-specific loopback is a capture-source option, not a separate product mode.
 
 ### 3.3 Imported recording
 
@@ -123,10 +126,10 @@ The imported file enters the same post-capture pipeline:
 
 ```text
 import
- -> normalize / inspect
+ -> inspect / normalize
  -> file ASR
- -> speaker diarization
- -> speaker matching
+ -> anonymous speaker labels
+ -> local speaker identity matching
  -> transcript artifacts
 ```
 
@@ -140,13 +143,7 @@ This function is first-class and MUST remain available even after live capture i
 
 Hybrid means local participants in a room plus remote participants in the same session.
 
-It is out of scope because it introduces:
-
-- acoustic echo ambiguity;
-- local/remote duplicate speech;
-- source attribution complexity;
-- speaker identity conflicts across tracks;
-- more aggressive AEC requirements.
+It is out of scope because it introduces acoustic echo ambiguity, local/remote duplicate speech, source-attribution complexity, speaker identity conflicts across tracks, and stronger AEC requirements.
 
 A session has exactly one mode:
 
@@ -189,8 +186,6 @@ meetcap config path
 meetcap config validate
 ```
 
-A later release may add daemon installation / startup registration, but that must not change the recording-session semantics.
-
 ---
 
 ## 6. File-first ASR requirement
@@ -213,8 +208,6 @@ Default design values:
 capture chunk:      60 seconds
 file-ASR batch:    300 seconds
 ```
-
-These are configuration defaults, not hard-coded constants.
 
 Result:
 
@@ -257,6 +250,8 @@ streaming:       disabled
 
 The implementation MUST isolate provider-specific request fields behind an ASR provider interface.
 
+Volcengine BigASR is the default provider and SHOULD request anonymous speaker information where the selected API/service tier supports it.
+
 ---
 
 ## 8. Recording requirements
@@ -285,8 +280,6 @@ audio/
 ```
 
 Do not generate a mixed master track as a required artifact.
-
-A mixed export can be added later as a convenience.
 
 ### 8.3 Durable chunks
 
@@ -320,6 +313,8 @@ speaker_1
 speaker_2
 ```
 
+For the MVP, Volcengine ASR-provided anonymous speaker labels are the default diarization source when available.
+
 ### Speaker identification
 
 Question:
@@ -332,15 +327,47 @@ Result:
 speaker_1 -> Alice
 ```
 
-These MUST remain separate in the domain model.
+This requires speaker embeddings and a persistent local speaker registry.
 
-### MVP policy
+### MVP identity stack
 
-ASR/provider diarization may be used first.
+```text
+Volcengine anonymous speaker labels
+ -> choose clean speaker samples
+ -> sherpa-onnx
+ -> 3D-Speaker ERes2Net-base
+ -> local Speaker Registry
+ -> ranked candidate identities
+```
 
-Persistent identification uses a local speaker registry and embedding provider.
+The default model baseline is:
 
-Matching produces candidates; user confirmation can lock the mapping.
+```text
+3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx
+```
+
+sherpa-onnx + 3D-Speaker is used for:
+
+- speaker enrollment;
+- embedding extraction;
+- 1:1 verification;
+- 1:N identification.
+
+It is **not** the default MVP diarization engine.
+
+A local diarization provider may be added later if real recordings demonstrate that provider diarization is inadequate.
+
+### Registry policy
+
+The model does not know human names. MeetCap owns:
+
+- speaker entities;
+- multiple embeddings per person;
+- candidate ranking;
+- thresholds and match margins;
+- manual confirmation;
+- manual assignment locks;
+- local persistence.
 
 Priority:
 
@@ -351,6 +378,10 @@ manual assignment
 ```
 
 The model MUST NOT silently overwrite a manual assignment.
+
+Unknown/low-confidence matches remain unknown.
+
+Voiceprints and name mappings are sensitive local data and remain local by default.
 
 ---
 
@@ -368,14 +399,16 @@ Examples:
 
 - default meeting mode;
 - input device;
-- loopback device / process preference;
+- loopback mode / process preference;
 - capture chunk duration;
 - ASR batch duration;
 - ASR service tier;
 - retry policy;
 - hotword table identifier;
 - output root;
-- speaker thresholds;
+- speaker identity provider;
+- speaker model path;
+- speaker thresholds and match margin;
 - retention policy;
 - logging level.
 
@@ -415,6 +448,8 @@ Example JSONL:
 {"start_ms":12340,"end_ms":16420,"source":"loopback","speaker_label":"speaker_1","speaker_name":"Alice","text":"We need to check the final quotation."}
 ```
 
+`speaker_label` is anonymous/session-scoped. `speaker_name` is a persistent local identity resolved later and may remain null.
+
 ---
 
 ## 12. MVP non-goals
@@ -437,10 +472,46 @@ The following are explicitly out of scope:
 - multi-user SaaS
 - organization SSO
 - complex RBAC
+- mandatory Python/PyTorch runtime
+- mandatory local diarization pipeline
 
 ---
 
-## 13. MVP success criteria
+## 13. OSS reuse policy
+
+Preferred infrastructure choices for MVP implementation:
+
+```text
+System.CommandLine
+Tomlyn
+Serilog
+NAudio 3
+Microsoft.Data.Sqlite
+FluentMigrator or thin equivalent
+FFMpegCore + FFmpeg/FFprobe
+Polly
+sherpa-onnx
+3D-Speaker ERes2Net-base
+```
+
+MeetCap should not reimplement these commodity capabilities without a demonstrated requirement.
+
+MeetCap-owned domain logic includes:
+
+```text
+Durable audio spool
+Crash recovery
+Persistent ASR job state machine
+Transcript normalization
+Dual-track timeline merge
+Speaker Registry semantics
+Manual speaker-lock policy
+Artifact contract
+```
+
+---
+
+## 14. MVP success criteria
 
 ### Capture
 
@@ -455,13 +526,15 @@ The following are explicitly out of scope:
 - Live recording batches are queued and transcribed using file ASR.
 - Failed jobs persist and retry after restart/network recovery.
 - Raw provider response is saved.
+- Anonymous speaker labels/timestamps are preserved where available.
 
 ### Speaker
 
-- ASR speaker labels are preserved.
-- A user can manually bind a temporary speaker to a person.
-- A local speaker registry can return candidate identities.
+- A user can enroll a named speaker with multiple local embeddings.
+- Later sessions can return useful ranked candidates for known speakers.
+- A user can manually bind an anonymous `speaker_N` to a person.
 - Manual bindings are never overwritten automatically.
+- Low-confidence voices remain unknown.
 
 ### Artifacts
 
@@ -469,7 +542,7 @@ A completed session contains enough local data to re-run later processing withou
 
 ---
 
-## 14. Definition of MVP complete
+## 15. Definition of MVP complete
 
 MVP is complete when this flow works reliably:
 
@@ -481,18 +554,13 @@ meetcap start "Weekly Meeting" --mode offline
 durable 60 s local audio chunks
     |
     v
-5-minute file-ASR batches
+5-minute Volcengine file-ASR batches
+    |
+    +--> transcript + timestamps
+    +--> anonymous speaker labels
     |
     v
-transcript/live.md continuously grows
-    |
-meetcap stop
-    |
-    v
-pending ASR jobs finish
-    |
-    v
-speaker mapping / final transcript
+sherpa-onnx + 3D-Speaker identity matching
     |
     v
 transcript/final.md
@@ -507,7 +575,10 @@ meetcap import .\existing-meeting.m4a
 file ASR
     |
     v
-speaker mapping
+anonymous speaker labels
+    |
+    v
+local identity matching
     |
     v
 final transcript

@@ -16,8 +16,8 @@ microphone_device_id = "default"
 microphone_device_id = "default"
 loopback_mode = "system"
 render_device_id = "default"
-# Future:
-# process_name = "WeMeet.exe"
+# Used when loopback_mode = "process"
+process_name = ""
 
 [storage]
 data_root = "%LOCALAPPDATA%\\MeetCap"
@@ -39,15 +39,24 @@ app_id = ""
 credential = "env:MEETCAP_VOLCENGINE_ACCESS_TOKEN"
 resource_id = "volc.bigasr.auc"
 hotword_table_id = ""
+request_speaker_info = true
 
 [speakers]
 enabled = true
-provider = "local"
 owner_name = ""
 auto_suggest = true
+manual_assignment_locked = true
+
+[speakers.identity]
+provider = "sherpa_onnx_3dspeaker"
 match_threshold = 0.82
 match_margin = 0.08
-manual_assignment_locked = true
+sample_min_seconds = 5
+sample_max_seconds = 15
+
+[speakers.sherpa_onnx]
+model = "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"
+model_path = ""
 
 [transcript]
 write_jsonl = true
@@ -55,6 +64,7 @@ write_markdown = true
 live_markdown = true
 include_source = true
 include_timestamps = true
+include_speaker_labels = true
 
 [logging]
 level = "Information"
