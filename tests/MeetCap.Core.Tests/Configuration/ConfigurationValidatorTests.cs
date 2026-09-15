@@ -75,8 +75,100 @@ public class ConfigurationValidatorTests
     public void Validate_ThresholdOutOfRange_Errors()
     {
         var c = ConfigurationDefaults.Default();
-        c.Speakers.MatchThreshold = 1.5;
-        Assert.False(ConfigurationValidator.Validate(c).IsValid);
+        c.Speakers.Identity.MatchThreshold = 1.5;
+        var result = ConfigurationValidator.Validate(c);
+        Assert.False(result.IsValid);
+        Assert.Contains(result.Errors, e => e.Contains("speakers.identity.match_threshold"));
+    }
+
+    [Fact]
+    public void Validate_MarginOutOfRange_Errors()
+    {
+        var c = ConfigurationDefaults.Default();
+        c.Speakers.Identity.MatchMargin = -0.1;
+        var result = ConfigurationValidator.Validate(c);
+        Assert.False(result.IsValid);
+        Assert.Contains(result.Errors, e => e.Contains("speakers.identity.match_margin"));
+    }
+
+    [Fact]
+    public void Validate_UnknownIdentityProvider_Errors()
+    {
+        var c = ConfigurationDefaults.Default();
+        c.Speakers.Identity.Provider = "local";
+        var result = ConfigurationValidator.Validate(c);
+        Assert.False(result.IsValid);
+        Assert.Contains(result.Errors, e => e.Contains("speakers.identity.provider"));
+    }
+
+    [Fact]
+    public void Validate_InvertedSampleWindow_Errors()
+    {
+        var c = ConfigurationDefaults.Default();
+        c.Speakers.Identity.SampleMinSeconds = 20;
+        c.Speakers.Identity.SampleMaxSeconds = 15;
+        var result = ConfigurationValidator.Validate(c);
+        Assert.False(result.IsValid);
+        Assert.Contains(result.Errors, e => e.Contains("speakers.identity.sample_max_seconds"));
+    }
+
+    [Fact]
+    public void Validate_NonPositiveSampleMinSeconds_Errors()
+    {
+        var c = ConfigurationDefaults.Default();
+        c.Speakers.Identity.SampleMinSeconds = 0;
+        var result = ConfigurationValidator.Validate(c);
+        Assert.False(result.IsValid);
+        Assert.Contains(result.Errors, e => e.Contains("speakers.identity.sample_min_seconds"));
+    }
+
+    [Fact]
+    public void Validate_ProcessLoopbackWithoutProcessName_Errors()
+    {
+        var c = ConfigurationDefaults.Default();
+        c.Capture.Online.LoopbackMode = "process";
+        var result = ConfigurationValidator.Validate(c);
+        Assert.False(result.IsValid);
+        Assert.Contains(result.Errors, e => e.Contains("capture.online.process_name"));
+    }
+
+    [Fact]
+    public void Validate_ProcessLoopbackWithProcessName_IsValid()
+    {
+        var c = ConfigurationDefaults.Default();
+        c.Capture.Online.LoopbackMode = "process";
+        c.Capture.Online.ProcessName = "Teams";
+        Assert.True(ConfigurationValidator.Validate(c).IsValid);
+    }
+
+    [Fact]
+    public void Validate_SystemLoopbackNeedsNoProcessName()
+    {
+        var c = ConfigurationDefaults.Default();
+        Assert.Equal("system", c.Capture.Online.LoopbackMode);
+        Assert.Equal(string.Empty, c.Capture.Online.ProcessName);
+        Assert.True(ConfigurationValidator.Validate(c).IsValid);
+    }
+
+    [Fact]
+    public void Validate_SpeakersEnabledWithoutProviderSpeakerInfo_Warns()
+    {
+        var c = ConfigurationDefaults.Default();
+        c.Asr.Volcengine.RequestSpeakerInfo = false;
+        var result = ConfigurationValidator.Validate(c);
+        Assert.True(result.IsValid);
+        Assert.Contains(result.Warnings, w => w.Contains("request_speaker_info"));
+    }
+
+    [Fact]
+    public void Validate_SpeakersDisabledWithoutProviderSpeakerInfo_DoesNotWarn()
+    {
+        var c = ConfigurationDefaults.Default();
+        c.Speakers.Enabled = false;
+        c.Asr.Volcengine.RequestSpeakerInfo = false;
+        var result = ConfigurationValidator.Validate(c);
+        Assert.True(result.IsValid);
+        Assert.DoesNotContain(result.Warnings, w => w.Contains("request_speaker_info"));
     }
 
     [Fact]

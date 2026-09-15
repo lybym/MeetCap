@@ -11,6 +11,8 @@ public static class ConfigurationValidator
     private static readonly HashSet<string> s_loopbackModes = new(StringComparer.Ordinal) { "system", "process" };
     private static readonly HashSet<string> s_asrStrategies = new(StringComparer.Ordinal) { "file", "streaming" };
     private static readonly HashSet<string> s_asrTiers = new(StringComparer.Ordinal) { "standard", "idle", "turbo" };
+    private static readonly HashSet<string> s_speakerIdentityProviders =
+        new(StringComparer.Ordinal) { "sherpa_onnx_3dspeaker" };
     private static readonly HashSet<string> s_logLevels = new(StringComparer.Ordinal)
         { "Trace", "Debug", "Information", "Warning", "Error", "Critical" };
 
@@ -72,6 +74,14 @@ public static class ConfigurationValidator
             result.AddError(
                 $"capture.online.loopback_mode='{capture.Online.LoopbackMode}' is invalid. Allowed: system, process.");
         }
+        else if (capture.Online.LoopbackMode == "process" && string.IsNullOrWhiteSpace(capture.Online.ProcessName))
+        {
+            // System loopback is the baseline and needs no target; process loopback is
+            // additive and cannot be resolved without a process name.
+            result.AddError(
+                "capture.online.loopback_mode is 'process' but capture.online.process_name is empty. " +
+                "Set the target process name, or use the baseline 'system' loopback.");
+        }
     }
 
     private static void ValidateStorage(MeetCapConfiguration config, ValidationResult result)
@@ -118,15 +128,44 @@ public static class ConfigurationValidator
     private static void ValidateSpeakers(MeetCapConfiguration config, ValidationResult result)
     {
         var speakers = config.Speakers;
-        if (!InRange01(speakers.MatchThreshold))
+        var identity = speakers.Identity;
+
+        if (!s_speakerIdentityProviders.Contains(identity.Provider))
         {
             result.AddError(
-                $"speakers.match_threshold={speakers.MatchThreshold} must be in [0, 1].");
+                $"speakers.identity.provider='{identity.Provider}' is invalid. " +
+                "Allowed: sherpa_onnx_3dspeaker.");
         }
 
-        if (!InRange01(speakers.MatchMargin))
+        if (!InRange01(identity.MatchThreshold))
         {
-            result.AddError($"speakers.match_margin={speakers.MatchMargin} must be in [0, 1].");
+            result.AddError(
+                $"speakers.identity.match_threshold={identity.MatchThreshold} must be in [0, 1].");
+        }
+
+        if (!InRange01(identity.MatchMargin))
+        {
+            result.AddError($"speakers.identity.match_margin={identity.MatchMargin} must be in [0, 1].");
+        }
+
+        RequirePositive(result, "speakers.identity.sample_min_seconds", identity.SampleMinSeconds);
+
+        if (identity.SampleMaxSeconds < identity.SampleMinSeconds)
+        {
+            result.AddError(
+                $"speakers.identity.sample_max_seconds={identity.SampleMaxSeconds} must be greater than or " +
+                $"equal to speakers.identity.sample_min_seconds={identity.SampleMinSeconds}.");
+        }
+
+        // Provider anonymous speaker labels are the default MVP diarization source
+        // (docs/ARCHITECTURE.md section 17.2). Without them the identity pipeline has
+        // no anonymous clusters to match, so recording still works but nobody is named.
+        if (speakers.Enabled && !config.Asr.Volcengine.RequestSpeakerInfo)
+        {
+            result.AddWarning(
+                "speakers.enabled is true while asr.volcengine.request_speaker_info is false; " +
+                "provider anonymous speaker labels are the default diarization source, so no speaker " +
+                "clusters will be available unless a local diarization fallback is configured.");
         }
     }
 

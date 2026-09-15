@@ -35,6 +35,13 @@ public sealed class CaptureOnlineSection
     public string LoopbackMode { get; set; } = "system";
 
     public string RenderDeviceId { get; set; } = "default";
+
+    /// <summary>
+    /// Target process name, used only when <see cref="LoopbackMode"/> is
+    /// <c>process</c>. Process loopback is an additive capture-source option, never a
+    /// separate meeting mode, and system loopback stays the baseline.
+    /// </summary>
+    public string ProcessName { get; set; } = string.Empty;
 }
 
 public sealed class StorageSection
@@ -75,17 +82,65 @@ public sealed class VolcengineSection
 
     public string ResourceId { get; set; } = "volc.bigasr.auc";
     public string HotwordTableId { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Ask the provider for anonymous speaker information where the configured API
+    /// tier supports it. These labels are the default MVP diarization source and
+    /// stay anonymous session/provider-scoped data, never persistent identities.
+    /// </summary>
+    public bool RequestSpeakerInfo { get; set; } = true;
 }
 
+/// <summary>
+/// Speaker attribution configuration. Diarization (who spoke when) and identity
+/// (who is speaker_1) are separate concerns: the provider supplies anonymous
+/// labels, and only the local identity provider may resolve them to a person.
+/// </summary>
 public sealed class SpeakersSection
 {
     public bool Enabled { get; set; } = true;
-    public string Provider { get; set; } = "local";
+
     public string OwnerName { get; set; } = string.Empty;
     public bool AutoSuggest { get; set; } = true;
-    public double MatchThreshold { get; set; } = 0.82;
-    public double MatchMargin { get; set; } = 0.08;
+
+    /// <summary>Manual assignment is authoritative and is never overwritten by automatic inference.</summary>
     public bool ManualAssignmentLocked { get; set; } = true;
+
+    public SpeakerIdentitySection Identity { get; set; } = new();
+
+    public SpeakerSherpaOnnxSection SherpaOnnx { get; set; } = new();
+}
+
+/// <summary>
+/// Local speaker identity matching policy: turning anonymous provider labels into
+/// ranked candidates for enrolled people. Implemented by M6; the keys are part of
+/// the configuration contract from M0 so the surface cannot drift.
+/// </summary>
+public sealed class SpeakerIdentitySection
+{
+    /// <summary>Allowed: <c>sherpa_onnx_3dspeaker</c>.</summary>
+    public string Provider { get; set; } = "sherpa_onnx_3dspeaker";
+
+    /// <summary>Placeholder until calibrated on real Chinese meeting recordings.</summary>
+    public double MatchThreshold { get; set; } = 0.82;
+
+    /// <summary>Required lead of the best candidate over the runner-up.</summary>
+    public double MatchMargin { get; set; } = 0.08;
+
+    /// <summary>Preferred lower bound of a clean enrollment/match speech sample.</summary>
+    public int SampleMinSeconds { get; set; } = 5;
+
+    /// <summary>Preferred upper bound of a clean enrollment/match speech sample.</summary>
+    public int SampleMaxSeconds { get; set; } = 15;
+}
+
+/// <summary>Local sherpa-onnx + 3D-Speaker ERes2Net-base embedding runtime.</summary>
+public sealed class SpeakerSherpaOnnxSection
+{
+    public string Model { get; set; } = "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx";
+
+    /// <summary>Optional explicit model directory; empty means "resolve from the data root".</summary>
+    public string ModelPath { get; set; } = string.Empty;
 }
 
 public sealed class TranscriptSection
@@ -95,6 +150,12 @@ public sealed class TranscriptSection
     public bool LiveMarkdown { get; set; } = true;
     public bool IncludeSource { get; set; } = true;
     public bool IncludeTimestamps { get; set; } = true;
+
+    /// <summary>
+    /// Keep the anonymous <c>speaker_label</c> separate from the resolved
+    /// <c>speaker_id</c>/<c>speaker_name</c> in transcript output.
+    /// </summary>
+    public bool IncludeSpeakerLabels { get; set; } = true;
 }
 
 public sealed class LoggingSection

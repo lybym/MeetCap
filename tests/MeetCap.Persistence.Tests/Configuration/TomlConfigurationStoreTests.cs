@@ -165,6 +165,74 @@ whoops = true
     }
 
     [Fact]
+    public void WriteDefault_EmitsAndReloadsTheSpeakerIdentitySections()
+    {
+        var dir = NewDir();
+        try
+        {
+            var store = new TomlConfigurationStore(dir);
+            store.WriteDefault(overwrite: false);
+            var text = File.ReadAllText(store.ConfigFilePath);
+
+            // Issue #9 configuration contract: identity matching and the sherpa-onnx
+            // runtime live in their own nested sections, not as flat [speakers] keys.
+            Assert.Contains("[speakers.identity]", text);
+            Assert.Contains("[speakers.sherpa_onnx]", text);
+            Assert.Contains("request_speaker_info = true", text);
+            Assert.Contains("process_name = \"\"", text);
+            Assert.Contains("include_speaker_labels = true", text);
+
+            var reloaded = store.Load();
+            Assert.Null(reloaded.LoadError);
+            Assert.Empty(reloaded.UnknownKeys);
+
+            Assert.Equal("sherpa_onnx_3dspeaker", reloaded.Configuration.Speakers.Identity.Provider);
+            Assert.Equal(0.82, reloaded.Configuration.Speakers.Identity.MatchThreshold);
+            Assert.Equal(0.08, reloaded.Configuration.Speakers.Identity.MatchMargin);
+            Assert.Equal(5, reloaded.Configuration.Speakers.Identity.SampleMinSeconds);
+            Assert.Equal(15, reloaded.Configuration.Speakers.Identity.SampleMaxSeconds);
+            Assert.Equal(
+                "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx",
+                reloaded.Configuration.Speakers.SherpaOnnx.Model);
+            Assert.True(reloaded.Configuration.Asr.Volcengine.RequestSpeakerInfo);
+            Assert.True(reloaded.Configuration.Transcript.IncludeSpeakerLabels);
+            Assert.Equal(string.Empty, reloaded.Configuration.Capture.Online.ProcessName);
+        }
+        finally
+        {
+            Cleanup(dir);
+        }
+    }
+
+    [Fact]
+    public void Load_ProcessLoopbackConfiguration_RoundTripsProcessName()
+    {
+        var dir = NewDir();
+        try
+        {
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(Path.Combine(dir, "config.toml"), @"config_version = 1
+
+[capture.online]
+loopback_mode = ""process""
+process_name = ""Teams""
+");
+            var store = new TomlConfigurationStore(dir);
+            var load = store.Load();
+
+            Assert.Null(load.LoadError);
+            Assert.Empty(load.UnknownKeys);
+            Assert.Equal("process", load.Configuration.Capture.Online.LoopbackMode);
+            Assert.Equal("Teams", load.Configuration.Capture.Online.ProcessName);
+            Assert.True(ConfigurationValidator.Validate(load.Configuration, load.UnknownKeys).IsValid);
+        }
+        finally
+        {
+            Cleanup(dir);
+        }
+    }
+
+    [Fact]
     public void ToToml_Serialized_ThenRedact_MasksCredential()
     {
         var dir = NewDir();

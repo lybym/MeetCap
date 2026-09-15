@@ -51,8 +51,36 @@ public class ConfigurationDefaultsTests
         Assert.NotNull(c.Asr);
         Assert.NotNull(c.Asr.Volcengine);
         Assert.NotNull(c.Speakers);
+        Assert.NotNull(c.Speakers.Identity);
+        Assert.NotNull(c.Speakers.SherpaOnnx);
         Assert.NotNull(c.Transcript);
         Assert.NotNull(c.Logging);
         Assert.NotNull(c.Retention);
+    }
+
+    [Fact]
+    public void Default_SystemLoopbackIsTheBaseline()
+    {
+        var online = ConfigurationDefaults.Default().Capture.Online;
+        Assert.Equal("system", online.LoopbackMode);
+        Assert.Equal(string.Empty, online.ProcessName);
+    }
+
+    [Fact]
+    public void Default_SpeakerIdentityContract()
+    {
+        var c = ConfigurationDefaults.Default();
+
+        Assert.True(c.Asr.Volcengine.RequestSpeakerInfo);
+        Assert.True(c.Transcript.IncludeSpeakerLabels);
+        Assert.Equal("sherpa_onnx_3dspeaker", c.Speakers.Identity.Provider);
+        Assert.Equal(0.82, c.Speakers.Identity.MatchThreshold);
+        Assert.Equal(0.08, c.Speakers.Identity.MatchMargin);
+        Assert.Equal(5, c.Speakers.Identity.SampleMinSeconds);
+        Assert.Equal(15, c.Speakers.Identity.SampleMaxSeconds);
+        Assert.Equal(
+            "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx",
+            c.Speakers.SherpaOnnx.Model);
+        Assert.Equal(string.Empty, c.Speakers.SherpaOnnx.ModelPath);
     }
 }
