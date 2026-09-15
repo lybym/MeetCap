@@ -305,4 +305,36 @@ internal static class Wait
 
     public static void Until(Func<bool> condition, int timeoutMs = 10_000, int pollMs = 10)
         => UntilAsync(condition, timeoutMs, pollMs).GetAwaiter().GetResult();
+
+    /// <summary>
+    /// Awaits a task with a bound. A test that waits on background recording work must
+    /// never be able to hang the whole suite (and the CI job) forever, so a stall
+    /// becomes a clear failure instead.
+    /// </summary>
+    public static async Task<T> ForAsync<T>(Task<T> task, int timeoutMs, string description)
+    {
+        ArgumentNullException.ThrowIfNull(task);
+
+        var completed = await Task.WhenAny(task, Task.Delay(timeoutMs)).ConfigureAwait(false);
+        if (completed != task)
+        {
+            throw new TimeoutException($"{description} did not finish within {timeoutMs} ms.");
+        }
+
+        return await task.ConfigureAwait(false);
+    }
+
+    /// <summary>Bounded await for a task that returns no value.</summary>
+    public static async Task ForAsync(Task task, int timeoutMs, string description)
+    {
+        ArgumentNullException.ThrowIfNull(task);
+
+        var completed = await Task.WhenAny(task, Task.Delay(timeoutMs)).ConfigureAwait(false);
+        if (completed != task)
+        {
+            throw new TimeoutException($"{description} did not finish within {timeoutMs} ms.");
+        }
+
+        await task.ConfigureAwait(false);
+    }
 }

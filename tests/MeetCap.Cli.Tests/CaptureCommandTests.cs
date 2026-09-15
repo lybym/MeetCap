@@ -146,7 +146,13 @@ public class CaptureCommandTests
         Assert.NotNull(sessionDirectory);
 
         var stop = harness.Run("stop");
-        var start = await startTask;
+
+        // Bounded: if the recorder ever fails to stop, the test must fail with a clear
+        // message rather than hanging the suite and the CI job.
+        var start = await AwaitBounded(
+            startTask,
+            TimeSpan.FromSeconds(60),
+            "meetcap start did not finish after meetcap stop");
 
         Assert.Equal(0, stop.ExitCode);
         Assert.Contains("stopped session", stop.Output);
@@ -254,6 +260,17 @@ public class CaptureCommandTests
         Assert.Contains("devices", result.Error);
         Assert.Contains("start", result.Error);
         Assert.Contains("stop", result.Error);
+    }
+
+    private static async Task<CliResult> AwaitBounded(Task<CliResult> task, TimeSpan timeout, string description)
+    {
+        var completed = await Task.WhenAny(task, Task.Delay(timeout)).ConfigureAwait(false);
+        if (completed != task)
+        {
+            throw new TimeoutException($"{description} (waited {timeout}).");
+        }
+
+        return await task.ConfigureAwait(false);
     }
 
     private static string? WaitForSessionDirectory(string dataRoot)

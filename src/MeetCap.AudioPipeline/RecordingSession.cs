@@ -170,8 +170,12 @@ public sealed class RecordingSession
             });
 
             BeginRecording();
-            _stopSignal.Clear();
 
+            // NOTE: the stop marker is deliberately NOT cleared here. The session
+            // directory is unique to this session, so there is no stale marker to
+            // remove, and `meetcap stop` may legitimately have written one in the window
+            // between the session row being created and capture starting. Clearing it
+            // would silently discard that request and the recording would never stop.
             var consumer = Task.Run(ConsumeAsync);
             var housekeeping = Task.Run(HousekeepAsync);
 

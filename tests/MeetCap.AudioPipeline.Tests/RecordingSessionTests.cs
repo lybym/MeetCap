@@ -37,7 +37,7 @@ public class RecordingSessionTests
         TestAudio.EmitSeconds(source, Format, 0, milliseconds: 150_000);
         cancellation.Cancel();
 
-        var outcome = await run;
+        var outcome = await Finish(run);
 
         Assert.Equal(SessionStatus.Completed, outcome.Status);
         Assert.True(outcome.IsClean);
@@ -96,7 +96,7 @@ public class RecordingSessionTests
         Assert.True(await Wait.UntilAsync(() => source.StartCount == 1));
         TestAudio.EmitSeconds(source, Format, 0, milliseconds: 60_000);
         cancellation.Cancel();
-        await run;
+        await Finish(run);
 
         var firstClose = ReadEvents(paths).First(e => Name(e) == SessionEventNames.ChunkClosed);
 
@@ -127,7 +127,7 @@ public class RecordingSessionTests
         source.Emit(TestAudio.Packet(Format, skipFrames, TestAudio.Frames(Format, 1_000)));
         cancellation.Cancel();
 
-        var outcome = await run;
+        var outcome = await Finish(run);
 
         Assert.True(outcome.Degraded);
         var gap = Assert.Single(ReadEvents(paths), e => Name(e) == SessionEventNames.CaptureGap);
@@ -156,7 +156,7 @@ public class RecordingSessionTests
             AudioBufferFlags.DataDiscontinuity));
         cancellation.Cancel();
 
-        var outcome = await run;
+        var outcome = await Finish(run);
 
         Assert.True(outcome.Degraded);
         Assert.Equal(1, CountEvents(ReadEvents(paths), SessionEventNames.CaptureDiscontinuity));
@@ -187,7 +187,7 @@ public class RecordingSessionTests
         TestAudio.EmitSeconds(source, Format, TestAudio.Frames(Format, 100), milliseconds: 900);
         cancellation.Cancel();
 
-        var outcome = await run;
+        var outcome = await Finish(run);
 
         Assert.False(outcome.Degraded);
         Assert.True(outcome.IsClean);
@@ -227,7 +227,7 @@ public class RecordingSessionTests
         TestAudio.EmitSeconds(second, Format, 0, milliseconds: 20_000);
         cancellation.Cancel();
 
-        var outcome = await run;
+        var outcome = await Finish(run);
 
         Assert.True(outcome.Degraded);
         Assert.False(outcome.IsClean);
@@ -264,7 +264,7 @@ public class RecordingSessionTests
         TestAudio.EmitSeconds(source, Format, 0, milliseconds: 5_000);
         source.Fail(new InvalidOperationException("device unplugged"));
 
-        var outcome = await run;
+        var outcome = await Finish(run);
 
         Assert.True(outcome.Degraded);
         Assert.False(outcome.IsClean);
@@ -293,7 +293,7 @@ public class RecordingSessionTests
         var session = harness.Service.PrepareSession("Never Started");
         var paths = Paths(harness, session);
 
-        var outcome = await session.RunAsync();
+        var outcome = await Finish(session.RunAsync());
 
         Assert.Equal(SessionStatus.Interrupted, outcome.Status);
         Assert.False(outcome.IsClean);
@@ -324,7 +324,7 @@ public class RecordingSessionTests
         // This is exactly what `meetcap stop` does in another process.
         new SessionStopSignal(paths.StopRequestPath).Request("meetcap stop");
 
-        var outcome = await run;
+        var outcome = await Finish(run);
 
         Assert.Equal(SessionStatus.Completed, outcome.Status);
         Assert.True(outcome.IsClean);
@@ -335,6 +335,31 @@ public class RecordingSessionTests
         Assert.Equal(1, CountEvents(events, SessionEventNames.SessionStopRequested));
 
         // The marker is cleaned up so the directory does not look like it is still stopping.
+        Assert.False(File.Exists(paths.StopRequestPath));
+    }
+
+    [Fact]
+    public async Task RunAsync_StopRequestedBeforeCaptureStarts_IsNotDiscarded()
+    {
+        using var harness = new SessionHarness(chunkSeconds: 60);
+        var source = new FakeCaptureSource(Format, harness.Device);
+        harness.Sources.Enqueue(source);
+
+        var session = harness.Service.PrepareSession("Early Stop");
+        var paths = Paths(harness, session);
+
+        // `meetcap stop` can land in the window between the session row existing and
+        // capture starting. That request must survive, otherwise the recording runs
+        // forever and `meetcap stop` reports a timeout.
+        new SessionStopSignal(paths.StopRequestPath).Request("meetcap stop");
+
+        var outcome = await Wait.ForAsync(
+            session.RunAsync(),
+            timeoutMs: 20_000,
+            "a session whose stop was requested before capture started");
+
+        Assert.Equal(SessionStatus.Completed, outcome.Status);
+        Assert.Equal("stop_requested", outcome.EndReason);
         Assert.False(File.Exists(paths.StopRequestPath));
     }
 
@@ -360,7 +385,7 @@ public class RecordingSessionTests
         Assert.True(await Wait.UntilAsync(() => CountDiskEvents(paths) > 0, timeoutMs: 5_000));
 
         cancellation.Cancel();
-        var outcome = await run;
+        var outcome = await Finish(run);
 
         Assert.True(outcome.Degraded);
         Assert.Equal(SessionStatus.Completed, outcome.Status);
@@ -422,7 +447,7 @@ public class RecordingSessionTests
         await Task.Delay(400);
 
         cancellation.Cancel();
-        var outcome = await run;
+        var outcome = await Finish(run);
 
         Assert.Equal(SessionStatus.Completed, outcome.Status);
         Assert.Equal(1, CountEvents(ReadEvents(paths), SessionEventNames.StorageProbeFailed));
@@ -455,7 +480,7 @@ public class RecordingSessionTests
             "overflow was not reported");
 
         cancellation.Cancel();
-        var outcome = await run;
+        var outcome = await Finish(run);
 
         Assert.True(outcome.Degraded);
 
@@ -525,7 +550,7 @@ public class RecordingSessionTests
         var run = session.RunAsync(cancellation.Token);
         Assert.True(await Wait.UntilAsync(() => source.StartCount == 1));
         cancellation.Cancel();
-        await run;
+        await Finish(run);
 
         SessionManifestStore.TryLoad(paths.ManifestPath, out var manifest, out var error);
         Assert.True(manifest is not null, error);
@@ -541,6 +566,13 @@ public class RecordingSessionTests
 
     private static SessionPaths Paths(SessionHarness harness, RecordingSession session)
         => new(harness.DataRoot, session.SessionId);
+
+    /// <summary>
+    /// Bounded wait for a recording session. A stalled session must fail the test with a
+    /// clear message instead of hanging the suite.
+    /// </summary>
+    private static Task<RecordingSessionOutcome> Finish(Task<RecordingSessionOutcome> run)
+        => Wait.ForAsync(run, timeoutMs: 60_000, "the recording session");
 
     private static SessionManifest ReadManifest(SessionPaths paths)
     {

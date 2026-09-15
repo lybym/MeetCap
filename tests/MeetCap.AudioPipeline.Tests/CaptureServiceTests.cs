@@ -114,7 +114,7 @@ public class CaptureServiceTests
         });
 
         var outcome = harness.Service.RequestStop(TimeSpan.FromSeconds(5));
-        await recorder;
+        await Wait.ForAsync(recorder, timeoutMs: 10_000, "the stand-in recorder");
 
         Assert.True(outcome.Signalled);
         Assert.True(outcome.ConfirmedStopped);
