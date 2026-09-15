@@ -137,6 +137,8 @@ CLI composition root
 
 `MeetCap.Core` MUST NOT reference NAudio, Volcengine SDK/JSON types, sherpa-onnx types, SQLite-specific types, FFmpeg wrapper types, Polly-specific types, or CLI-library types.
 
+This rule is machine-checked by `tests/MeetCap.Core.Tests/Architecture/CoreDependencyBoundaryTests.cs`, so adopting an OSS building block cannot quietly move infrastructure types into the domain project.
+
 ---
 
 ## 4. Runtime components

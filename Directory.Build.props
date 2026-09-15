@@ -1,0 +1,19 @@
+<Project>
+  <PropertyGroup>
+    <Product>MeetCap</Product>
+    <Authors>MeetCap</Authors>
+    <Copyright>Copyright (c) MeetCap contributors. See LICENSE.</Copyright>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+    <!-- MeetCap is a self-contained repository: pin package versions inline per project.
+         This deliberately opts out of any ancestor central package management. -->
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+    <!-- M0 skeleton: rely on compiler warnings (CS*) enforced as errors.
+         Code analyzers (CA*) can be tightened in a later quality milestone. -->
+    <EnableNETAnalyzers>false</EnableNETAnalyzers>
+  </PropertyGroup>
+</Project>

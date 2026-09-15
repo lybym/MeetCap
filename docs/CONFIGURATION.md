@@ -90,6 +90,8 @@ process
 
 `process` is a capture-source option, not a separate meeting mode, and should use NAudio process-loopback support where available.
 
+`system` is the baseline online path and requires no further input. `process_name` names the target process and is therefore required when `loopback_mode = "process"`; validation rejects `process` with an empty `process_name` rather than failing later during capture.
+
 ## 6. Durability
 
 ```toml
@@ -139,6 +141,8 @@ Credential references may include `env:` and `credman:` schemes.
 
 Provider speaker labels are session-scoped anonymous labels. They are not persistent identities and must not be treated as names.
 
+Because these labels are the default MVP diarization source, `speakers.enabled = true` with `request_speaker_info = false` produces a validation warning: recording still succeeds, but no anonymous speaker clusters exist for the identity pipeline to match, so nobody can be identified unless a local diarization fallback is configured.
+
 ## 9. Speaker architecture
 
 Speaker processing has two separate responsibilities:
@@ -183,6 +187,13 @@ sample_max_seconds = 15
 
 Initial thresholds are placeholders until calibrated on real Chinese meeting recordings.
 
+Validation rules:
+
+- `provider` must be a supported identity provider (`sherpa_onnx_3dspeaker`).
+- `match_threshold` and `match_margin` must be within `[0, 1]`.
+- `sample_min_seconds` must be greater than `0`.
+- `sample_max_seconds` must be greater than or equal to `sample_min_seconds`.
+
 Low-confidence matches remain unknown.
 
 ### 9.3 sherpa-onnx + 3D-Speaker
@@ -195,9 +206,17 @@ model_path = ""
 
 The default identity implementation uses sherpa-onnx to run the 3D-Speaker ERes2Net-base embedding model locally.
 
+`model_path` is empty by default, which means the model is resolved from the configured data root.
+
 The default Windows runtime should not require Python or PyTorch.
 
 A future local diarization fallback may also use sherpa-onnx, but this is not required for the MVP.
+
+### 9.4 Implementation status
+
+The speaker sections above are part of the configuration contract from M0 onward: the keys are declared, defaulted, validated, and shipped in `config.example.toml`.
+
+Enrollment, embedding extraction, similarity search, and manual assignment are implemented in M6. M0 does not load a speaker model, and an unconfigured `model_path` is not an error until M6 resolves it. Speaker configuration can never fail recording.
 
 ## 10. Transcript
 
@@ -232,3 +251,10 @@ A running session uses a configuration snapshot captured at session start. Editi
 ## 13. Config migration
 
 The file contains `config_version = 1`. Breaking changes require migration or an actionable validation error.
+
+The pre-speaker-identity flat keys `speakers.provider`, `speakers.match_threshold`, and
+`speakers.match_margin` are rejected even when `config_version = 1`; they cannot silently
+fall back to the current identity defaults. Remove `speakers.provider` and explicitly set
+`[speakers.identity] provider = "sherpa_onnx_3dspeaker"` after confirming it is appropriate
+for the deployment. Move the two numeric values into `[speakers.identity]` as
+`match_threshold` and `match_margin`, respectively.

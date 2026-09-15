@@ -1,0 +1,11 @@
+<Project>
+  <!--
+    MeetCap is a self-contained repository and pins package versions inline on
+    each PackageReference. This file is the nearest Directory.Packages.props for
+    MeetCap projects and explicitly opts out of central package management so
+    that no ancestor (e.g. a host checkout) can force central pinning onto us.
+  -->
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+</Project>
