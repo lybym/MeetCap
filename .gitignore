@@ -13,7 +13,9 @@ TestResults/
 
 # Local runtime data
 data/
-sessions/
+# Repo-root only: a source folder such as src/MeetCap.Core/Sessions must never be
+# ignored just because it is named "sessions".
+/sessions/
 *.db
 *.db-shm
 *.db-wal
