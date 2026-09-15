@@ -7,7 +7,6 @@ using MeetCap.Core.Configuration;
 using MeetCap.Core.Secrets;
 using MeetCap.Persistence.Configuration;
 using Microsoft.Extensions.Logging;
-using Serilog;
 
 /// <summary>
 /// MeetCap CLI entry point and composition root. Builds the System.CommandLine
@@ -40,8 +39,7 @@ public static class Program
         CliEnvironment? environment = null,
         IConfigurationStore? configurationStore = null,
         InvocationConfiguration? invocationConfiguration = null,
-        ParserConfiguration? parserConfiguration = null,
-        bool disposeLogger = true)
+        ParserConfiguration? parserConfiguration = null)
     {
         ArgumentNullException.ThrowIfNull(args);
         environment ??= CliEnvironment.Instance;
@@ -69,16 +67,9 @@ public static class Program
 
         ApplyConfiguredLogLevel(store, levelSwitch);
 
-        var exitCode = parseResult.Invoke(invocationConfiguration);
-
-        if (disposeLogger)
-        {
-            // Serilog's ILogger has no Dispose; CloseAndFlush flushes and closes only
-            // this logger instance (unlike the static Log.CloseAndFlush).
-            Log.CloseAndFlush(logger);
-        }
-
-        return exitCode;
+        // The logger factory owns the Serilog logger and closes/flushes it when this
+        // method returns.
+        return parseResult.Invoke(invocationConfiguration);
     }
 
     private static void WriteParseErrors(ParseResult parseResult, TextWriter error)

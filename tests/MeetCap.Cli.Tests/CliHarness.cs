@@ -43,16 +43,16 @@ internal sealed class CliHarness : IDisposable
         using var output = new StringWriter();
         using var error = new StringWriter();
 
-        // disposeLogger: false keeps the Serilog pipeline attached to the captured
-        // writers for the whole test so nothing is lost on shutdown.
         var exitCode = Program.Run(
             args,
             Environment,
             Store,
-            new InvocationConfiguration { Output = output, Error = error },
-            disposeLogger: false);
+            new InvocationConfiguration { Output = output, Error = error });
 
-        return new CliResult(exitCode, output.ToString(), error.ToString());
+        // Read the captured text before the writers are disposed; the command tree
+        // writes through these instances and Run returns after the pipeline flushed.
+        var captured = new CliResult(exitCode, output.ToString(), error.ToString());
+        return captured;
     }
 
     public void WriteConfig(string toml) => File.WriteAllText(ConfigFilePath, toml);
