@@ -48,6 +48,8 @@ built-in defaults
 [asr]
 [asr.volcengine]
 [speakers]
+[speakers.identity]
+[speakers.sherpa_onnx]
 [transcript]
 [logging]
 [retention]
@@ -76,9 +78,17 @@ microphone_device_id = "default"
 microphone_device_id = "default"
 loopback_mode = "system"
 render_device_id = "default"
+process_name = ""
 ```
 
-Future process-specific loopback may add `process_name` without creating a new meeting mode.
+Allowed `loopback_mode` values:
+
+```text
+system
+process
+```
+
+`process` is a capture-source option, not a separate meeting mode, and should use NAudio process-loopback support where available.
 
 ## 6. Durability
 
@@ -110,6 +120,8 @@ Allowed service tiers: `standard`, `idle`, `turbo`.
 
 The app MUST NOT silently switch to streaming when file ASR fails.
 
+Retry configuration defines provider-execution resilience. Persistent retry/job state remains stored in the ASR job queue.
+
 ## 8. Volcengine
 
 ```toml
@@ -118,24 +130,74 @@ app_id = "your-app-id"
 credential = "env:MEETCAP_VOLCENGINE_ACCESS_TOKEN"
 resource_id = "volc.bigasr.auc"
 hotword_table_id = ""
+request_speaker_info = true
 ```
 
 Credential references may include `env:` and `credman:` schemes.
 
-## 9. Speaker
+`request_speaker_info = true` means MeetCap asks Volcengine for anonymous speaker information when the selected API/service tier supports it.
+
+Provider speaker labels are session-scoped anonymous labels. They are not persistent identities and must not be treated as names.
+
+## 9. Speaker architecture
+
+Speaker processing has two separate responsibilities:
+
+```text
+diarization     -> who spoke when? -> speaker_0 / speaker_1 / ...
+identification  -> who is speaker_1? -> Alice / Bob / Unknown
+```
+
+For the MVP:
+
+```text
+Diarization default:
+Volcengine BigASR anonymous speaker labels
+
+Identity default:
+sherpa-onnx + 3D-Speaker ERes2Net-base
+```
+
+### 9.1 General speaker policy
 
 ```toml
 [speakers]
 enabled = true
-provider = "local"
 owner_name = ""
 auto_suggest = true
-match_threshold = 0.82
-match_margin = 0.08
 manual_assignment_locked = true
 ```
 
-Initial thresholds are placeholders until calibrated on real recordings.
+Manual assignment is authoritative.
+
+### 9.2 Identity matching
+
+```toml
+[speakers.identity]
+provider = "sherpa_onnx_3dspeaker"
+match_threshold = 0.82
+match_margin = 0.08
+sample_min_seconds = 5
+sample_max_seconds = 15
+```
+
+Initial thresholds are placeholders until calibrated on real Chinese meeting recordings.
+
+Low-confidence matches remain unknown.
+
+### 9.3 sherpa-onnx + 3D-Speaker
+
+```toml
+[speakers.sherpa_onnx]
+model = "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx"
+model_path = ""
+```
+
+The default identity implementation uses sherpa-onnx to run the 3D-Speaker ERes2Net-base embedding model locally.
+
+The default Windows runtime should not require Python or PyTorch.
+
+A future local diarization fallback may also use sherpa-onnx, but this is not required for the MVP.
 
 ## 10. Transcript
 
@@ -146,9 +208,12 @@ write_markdown = true
 live_markdown = true
 include_source = true
 include_timestamps = true
+include_speaker_labels = true
 ```
 
 Raw normalized JSONL remains internally mandatory.
+
+Anonymous `speaker_label` and persistent `speaker_id` / `speaker_name` remain separate fields.
 
 ## 11. Storage
 
@@ -157,6 +222,8 @@ Raw normalized JSONL remains internally mandatory.
 data_root = "%LOCALAPPDATA%\\MeetCap"
 minimum_free_space_gb = 5
 ```
+
+Speaker embeddings and voiceprint/name mappings are stored locally by default and should be treated as sensitive identity-related data.
 
 ## 12. Reload behavior
 
