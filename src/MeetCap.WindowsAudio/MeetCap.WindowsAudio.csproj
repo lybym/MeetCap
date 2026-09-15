@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <RootNamespace>MeetCap.WindowsAudio</RootNamespace>
+    <AssemblyName>MeetCap.WindowsAudio</AssemblyName>
+    <PackageId>MeetCap.WindowsAudio</PackageId>
+    <Description>MeetCap Windows audio boundary: NAudio 3 device enumeration and WASAPI capture behind MeetCap-owned abstractions.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MeetCap.Core\MeetCap.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- #3 / docs/ARCHITECTURE.md section 2: NAudio modern WasapiRecorder/builder APIs.
+         NAudio types must never leave this assembly (docs/DEVELOPMENT.md section 4). -->
+    <PackageReference Include="NAudio" Version="3.1.0" />
+  </ItemGroup>
+
+</Project>

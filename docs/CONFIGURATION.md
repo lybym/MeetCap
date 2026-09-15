@@ -103,6 +103,19 @@ flush_interval_ms = 1000
 
 Validation must reject unsafe values.
 
+What M1 does with them:
+
+- `chunk_seconds` sets the chunk capacity in frames
+  (`chunk_seconds × sample_rate × block_align`). A chunk is cut at exactly that boundary
+  even when a device buffer straddles it, so `audio/mic/000001.wav` really is one chunk
+  of audio rather than "roughly one".
+- `buffer_seconds` bounds the in-memory packet queue between the capture callback and the
+  disk writer. When the queue is full the callback is never blocked: the audio is
+  dropped, counted, and reported as a `capture.buffer_overflow` degraded event.
+- `flush_interval_ms` is how often the open chunk is flushed towards the operating
+  system. It never affects durability of closed chunks, which are flushed to disk before
+  they are renamed out of `.part`.
+
 ## 7. ASR
 
 ```toml
@@ -243,6 +256,18 @@ minimum_free_space_gb = 5
 ```
 
 Speaker embeddings and voiceprint/name mappings are stored locally by default and should be treated as sensitive identity-related data.
+
+`minimum_free_space_gb` is enforced twice, as `docs/RELIABILITY.md` section 10 requires:
+
+- **before start**: free space below the threshold fails `meetcap start` with a non-zero
+  exit code, before any session directory is created;
+- **while recording**: dropping below it writes a rate-limited `storage.low_disk_space`
+  event and recording continues.
+
+Independently of the configured value there is a 256 MB hard floor. Free space below it
+writes `storage.disk_exhausted`, stops the session, and leaves every already closed chunk
+readable. Older recordings are never deleted automatically
+(`retention.automatic_delete` stays `false` by default).
 
 ## 12. Reload behavior
 

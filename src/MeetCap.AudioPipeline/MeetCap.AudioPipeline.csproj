@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <RootNamespace>MeetCap.AudioPipeline</RootNamespace>
+    <AssemblyName>MeetCap.AudioPipeline</AssemblyName>
+    <PackageId>MeetCap.AudioPipeline</PackageId>
+    <Description>MeetCap durable audio spool: recoverable WAV chunk lifecycle, session artifacts, disk-space policy and startup recovery.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MeetCap.Core\MeetCap.Core.csproj" />
+    <ProjectReference Include="..\MeetCap.Persistence\MeetCap.Persistence.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="MeetCap.AudioPipeline.Tests" />
+  </ItemGroup>
+
+</Project>

@@ -139,6 +139,22 @@ CLI composition root
 
 This rule is machine-checked by `tests/MeetCap.Core.Tests/Architecture/CoreDependencyBoundaryTests.cs`, so adopting an OSS building block cannot quietly move infrastructure types into the domain project.
 
+Implemented so far:
+
+```text
+Core                    domain types and abstractions only, no package references
+Persistence             Tomlyn config store, SQLite migrations and repositories
+WindowsAudio            NAudio 3 endpoint enumeration and WASAPI capture
+AudioPipeline           bounded queue, chunk spool, session artifacts, recovery scan
+Cli                     composition root: config, status, devices, start, stop
+```
+
+`MeetCap.AudioPipeline` sits above `Core` and `Persistence`: it owns the capture
+lifecycle and writes the session artifacts and their index. It does not reference
+`MeetCap.WindowsAudio`; the CLI composition root is the only place that joins a
+concrete audio platform to the pipeline, which is what keeps the pipeline testable
+without audio hardware.
+
 ---
 
 ## 4. Runtime components
@@ -311,6 +327,40 @@ online.loopback.mode = process
 
 Where NAudio/Windows support process loopback, MeetCap should use that implementation rather than recreate the underlying Windows activation plumbing.
 
+### 7.1 M1 implementation
+
+`MeetCap.WindowsAudio` is the only project that references NAudio. It uses NAudio 3's
+`WasapiRecorderBuilder` in shared mode and exposes:
+
+```text
+IAudioDeviceEnumerator      active capture endpoints and the system default
+IAudioCaptureSourceFactory  creates a capture source for a resolved endpoint
+IAudioCaptureSource         Format, Device, PacketAvailable, Stopped, Start, Stop
+```
+
+`AudioPacket` is the MeetCap-owned packet that crosses that boundary. It carries the
+source, the native `AudioFormat`, a private copy of the bytes, the device position in
+frames, the device QPC timestamp when one was supplied, the observation time, and
+MeetCap-owned buffer flags. No NAudio type escapes the assembly, and no conversion or
+resampling happens on the capture thread: the device's own mix format is recorded.
+
+The recording pipeline owns the bounded queue:
+
+```text
+capture callback  ->  bounded packet queue  ->  consumer  ->  chunk spool
+                                                          ->  SQLite chunk index
+                                                          ->  events.jsonl
+```
+
+The queue is bounded from `capture.buffer_seconds`. `TryWrite` is used, so a full queue
+can never block the capture callback: the drop is counted and reported as an explicit
+`capture.buffer_overflow` degraded event instead of being hidden.
+
+A capture device that disappears ends only the current capture segment. The session
+closes the audio already captured, waits, re-resolves the configured endpoint, and
+restarts capture behind the same session; a device that cannot be recovered ends the
+session with everything already captured still closed and durable.
+
 ---
 
 ## 8. Timing
@@ -329,6 +379,23 @@ format
 NAudio-provided timing metadata should be carried through the MeetCap abstraction rather than independently re-derived when unnecessary.
 
 Do not build the unified timeline only from wall-clock timestamps.
+
+### 8.1 Session timeline
+
+The first observed packet defines the session origin. Every later packet is placed by
+device position, so session-relative milliseconds come from the device rather than from
+a wall-clock read. QPC is preserved on the packet and as a per-chunk start anchor, so a
+recorded timeline can be cross-checked afterwards.
+
+Discontinuities are never smoothed over:
+
+- a device position that jumps forward produces a `capture.gap` event carrying the
+  missing duration, and later audio stays where the device says it belongs;
+- a device position that moves backwards (a restarted stream) is clamped so the session
+  timeline stays monotonic, and is reported as a `capture.discontinuity`;
+- the device's own buffer flags are surfaced as `capture.discontinuity`;
+- after a device loss and recovery, the measured outage is inserted as an explicit gap,
+  and the first buffer of the new stream starts a new chunk.
 
 ---
 
@@ -370,6 +437,32 @@ This lifecycle is MeetCap-owned domain logic and must not be delegated to a gene
 Only `CLOSED` chunks are eligible for ASR batching.
 
 Startup recovery scans `.part` files and either repairs them or records an explicit loss event.
+
+### 9.1 M1 implementation
+
+Each chunk is a plain 44-byte-header WAV file in the device's native format. The header
+is complete from the first byte, describing zero data, so a process kill at any point
+leaves a file whose audio length is exactly `fileLength - 44`. Closing a chunk patches
+the two size fields, flushes to disk, validates the header against the actual length and
+format, and only then renames out of `.part`. A chunk that fails validation stays as
+`.part` and the session reports the failure rather than declaring it durable.
+
+Chunk boundaries are cut by frame capacity
+(`chunk_seconds * sample_rate * block_align`), not by wall-clock time and not by
+"whatever the device happened to deliver", so a boundary is exactly one chunk of audio
+even when a buffer straddles it.
+
+Startup recovery runs before a new recording starts and from `meetcap status`:
+
+```text
+.part with audio             -> patch header, validate, rename, mark recovered
+.part without audio          -> discard it (it holds nothing), report audio.chunk.corrupt
+.part that is not a WAV      -> leave the bytes in place, mark corrupt, report the reason
+session not cleanly stopped  -> status INTERRUPTED, manifest records recovered_at
+```
+
+Previously closed chunks are never reopened or rewritten, which is what makes a forced
+kill unable to damage them.
 
 ---
 
@@ -648,6 +741,7 @@ No component may read ad-hoc environment variables directly except the configura
     <session-id>/
       session.json
       events.jsonl
+      stop.request          (present only while a stop is being requested)
       audio/
         mic/
         loopback/
@@ -664,6 +758,11 @@ No component may read ad-hoc environment variables directly except the configura
       logs/
         session.log
 ```
+
+`stop.request` is a control marker, not an artifact. `meetcap stop` runs in a different
+process from `meetcap start`, so it signals the running recorder by writing this file,
+which the recording loop polls. It carries no session state and is removed when the
+session ends. See `docs/DATA_MODEL.md` section 2.
 
 Speaker embeddings and name mappings remain local by default and are treated as sensitive identity-related data.
 
@@ -688,14 +787,33 @@ PROCESSING
 COMPLETED
 ```
 
+M1 implements the subset that has no post-capture work yet:
+
+```text
+CREATED -> RECORDING -> FINALIZING -> COMPLETED     clean stop, every artifact closed
+CREATED|RECORDING -> INTERRUPTED                    abandoned, never completed cleanly
+```
+
+`INTERRUPTED` is terminal and is entered only when startup recovery finds a session that
+was never cleanly stopped, or when the recording process itself cannot finish (capture
+never started, or the last chunk could not be closed). It is never used for a degraded
+but complete recording.
+
+A device loss that is recovered does **not** interrupt a session: the session still
+reaches `COMPLETED`, and the outage appears as a `degraded` flag plus explicit
+`capture.device_lost` / `capture.device_restored` / `capture.gap` events. `PROCESSING`
+arrives with the ASR milestones, when a completed recording can still own outstanding
+jobs.
+
 Degraded conditions are orthogonal flags/events, not necessarily terminal states.
 
 Examples:
 
 ```text
 ASR_OFFLINE
-LOOPBACK_DEVICE_LOST
+DEVICE_LOST
 LOW_DISK_SPACE
+BUFFER_OVERFLOW
 SPEAKER_PROVIDER_FAILED
 ```
 

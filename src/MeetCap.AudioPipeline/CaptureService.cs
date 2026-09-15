@@ -1,0 +1,213 @@
+namespace MeetCap.AudioPipeline;
+
+using MeetCap.Core.Capture;
+using MeetCap.Core.Diagnostics;
+using MeetCap.Core.Sessions;
+using MeetCap.Persistence.Storage;
+
+/// <summary>A recording session that is currently open.</summary>
+public sealed record ActiveSessionInfo(
+    string SessionId,
+    string SessionDirectory,
+    string Title,
+    string Status,
+    DateTimeOffset? StartedAt);
+
+/// <summary>What <c>meetcap stop</c> managed to do.</summary>
+public sealed record StopRequestOutcome(
+    bool Signalled,
+    string? SessionId,
+    string Message,
+    bool ConfirmedStopped);
+
+/// <summary>
+/// The recording operations the CLI drives: device listing, session preparation,
+/// running a session, requesting a stop, and the startup recovery scan.
+/// </summary>
+/// <remarks>
+/// Keeping this here instead of in the command handlers means <c>meetcap start</c>,
+/// <c>meetcap stop</c> and <c>meetcap status</c> stay thin adapters over one
+/// implementation (docs/DEVELOPMENT.md section 8).
+/// </remarks>
+public sealed class CaptureService
+{
+    private static readonly TimeSpan StopPollInterval = TimeSpan.FromMilliseconds(200);
+
+    private readonly CapturePlatform _platform;
+    private readonly MeetCapDatabase _database;
+    private readonly CaptureSettings _settings;
+    private readonly int _maxDeviceRecoveryAttempts;
+
+    public CaptureService(
+        CapturePlatform platform,
+        MeetCapDatabase database,
+        CaptureSettings settings,
+        int maxDeviceRecoveryAttempts = 3)
+    {
+        _platform = platform ?? throw new ArgumentNullException(nameof(platform));
+        _database = database ?? throw new ArgumentNullException(nameof(database));
+        _settings = settings ?? throw new ArgumentNullException(nameof(settings));
+
+        if (maxDeviceRecoveryAttempts < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maxDeviceRecoveryAttempts),
+                maxDeviceRecoveryAttempts,
+                "Device recovery attempts must not be negative.");
+        }
+
+        _maxDeviceRecoveryAttempts = maxDeviceRecoveryAttempts;
+    }
+
+    public CaptureSettings Settings => _settings;
+
+    /// <summary>Active capture endpoints, default first.</summary>
+    public IReadOnlyList<CaptureDeviceInfo> ListDevices() => OrderDevices(_platform.Devices.EnumerateCaptureDevices());
+
+    /// <summary>
+    /// Stable presentation order for device listings: the system default first, then
+    /// alphabetical. Shared so <c>meetcap devices</c> does not need a database just to
+    /// sort a list.
+    /// </summary>
+    public static IReadOnlyList<CaptureDeviceInfo> OrderDevices(IEnumerable<CaptureDeviceInfo> devices)
+    {
+        ArgumentNullException.ThrowIfNull(devices);
+
+        return devices
+            .OrderByDescending(d => d.IsDefault)
+            .ThenBy(d => d.DisplayName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    /// <summary>The endpoint a session would record from.</summary>
+    /// <exception cref="DeviceUnavailableException">The configured device cannot be resolved.</exception>
+    public CaptureDeviceInfo ResolveDevice()
+        => AudioDeviceResolver.Resolve(_platform.Devices, _settings.MicrophoneDeviceId);
+
+    /// <summary>Runs the startup scan (docs/RELIABILITY.md section 6).</summary>
+    public RecoveryReport RunStartupRecovery()
+    {
+        _database.EnsureMigrated();
+        return new SessionRecoveryScanner(_database, _platform.Clock).Scan(_settings.DataRoot);
+    }
+
+    /// <summary>The newest session that still holds the recording surface, if any.</summary>
+    public ActiveSessionInfo? FindActiveSession()
+    {
+        var record = _database.Sessions.FindActiveSession();
+        if (record is null)
+        {
+            return null;
+        }
+
+        return new ActiveSessionInfo(
+            record.Id,
+            new SessionPaths(_settings.DataRoot, record.Id).SessionDirectory,
+            record.Title,
+            record.Status,
+            record.StartedAt);
+    }
+
+    /// <summary>
+    /// Creates the session directory, manifest and index row, then returns the runner
+    /// for it. Everything that can fail before recording — device resolution and the
+    /// free-space check — fails here, before any artifact is written.
+    /// </summary>
+    /// <exception cref="DeviceUnavailableException">No usable microphone.</exception>
+    /// <exception cref="InsufficientDiskSpaceException">Not enough free space to record.</exception>
+    public RecordingSession PrepareSession(string title)
+    {
+        var device = ResolveDevice();
+
+        new DiskSpaceMonitor(_platform.DiskSpace, _settings.MinimumFreeSpaceBytes)
+            .EnsureSufficientAtStart(_settings.DataRoot);
+
+        var now = _platform.Clock.UtcNow;
+        var sessionId = SessionIds.Create(now);
+        var paths = new SessionPaths(_settings.DataRoot, sessionId);
+        paths.CreateDirectories();
+
+        var manifest = new SessionManifest
+        {
+            SessionId = sessionId,
+            Title = title,
+            Mode = SessionModes.Offline,
+            SourceType = SessionSourceTypes.Live,
+            Status = SessionStatus.Created,
+            ConfigVersion = _settings.ConfigVersion,
+            Tracks = new[] { AudioSources.Mic },
+            ChunkSeconds = _settings.ChunkSeconds,
+        };
+        SessionManifestStore.Save(paths.ManifestPath, manifest);
+
+        _database.Sessions.Insert(new SessionRecord
+        {
+            Id = sessionId,
+            Title = title,
+            Mode = SessionModes.Offline,
+            SourceType = SessionSourceTypes.Live,
+            Status = SessionStatus.Created,
+            ConfigVersion = _settings.ConfigVersion,
+            ConfigSnapshot = CaptureConfigSnapshot.ToJson(_settings),
+            Tracks = new[] { AudioSources.Mic },
+            CreatedAt = now,
+            UpdatedAt = now,
+        });
+
+        return new RecordingSession(
+            paths,
+            _settings,
+            _platform,
+            _database,
+            new JsonlSessionEventSink(paths.EventsPath),
+            device,
+            _platform.Clock,
+            manifest,
+            _maxDeviceRecoveryAttempts);
+    }
+
+    /// <summary>
+    /// Signals the running recording process to stop and, when it is a live process,
+    /// waits for the session to reach a terminal state.
+    /// </summary>
+    public StopRequestOutcome RequestStop(TimeSpan wait)
+    {
+        var active = FindActiveSession();
+        if (active is null)
+        {
+            return new StopRequestOutcome(false, null, "no active recording session", false);
+        }
+
+        var paths = new SessionPaths(_settings.DataRoot, active.SessionId);
+        if (!Directory.Exists(paths.SessionDirectory))
+        {
+            return new StopRequestOutcome(
+                false,
+                active.SessionId,
+                $"session '{active.SessionId}' has no directory on disk; run 'meetcap status' to recover it",
+                false);
+        }
+
+        new SessionStopSignal(paths.StopRequestPath).Request("meetcap stop");
+
+        // Stopwatch rather than the injected clock: the wait must make progress even
+        // when time is faked, and it must never be able to spin forever.
+        var deadline = System.Diagnostics.Stopwatch.StartNew();
+        while (deadline.Elapsed < wait)
+        {
+            Thread.Sleep(StopPollInterval);
+
+            var current = _database.Sessions.Find(active.SessionId);
+            if (current is null || !SessionStatus.IsActive(current.Status))
+            {
+                return new StopRequestOutcome(true, active.SessionId, "recording stopped", true);
+            }
+        }
+
+        return new StopRequestOutcome(
+            true,
+            active.SessionId,
+            "stop requested; the recording process is still finalizing its last chunk",
+            false);
+    }
+}

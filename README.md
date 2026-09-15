@@ -27,18 +27,27 @@ Imported recordings remain a first-class workflow:
 meetcap import .\meeting.m4a --title "Project Review"
 ```
 
-## Planned CLI
+## CLI
+
+Implemented:
 
 ```powershell
+meetcap devices                  # active capture endpoints, default and configured
 meetcap start "Weekly Meeting" --mode offline
-meetcap start "Remote Review" --mode online
-meetcap stop
-meetcap status
-meetcap import .\recording.m4a
-meetcap devices
-meetcap speakers list
+meetcap stop                     # signals the running recording to finish
+meetcap status                   # config, data root, database, incomplete sessions
+meetcap config init
 meetcap config path
 meetcap config validate
+meetcap config show
+```
+
+Planned:
+
+```powershell
+meetcap start "Remote Review" --mode online
+meetcap import .\recording.m4a
+meetcap speakers list
 ```
 
 ## Documentation
@@ -51,6 +60,7 @@ meetcap config validate
 - [Data Model & Artifact Contract](docs/DATA_MODEL.md)
 - [Reliability Requirements](docs/RELIABILITY.md)
 - [Development Rules](docs/DEVELOPMENT.md)
+- [M1 Windows validation checklist](docs/M1_WINDOWS_VALIDATION.md)
 
 ## Technology direction
 
@@ -95,4 +105,11 @@ See `docs/ARCHITECTURE.md` for the authoritative architecture.
 
 ## Repository status
 
-This repository starts documentation-first. Code should be added milestone by milestone according to `docs/ROADMAP.md`; agents should not implement later milestones opportunistically.
+This repository starts documentation-first. Code is added milestone by milestone
+according to `docs/ROADMAP.md`; agents should not implement later milestones
+opportunistically.
+
+M0 (repository and executable skeleton) and M1 (offline microphone capture) are
+implemented. M1's hardware-dependent acceptance tests are still open and are tracked as
+a manual checklist in `docs/M1_WINDOWS_VALIDATION.md`; nothing here claims M1 is verified
+end to end on real audio hardware yet.

@@ -20,7 +20,8 @@ internal static class CommandTree
         Func<string, IConfigurationStore> storeFactory,
         TextWriter output,
         TextWriter error,
-        CliEnvironment? environment = null)
+        CliEnvironment? environment = null,
+        ICapturePlatformFactory? platformFactory = null)
     {
         ArgumentNullException.ThrowIfNull(secrets);
         ArgumentNullException.ThrowIfNull(loggerFactory);
@@ -33,20 +34,53 @@ internal static class CommandTree
         root.Options.Add(GlobalOptions.DataRoot);
 
         var configCommand = new Command("config", "Inspect and initialize MeetCap configuration.");
-        configCommand.Subcommands.Add(BuildConfigInit(secrets, loggerFactory, storeFactory, output, error, environment));
-        configCommand.Subcommands.Add(BuildConfigPath(secrets, loggerFactory, storeFactory, output, error, environment));
-        configCommand.Subcommands.Add(BuildConfigValidate(secrets, loggerFactory, storeFactory, output, error, environment));
-        configCommand.Subcommands.Add(BuildConfigShow(secrets, loggerFactory, storeFactory, output, error, environment));
+        configCommand.Subcommands.Add(BuildConfigInit(secrets, loggerFactory, storeFactory, output, error, environment, platformFactory));
+        configCommand.Subcommands.Add(BuildConfigPath(secrets, loggerFactory, storeFactory, output, error, environment, platformFactory));
+        configCommand.Subcommands.Add(BuildConfigValidate(secrets, loggerFactory, storeFactory, output, error, environment, platformFactory));
+        configCommand.Subcommands.Add(BuildConfigShow(secrets, loggerFactory, storeFactory, output, error, environment, platformFactory));
 
-        var statusCommand = new Command("status", "Show database and session status (no session is active in M0).");
+        var statusCommand = new Command(
+            "status",
+            "Show configuration, data root, database, and any session that was not cleanly stopped.");
+
+        var devicesCommand = new Command("devices", "List the capture devices Windows currently offers.");
+
+        var titleArgument = new Argument<string?>("title")
+        {
+            Description = "Session title (defaults to app.default_title).",
+            Arity = ArgumentArity.ZeroOrOne,
+        };
+
+        var modeOption = new Option<string?>("--mode", "-m")
+        {
+            Description = "Session mode. M1 supports offline; online arrives with M5.",
+        };
+
+        var startCommand = new Command("start", "Start an offline recording session.");
+        startCommand.Arguments.Add(titleArgument);
+        startCommand.Options.Add(modeOption);
+
+        var stopCommand = new Command("stop", "Stop the recording session that is currently running.");
 
         root.Subcommands.Add(configCommand);
         root.Subcommands.Add(statusCommand);
+        root.Subcommands.Add(devicesCommand);
+        root.Subcommands.Add(startCommand);
+        root.Subcommands.Add(stopCommand);
 
         root.SetAction(parseResult => RequireVerb(parseResult, root, error));
         configCommand.SetAction(parseResult => RequireSubcommand(parseResult, configCommand, error));
         statusCommand.SetAction((parseResult, _) =>
-            StatusCommand.Run(CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment)));
+            StatusCommand.Run(CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory)));
+        devicesCommand.SetAction((parseResult, _) =>
+            DevicesCommand.Run(CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory)));
+        startCommand.SetAction((parseResult, _) =>
+            StartCommand.Run(
+                CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory),
+                parseResult.GetValue(titleArgument),
+                parseResult.GetValue(modeOption)));
+        stopCommand.SetAction((parseResult, _) =>
+            StopCommand.Run(CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory)));
 
         return root;
     }
@@ -57,7 +91,8 @@ internal static class CommandTree
         Func<string, IConfigurationStore> storeFactory,
         TextWriter output,
         TextWriter error,
-        CliEnvironment? environment)
+        CliEnvironment? environment,
+        ICapturePlatformFactory? platformFactory)
     {
         var force = new Option<bool>("--force", "-f")
         {
@@ -68,7 +103,7 @@ internal static class CommandTree
         command.Options.Add(force);
         command.SetAction(parseResult =>
         {
-            var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment);
+            var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory);
             return ConfigCommand.Init(context, context.ConfigurationStore, parseResult.GetValue(force));
         });
         return command;
@@ -80,12 +115,13 @@ internal static class CommandTree
         Func<string, IConfigurationStore> storeFactory,
         TextWriter output,
         TextWriter error,
-        CliEnvironment? environment)
+        CliEnvironment? environment,
+        ICapturePlatformFactory? platformFactory)
     {
         var command = new Command("path", "Print the config.toml path.");
         command.SetAction(parseResult =>
         {
-            var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment);
+            var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory);
             return ConfigCommand.PrintPath(context, context.ConfigurationStore);
         });
         return command;
@@ -97,12 +133,13 @@ internal static class CommandTree
         Func<string, IConfigurationStore> storeFactory,
         TextWriter output,
         TextWriter error,
-        CliEnvironment? environment)
+        CliEnvironment? environment,
+        ICapturePlatformFactory? platformFactory)
     {
         var command = new Command("validate", "Validate config.toml keys and values.");
         command.SetAction(parseResult =>
         {
-            var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment);
+            var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory);
             return ConfigCommand.Validate(context, context.ConfigurationStore);
         });
         return command;
@@ -114,12 +151,13 @@ internal static class CommandTree
         Func<string, IConfigurationStore> storeFactory,
         TextWriter output,
         TextWriter error,
-        CliEnvironment? environment)
+        CliEnvironment? environment,
+        ICapturePlatformFactory? platformFactory)
     {
         var command = new Command("show", "Print the effective configuration with secrets redacted.");
         command.SetAction(parseResult =>
         {
-            var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment);
+            var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory);
             return ConfigCommand.Show(context, context.ConfigurationStore);
         });
         return command;
@@ -132,8 +170,9 @@ internal static class CommandTree
         Func<string, IConfigurationStore> storeFactory,
         TextWriter output,
         TextWriter error,
-        CliEnvironment? environment)
-        => new(parseResult, output, error, storeFactory, secrets, loggerFactory, environment);
+        CliEnvironment? environment,
+        ICapturePlatformFactory? platformFactory)
+        => new(parseResult, output, error, storeFactory, secrets, loggerFactory, environment, platformFactory);
 
     /// <summary>
     /// Error action for <c>meetcap</c> without a verb. Mirrors the documented usage

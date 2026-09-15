@@ -11,9 +11,11 @@ TestResults/
 *.user
 *.suo
 
-# Local runtime data
-data/
-sessions/
+# Local runtime data. Anchored to the repository root: an unanchored `sessions/`
+# also matches source and test folders named Sessions/, which would silently drop
+# them from a commit.
+/data/
+/sessions/
 *.db
 *.db-shm
 *.db-wal

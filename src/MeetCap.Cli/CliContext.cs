@@ -1,8 +1,12 @@
 namespace MeetCap.Cli;
 
 using System.CommandLine;
+using MeetCap.AudioPipeline;
+using MeetCap.Core.Capture;
 using MeetCap.Core.Configuration;
+using MeetCap.Core.Diagnostics;
 using MeetCap.Core.Secrets;
+using MeetCap.Persistence.Storage;
 using Microsoft.Extensions.Logging;
 
 /// <summary>
@@ -27,6 +31,7 @@ internal sealed class CliContext
     private readonly ParseResult _parseResult;
     private readonly Func<string, IConfigurationStore> _storeFactory;
     private readonly CliEnvironment _environment;
+    private readonly ICapturePlatformFactory _platformFactory;
 
     public CliContext(
         ParseResult parseResult,
@@ -35,7 +40,8 @@ internal sealed class CliContext
         Func<string, IConfigurationStore> storeFactory,
         SecretRegistry secrets,
         ILoggerFactory loggerFactory,
-        CliEnvironment? environment = null)
+        CliEnvironment? environment = null,
+        ICapturePlatformFactory? platformFactory = null)
     {
         _parseResult = parseResult ?? throw new ArgumentNullException(nameof(parseResult));
         Out = output ?? throw new ArgumentNullException(nameof(output));
@@ -44,6 +50,7 @@ internal sealed class CliContext
         Secrets = secrets ?? throw new ArgumentNullException(nameof(secrets));
         LoggerFactory = loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory));
         _environment = environment ?? CliEnvironment.Instance;
+        _platformFactory = platformFactory ?? NAudioCapturePlatformFactory.Instance;
     }
 
     /// <summary>Logger category used by every command handler.</summary>
@@ -77,6 +84,54 @@ internal sealed class CliContext
     /// Resolved per command so a one-shot <c>--config-dir</c> override is honored.
     /// </summary>
     public IConfigurationStore ConfigurationStore => _storeFactory(ConfigDirectory);
+
+    /// <summary>
+    /// The data root a capture command will use: the one-shot <c>--data-root</c>
+    /// override when supplied, otherwise the expanded <c>storage.data_root</c>
+    /// (docs/CONFIGURATION.md section 2).
+    /// </summary>
+    /// <exception cref="MeetCapException">The configured data root is empty.</exception>
+    public string ResolveDataRoot(MeetCapConfiguration configuration)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        var configured = DataRootOverride is { Length: > 0 } over
+            ? over
+            : configuration.Storage.DataRoot;
+
+        var expanded = Environment.ExpandEnvironmentVariables(configured ?? string.Empty);
+        if (string.IsNullOrWhiteSpace(expanded))
+        {
+            throw new MeetCapException(
+                "storage.data_root is empty, so there is nowhere to write recordings. " +
+                "Set it in config.toml or pass --data-root.");
+        }
+
+        try
+        {
+            return Path.GetFullPath(expanded);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            throw new MeetCapException($"storage.data_root '{expanded}' is not a usable path: {ex.Message}", ex);
+        }
+    }
+
+    /// <summary>The capture platform for this invocation.</summary>
+    public CapturePlatform CreateCapturePlatform() => _platformFactory.Create();
+
+    /// <summary>
+    /// Creates the capture service for a session: it migrates the database first, so
+    /// every capture command starts from a known schema.
+    /// </summary>
+    public CaptureService CreateCaptureService(CaptureSettings settings)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+
+        var database = new MeetCapDatabase(Path.Combine(settings.DataRoot, "meetcap.db"));
+        database.EnsureMigrated();
+        return new CaptureService(CreateCapturePlatform(), database, settings);
+    }
 }
 
 /// <summary>
