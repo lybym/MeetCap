@@ -140,7 +140,7 @@ public class SqliteMigratorTests
     }
 
     [Fact]
-    public void Migrate_ConcurrentFirstRun_AppliesEveryVersionExactlyOnce()
+    public void Migrate_ConcurrentFirstRun_CompletesWithOneRecordedVersion()
     {
         var db = NewDb();
         try
@@ -156,10 +156,11 @@ public class SqliteMigratorTests
                 {
                     try
                     {
-                        // Several migrators race to migrate the same clean database. The
-                        // migration layer holds no lock of its own, so this exercises the
-                        // documented guarantee: concurrent callers finish and each version
-                        // is recorded once, because the version row is insert-or-ignore.
+                        // Migration scripts must be independently idempotent: this thin
+                        // layer deliberately owns no cross-process protocol. The assertion
+                        // below establishes the observable M0 outcome (all callers finish
+                        // and only one committed version is recorded), not exactly-once
+                        // execution of arbitrary future migration SQL.
                         start.SignalAndWait();
                         new SqliteMigrator().Migrate(db);
                     }
@@ -221,6 +222,37 @@ public class SqliteMigratorTests
             database.EnsureMigrated();
             Assert.True(database.IsInitialized());
             Assert.Equal(0, database.CountActiveSessions());
+        }
+        finally
+        {
+            Cleanup(db);
+        }
+    }
+
+    [Fact]
+    public void MeetCapDatabase_TrackingTableWithoutCommittedMigration_IsNotInitialized()
+    {
+        var db = NewDb();
+        try
+        {
+            using (var c = Open(db))
+            using (var cmd = new SqliteCommand(
+                       "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)",
+                       c))
+            {
+                cmd.ExecuteNonQuery();
+            }
+
+            var database = new MeetCapDatabase(db);
+            Assert.False(database.IsInitialized());
+            Assert.Equal(0, database.CountActiveSessions());
+
+            database.EnsureMigrated();
+
+            Assert.True(database.IsInitialized());
+            using var migrated = Open(db);
+            Assert.True(TableExists(migrated, "sessions"));
+            Assert.Equal(1, Count(migrated, "SELECT COUNT(*) FROM schema_migrations"));
         }
         finally
         {

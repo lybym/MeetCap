@@ -230,7 +230,7 @@ JSONL is the stable machine-consumption format. Agents should not need to parse 
 
 ## 14. Migrations
 
-SQLite schema is created and evolved by numbered, embedded SQL migration scripts applied by `SqliteMigrator` (`src/MeetCap.Persistence/Storage/SqliteMigrator.cs`). Applied versions are recorded in `schema_migrations`. Re-running migrations is idempotent; already-applied migrations are skipped.
+SQLite schema is created and evolved by numbered, embedded SQL migration scripts applied by `SqliteMigrator` (`src/MeetCap.Persistence/Storage/SqliteMigrator.cs`). Applied versions are recorded in `schema_migrations`. A database is initialized only when every migration embedded in the running version has a committed version record. Re-running migrations is idempotent; already-applied migrations are skipped. The thin M0 layer intentionally does not add an application-owned cross-process coordination protocol, so each migration script must itself be safe to re-run (for example, use `IF NOT EXISTS`) until a future, explicitly specified reliability requirement changes that contract.
 
 - **0001_sessions** (M0): creates `schema_migrations` and the `sessions` table (section 1) with `CHECK` constraints on `mode` (`offline`/`online`/`import`) and `source_type` (`live`/`import`), plus convenience indexes on `status` and `started_at`.
 - Later milestones add `audio_chunks`, `asr_jobs`, `speakers`, `speaker_embeddings` and `speaker_assignments` as their features are implemented, each as a new numbered migration. No table is created ahead of its feature (section 11).

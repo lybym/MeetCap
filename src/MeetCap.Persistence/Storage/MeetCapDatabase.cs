@@ -17,7 +17,10 @@ public sealed class MeetCapDatabase
         _dbPath = dbPath;
     }
 
-    /// <summary>True when the database file exists and has been migrated at least once.</summary>
+    /// <summary>
+    /// True when the database file exists and every migration embedded in this
+    /// version of MeetCap has been committed.
+    /// </summary>
     public bool IsInitialized()
     {
         if (!File.Exists(_dbPath))
@@ -28,7 +31,16 @@ public sealed class MeetCapDatabase
         try
         {
             using var conn = Open();
-            return TableExists(conn, "schema_migrations");
+            if (!TableExists(conn, "schema_migrations"))
+            {
+                return false;
+            }
+
+            var requiredVersions = new SqliteMigrator()
+                .GetMigrations()
+                .Select(migration => migration.Version);
+            var appliedVersions = GetAppliedMigrationVersions(conn);
+            return requiredVersions.All(appliedVersions.Contains);
         }
         catch (SqliteException)
         {
@@ -80,5 +92,18 @@ public sealed class MeetCapDatabase
         cmd.Parameters.AddWithValue("@name", name);
         var result = cmd.ExecuteScalar();
         return result is long l && l > 0;
+    }
+
+    private static HashSet<int> GetAppliedMigrationVersions(SqliteConnection conn)
+    {
+        var versions = new HashSet<int>();
+        using var cmd = new SqliteCommand("SELECT version FROM schema_migrations", conn);
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            versions.Add(reader.GetInt32(0));
+        }
+
+        return versions;
     }
 }
