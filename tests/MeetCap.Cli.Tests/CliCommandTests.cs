@@ -9,6 +9,27 @@ namespace MeetCap.Cli.Tests;
 /// </summary>
 public class CliCommandTests
 {
+    /// <summary>
+    /// The <c>storage.data_root</c> written to config.toml. Forward slashes keep the
+    /// value a valid TOML basic string without escape sequences to reason about.
+    /// </summary>
+    private const string PersistedDataRoot = "D:/meetcap-persisted-root";
+
+    /// <summary>The one-shot <c>--data-root</c> value that must outrank the file.</summary>
+    private const string OverrideDataRoot = "D:/meetcap-override-root";
+
+    /// <summary>A non-empty credential so <c>SecretRedactor</c> has something to mask.</summary>
+    private const string SecretSentinel = "printable-secret-sentinel";
+
+    private static string ConfigWithSecrets(string dataRoot) =>
+        $"""
+        [storage]
+        data_root = "{dataRoot}"
+
+        [asr.volcengine]
+        credential = "{SecretSentinel}"
+        """;
+
     [Fact]
     public void ConfigInit_WritesDefaultConfigAndReportsPath()
     {
