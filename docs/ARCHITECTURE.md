@@ -761,27 +761,44 @@ Implemented order of operations (M3):
 load + validate config                    # invalid configuration stops here
 resolve provider (app id + credential)    # invalid credentials stop here
 resolve FFmpeg/FFprobe
-migrate database
-inspect source with FFprobe
+migrate database (creates the data root and its private-data marker)
+inspect source with FFprobe               # an unusable file stops here, state-free
+create the session row (mode=import, source_type=import, status=PROCESSING)
+write session.json                        # the durable record, before any risky media work
+emit session.created
 copy source into audio/import/            # original is never modified
+rewrite session.json with the original artifact mapping; emit session.source.imported
 normalize into audio/import/normalized.wav  # only when the source is not already
                                             # 16 kHz mono 16-bit PCM WAV
 re-inspect the normalized artifact
-write session.json (incl. source artifact mapping) + events.jsonl
-create the session row (mode=import, source_type=import, status=PROCESSING)
+rewrite session.json with the normalized artifact; emit session.media.normalized
 create the ASR job row (status=pending, provider_request_id already allocated)
+emit asr.job.queued
 drive the job: submit -> poll -> retain raw response -> normalize -> write
   asr/jobs/<job-id>/request.json        # sanitized, no credentials, no inline audio
   asr/jobs/<job-id>/response.json       # raw provider response, retained first
   asr/jobs/<job-id>/normalized.jsonl
-  transcript/raw.jsonl                  # mandatory
+  transcript/raw.jsonl                  # rebuilt from every job's normalized.jsonl, so
+                                        # re-completing a job cannot duplicate segments
   transcript/live.md                    # Markdown transcript
+mark the job succeeded, then emit asr.job.completed
 mark the session COMPLETED once every job succeeded
 ```
 
-Failures before the session row is created leave no session state behind. A failed or
-interrupted ASR job leaves the session in `PROCESSING` so the audio stays recoverable and
-`meetcap asr resume` can continue it.
+Failure guarantees, stated precisely:
+
+- Configuration, credential, tier, toolchain, and source-not-found failures happen before
+  anything is created, so they leave no session state behind at all.
+- A failure after `inspect` (copying or normalizing) leaves a **visible, recoverable** session:
+  the row exists, `session.json` exists and reflects the artifacts materialized so far, and the
+  session stays in `PROCESSING`. Nothing is orphaned or silently completed.
+- A failed or interrupted ASR job leaves the session in `PROCESSING` so the audio stays
+  recoverable and `meetcap asr resume` can continue it.
+
+The per-job artifacts, not `transcript/raw.jsonl`, are the durable transcript source:
+`raw.jsonl` is derived by concatenating each job's `normalized.jsonl` in job order. That keeps
+the session transcript write idempotent, which is what makes the crash-and-resume path safe
+when a process dies between writing the transcript and persisting the terminal job status.
 
 Imported and recorded sessions therefore share the same transcript and speaker-identity pipeline.
 
@@ -801,6 +818,13 @@ Local by default:
 - speaker/name mappings;
 - transcripts;
 - SQLite database.
+
+The repository `.gitignore` only ignores `/sessions/` at the repository root, because an
+unanchored `sessions/` pattern also swallowed the `src/MeetCap.Core/Sessions` source folder. To
+keep private data private wherever the data root actually is, MeetCap drops a self-ignoring
+`.gitignore` (`*`) into the data root the first time it creates it. It never overwrites an
+existing `.gitignore`, and the marker is best effort: a read-only data root must not fail a
+command.
 
 Only configured ASR audio/batches are sent to the ASR provider.
 

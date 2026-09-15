@@ -260,6 +260,23 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
             : null;
 
         var statusCode = (int)response.StatusCode;
+
+        // A transport-level rejection is classified from the HTTP status alone. Gating this
+        // on the absence of X-Api-Status-Code would make a 401/403 that happens to carry the
+        // header retryable, so bad credentials would be retried instead of failing visibly --
+        // the opposite of the acceptance criterion this adapter is supposed to satisfy.
+        if (!response.IsSuccessStatusCode
+            && response.StatusCode is HttpStatusCode.Unauthorized
+                or HttpStatusCode.Forbidden
+                or HttpStatusCode.BadRequest)
+        {
+            throw new AsrPermanentException(
+                $"http.{statusCode}",
+                Scrub(
+                    $"Volcengine rejected the request with HTTP {statusCode} for {path}" +
+                    Describe(apiStatus, apiMessage) +
+                    $": {Snippet(responseBody)} Check asr.volcengine.app_id and the resolved credential."));        }
+
         if (statusCode is >= 500 or 408 or 429)
         {
             // Transport-level server problems are the classic transient case that Polly
@@ -273,20 +290,9 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
 
         if (!response.IsSuccessStatusCode && string.IsNullOrEmpty(apiStatus))
         {
-            var code = $"http.{statusCode}";
-            var message = Scrub(
-                $"Volcengine returned HTTP {statusCode} for {path}: {Snippet(responseBody)}" +
-                (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden
-                    ? " Check asr.volcengine.app_id and the resolved credential."
-                    : string.Empty));
-
-            if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden
-                or HttpStatusCode.BadRequest)
-            {
-                throw new AsrPermanentException(code, message);
-            }
-
-            throw new AsrTransientException(code, message);
+            throw new AsrTransientException(
+                $"http.{statusCode}",
+                Scrub($"Volcengine returned HTTP {statusCode} for {path}: {Snippet(responseBody)}"));
         }
 
         return new VolcengineResponse(responseBody, apiStatus ?? string.Empty, apiMessage ?? string.Empty);

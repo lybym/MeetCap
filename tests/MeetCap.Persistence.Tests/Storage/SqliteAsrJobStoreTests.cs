@@ -1,5 +1,6 @@
 using MeetCap.Core.Asr;
 using MeetCap.Persistence.Storage;
+using Microsoft.Data.Sqlite;
 using Xunit;
 
 namespace MeetCap.Persistence.Tests.Storage;
@@ -125,6 +126,56 @@ public class SqliteAsrJobStoreTests
         new SqliteMigrator().Migrate(workspace.DatabasePath);
 
         Assert.Throws<InvalidOperationException>(() => Store(workspace).Update(Job("job_missing")));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public void Create_RejectsAJobWithoutAProviderRequestId(string requestId)
+    {
+        // The invariant is enforced where rows are written, so the domain type and the store
+        // tell one story instead of relying on a defensive branch in the processor.
+        using var workspace = new TempWorkspace();
+        new SqliteMigrator().Migrate(workspace.DatabasePath);
+
+        var ex = Assert.Throws<ArgumentException>(
+            () => Store(workspace).Create(Job() with { ProviderRequestId = requestId }));
+
+        Assert.Contains("provider request id", ex.Message, StringComparison.Ordinal);
+        Assert.Null(Store(workspace).Get("job_1"));
+    }
+
+    [Fact]
+    public void Get_FailsLoudlyAndNamesTheJobWhenAStoredRowHasNoProviderRequestId()
+    {
+        // The column stays nullable in SQLite, so an externally written or hand-edited row can
+        // still violate the invariant. That must fail loudly and identify the row instead of
+        // aborting the queue anonymously.
+        using var workspace = new TempWorkspace();
+        new SqliteMigrator().Migrate(workspace.DatabasePath);
+
+        using (var connection = new SqliteConnection(
+                   new SqliteConnectionStringBuilder
+                   {
+                       DataSource = workspace.DatabasePath,
+                       Pooling = false,
+                   }.ToString()))
+        {
+            connection.Open();
+            using var cmd = new SqliteCommand(
+                "INSERT INTO asr_jobs (id, session_id, source, tier, provider, input_artifact, status, " +
+                "provider_request_id, created_at, updated_at) " +
+                "VALUES ('job_broken', 'ses_1', 'import', 'standard', 'volcengine', " +
+                "'audio/import/a.wav', 'pending', NULL, @now, @now)",
+                connection);
+            cmd.Parameters.AddWithValue("@now", "2026-09-15T00:00:00Z");
+            cmd.ExecuteNonQuery();
+        }
+
+        var ex = Assert.Throws<InvalidOperationException>(() => Store(workspace).Get("job_broken"));
+
+        Assert.Contains("job_broken", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("provider request id", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]

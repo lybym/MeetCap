@@ -46,7 +46,19 @@ public sealed class MeetCapDatabase
     }
 
     /// <summary>Creates the database and applies all pending migrations.</summary>
-    public void EnsureMigrated() => new SqliteMigrator().Migrate(DatabasePath);
+    public void EnsureMigrated()
+    {
+        var dataRoot = Path.GetDirectoryName(DatabasePath);
+        if (!string.IsNullOrEmpty(dataRoot))
+        {
+            // The data root holds recordings, transcripts, and voiceprints. Mark it as
+            // private local data wherever it is, so the repository .gitignore no longer has
+            // to guess.
+            DataRootMarker.EnsureSelfIgnoring(dataRoot);
+        }
+
+        new SqliteMigrator().Migrate(DatabasePath);
+    }
 
     /// <summary>Count of sessions in a non-terminal state. Zero before any session exists.</summary>
     public int CountActiveSessions()

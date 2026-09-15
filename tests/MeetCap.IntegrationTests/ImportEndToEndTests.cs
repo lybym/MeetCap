@@ -416,8 +416,62 @@ public class ImportEndToEndTests : IDisposable
         var requestJson = File.ReadAllText(
             new SessionArtifactPaths(_dataRoot, "ses_test").JobRequestJson("job_test"));
 
-        Assert.DoesNotContain("data", requestJson, StringComparison.Ordinal);
-        Assert.Contains("speaker_info_requested", requestJson, StringComparison.Ordinal);
+        // Structural assertions rather than a substring grep: the persisted metadata must not
+        // carry the audio payload or any credential-bearing material, and must record the
+        // speaker-info decision and the size of what was uploaded.
+        using var document = JsonDocument.Parse(requestJson);
+        var root = document.RootElement;
+
+        Assert.False(root.TryGetProperty("access_token", out _));
+        Assert.False(root.TryGetProperty("Authorization", out _));
+        Assert.False(root.TryGetProperty("headers", out _));
+        Assert.True(root.GetProperty("speaker_info_requested").GetBoolean());
+
+        var audio = root.GetProperty("audio");
+        Assert.False(audio.TryGetProperty("data", out _));
+        Assert.Equal("wav", audio.GetProperty("format").GetString());
+        Assert.Equal(512, audio.GetProperty("inline_bytes").GetInt64());
+
+        // The source audio itself must not be duplicated into the job metadata.
+        var base64 = Convert.ToBase64String(File.ReadAllBytes(_sourcePath));
+        Assert.DoesNotContain(base64, requestJson, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Import_NormalizationFailure_LeavesAVisibleRecoverableSessionWithItsDocument()
+    {
+        // A normalize/inspect failure happens after the session row exists. The durable
+        // session.json must exist by then, so the user sees the half-materialized session
+        // instead of an orphaned row.
+        Migrate();
+        _media.SourceDescriptor = path => FakeMediaPipeline.Source(path, "mov,mp4,m4a,3gp,3g2,mj2", "aac", 44100, 2);
+        _media.FailNormalization = true;
+        var (service, _, _, database) = CreateService();
+
+        await Assert.ThrowsAsync<MeetCap.Core.Media.MediaProbeException>(
+            () => service.ImportAsync(new ImportRequest
+            {
+                SourcePath = _sourcePath,
+                SessionId = "ses_test",
+                JobId = "job_test",
+            }));
+
+        var paths = new SessionArtifactPaths(_dataRoot, "ses_test");
+        var document = new FileSessionArtifactWriter().ReadSessionDocument(paths);
+
+        Assert.NotNull(document);
+        Assert.Equal("ses_test", document!.SessionId);
+        // The source was already copied, so the mapping records it.
+        Assert.Equal(SourceArtifact.Roles.Original, Assert.Single(document.SourceArtifacts).Role);
+        Assert.True(File.Exists(paths.ImportAudioFile("meeting.wav")));
+
+        // No job was queued and the session stays recoverable rather than silently complete.
+        Assert.Empty(database.AsrJobs.ListBySession("ses_test"));
+        Assert.Equal(SessionStatus.Processing, database.Sessions.Get("ses_test")!.Status);
+
+        Assert.Contains(
+            SessionEvents.SessionCreated,
+            File.ReadAllLines(paths.EventsJsonl).Select(line => JsonDocument.Parse(line).RootElement.GetProperty("event").GetString()));
     }
 
     [Fact]

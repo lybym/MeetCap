@@ -343,16 +343,89 @@ public class AsrJobProcessorTests : IDisposable
     }
 
     [Fact]
-    public async Task JobWithoutAProviderRequestId_IsFailedRatherThanResubmittedBlindly()
+    public async Task CrashBetweenArtifactWriteAndStatusWrite_DoesNotDuplicateOrDoubleReport()
     {
-        var job = CreateJob() with { ProviderRequestId = null };
-        _jobs.Update(job);
+        // The window P1-2 is about: the transcript artifacts are written, then the terminal
+        // status is persisted. If the process dies in between, the row is still resumable, the
+        // provider returns the same immutable result, and Complete runs a second time. The
+        // session transcript must not grow a second copy of every segment, and events.jsonl
+        // must not gain a second completion record.
+        var job = CreateJob();
+        _provider.EnqueuePoll(Completed(), Completed());
 
-        var result = await CreateProcessor().ProcessAsync(job);
+        _jobs.AbandonUpdateWhen = candidate => candidate.Status == AsrJobStatus.Succeeded;
 
-        Assert.Equal(AsrJobOutcome.Failed, result.Outcome);
-        Assert.Equal("asr.configuration", result.Job.ErrorCode);
-        Assert.Empty(_provider.Submissions);
+        var crash = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => CreateProcessor().ProcessAsync(job));
+        Assert.Contains("Simulated process death", crash.Message, StringComparison.Ordinal);
+
+        // Artifacts from the first pass are on disk, but the job row never reached succeeded.
+        Assert.Equal(AsrJobStatus.Polling, _jobs.Get("job_1")!.Status);
+        Assert.Single(_transcripts.ReadJsonl(Paths.RawTranscriptJsonl));
+        Assert.DoesNotContain(SessionEvents.AsrJobCompleted, _artifacts.Events);
+
+        // Resume in a new "process": same artifacts on disk, same durable row.
+        _jobs.AbandonUpdateWhen = null;
+        var resumed = await CreateProcessor().ProcessAsync(_jobs.Get("job_1")!);
+
+        Assert.Equal(AsrJobOutcome.Succeeded, resumed.Outcome);
+        var segments = _transcripts.ReadJsonl(Paths.RawTranscriptJsonl);
+        Assert.Single(segments);
+        Assert.Equal("seg_1", segments[0].SegmentId);
+
+        var markdown = File.ReadAllText(Paths.LiveTranscriptMarkdown);
+        Assert.Contains("Segments: 1", markdown, StringComparison.Ordinal);
+        Assert.Equal(1, _artifacts.Events.Count(name => name == SessionEvents.AsrJobCompleted));
+    }
+
+    [Fact]
+    public async Task SessionTranscript_IsTheOrderedConcatenationOfEachJobsContribution()
+    {
+        var first = CreateJob();
+        _provider.EnqueuePoll(Completed());
+        await CreateProcessor().ProcessAsync(first);
+
+        var second = new AsrJob
+        {
+            Id = "job_2",
+            SessionId = "ses_1",
+            Source = AudioSource.Import,
+            Tier = "standard",
+            Provider = "volcengine",
+            InputArtifact = first.InputArtifact,
+            Status = AsrJobStatus.Pending,
+            ProviderRequestId = "req-0002",
+            DurationMs = 754_000,
+            CreatedAt = s_now.AddMinutes(1),
+            UpdatedAt = s_now.AddMinutes(1),
+        };
+        _jobs.Create(second);
+
+        _normalizer.OnNormalize = (_, context) => new AsrNormalizationResult
+        {
+            Segments = new[]
+            {
+                new TranscriptSegment
+                {
+                    SegmentId = "seg_job2",
+                    SessionId = context.SessionId,
+                    Source = context.Source,
+                    StartMs = 1000,
+                    EndMs = 2000,
+                    RawText = "second",
+                    ProviderJobId = context.JobId,
+                },
+            },
+            SpeakerInfoReturned = false,
+        };
+        _provider.EnqueuePoll(Completed());
+
+        await CreateProcessor().ProcessAsync(second);
+
+        var segments = _transcripts.ReadJsonl(Paths.RawTranscriptJsonl);
+        Assert.Equal(2, segments.Count);
+        Assert.Equal("seg_1", segments[0].SegmentId);
+        Assert.Equal("seg_job2", segments[1].SegmentId);
     }
 
     [Fact]

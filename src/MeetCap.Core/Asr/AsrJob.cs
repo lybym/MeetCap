@@ -35,7 +35,14 @@ public sealed record AsrJob
     /// before the first submit, so a restart never has to invent a new id (which
     /// would risk a second billable task for the same audio).
     /// </summary>
-    public string? ProviderRequestId { get; init; }
+    /// <remarks>
+    /// Non-nullable by design: without a stable provider task id a restart could not avoid
+    /// submitting the same audio twice, so the invariant is expressed in the type instead of
+    /// in a defensive branch that only a tolerant store implementation could reach. The
+    /// SQLite store rejects a blank value on write, and fails loudly -- naming the job -- if
+    /// a stored row is NULL.
+    /// </remarks>
+    public required string ProviderRequestId { get; init; }
 
     public int AttemptCount { get; init; }
 

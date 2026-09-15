@@ -173,7 +173,10 @@ Notes:
 
 - `provider_request_id` is allocated when the job is created and persisted **before** the
   first submit. It is the provider's task identifier, so a retry — including a retry after a
-  process restart — addresses the same task instead of creating a second billable one.
+  process restart — addresses the same task instead of creating a second billable one. The
+  column is nullable in SQLite for migration simplicity, but the invariant is enforced on write
+  (`Create` rejects a blank value) and on read (a NULL row fails loudly, naming the job); the
+  domain type declares the id non-nullable, so no MeetCap code path can produce an unset one.
 - `input_artifact` is stored session-relative (for example `audio/import/normalized.wav`) so
   the artifact contract survives moving the data root.
 - `attempt_count` is incremented when the job enters `submitting`, so a submit that never
@@ -185,6 +188,10 @@ Notes:
 - `raw_response_path` and `normalized_result_path` point at `response.json` and
   `normalized.jsonl`. The raw response is written before parsing so a parser fix never
   requires re-billing the same audio.
+- `transcript/raw.jsonl` is derived, not appended: it is rebuilt by concatenating each job's
+  `normalized.jsonl` in job order. Re-completing a job (which happens when a process dies
+  between writing the transcript and persisting the terminal status) therefore replaces that
+  job's contribution instead of duplicating its segments.
 
 ## 7. Transcript segment
 
@@ -290,6 +297,11 @@ JSONL is the stable machine-consumption format. Agents should not need to parse 
 
 SQLite schema is created and evolved by numbered, embedded SQL migration scripts applied by `SqliteMigrator` (`src/MeetCap.Persistence/Storage/SqliteMigrator.cs`). Applied versions are recorded in `schema_migrations`. Re-running migrations is idempotent; already-applied migrations are skipped.
 
+Every embedded `*.sql` resource under `Migrations` must carry a parseable version
+(`Migrations.<digits>`), and no two may claim the same one. Both violations are rejected before
+any DDL runs, because either one makes a migration silently not run: a duplicate looks
+already-applied, and an unnumbered script is never considered at all.
+
 - **0001_sessions** (M0): creates `schema_migrations` and the `sessions` table (section 1) with `CHECK` constraints on `mode` (`offline`/`online`/`import`) and `source_type` (`live`/`import`), plus convenience indexes on `status` and `started_at`.
 - **0003_asr_jobs** (M3): creates the `asr_jobs` table (section 6) with a `CHECK` constraint on `status` and indexes on `status`, `session_id`, and `next_retry_at`.
 - Later milestones add `audio_chunks`, `speakers`, `speaker_embeddings` and `speaker_assignments` as their features are implemented, each as a new numbered migration. No table is created ahead of its feature (section 11).
@@ -297,5 +309,6 @@ SQLite schema is created and evolved by numbered, embedded SQL migration scripts
 Version `0002` is intentionally unused in this repository's `main` line: it is claimed by the
 M1 capture migration (`0002_audio_chunks.sql`, issue #3), which is developed in parallel. Two
 scripts claiming one version would make the second look already applied and its tables would
-never be created, so `SqliteMigrator` now also fails loudly if two embedded scripts resolve to
-the same version.
+never be created, so `SqliteMigrator` fails loudly if two embedded scripts resolve to the same
+version — and equally loudly if an embedded `*.sql` under `Migrations` has no parseable version,
+because such a script would otherwise never be applied at all.

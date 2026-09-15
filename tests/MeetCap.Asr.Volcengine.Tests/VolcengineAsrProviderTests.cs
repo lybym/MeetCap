@@ -126,16 +126,80 @@ public class VolcengineAsrProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task TransientPollErrors_AreRetriedInProcessWithAStableTaskId()
+    {
+        // The same stability requirement applies to the query, where an unstable request id
+        // would address a different task.
+        var handler = new StubHttpHandler()
+            .EnqueueRepeat(2, HttpStatusCode.ServiceUnavailable, body: "busy")
+            .EnqueueJson(HttpStatusCode.OK, "{\"result\":{\"utterances\":[]}}");
+        using var provider = Create(handler);
+
+        var result = await provider.GetResultAsync(
+            new AsrSubmission { ProviderRequestId = "req-0001", SanitizedRequestJson = "{}" },
+            Request(WriteAudio()));
+
+        Assert.Equal(AsrPollState.Completed, result.State);
+        Assert.Equal(3, handler.Requests.Count);
+        Assert.All(
+            handler.Requests,
+            request => Assert.Equal("req-0001", string.Join(",", request.Headers.GetValues("X-Api-Request-Id"))));
+    }
+
+    [Fact]
     public async Task Unauthorized_FailsPermanentlyWithAnActionableMessage()
     {
-        var handler = new StubHttpHandler().Enqueue(HttpStatusCode.Unauthorized, body: "bad app id");
-        using var provider = Create(handler);
+        var handler = new StubHttpHandler().Enqueue(HttpStatusCode.Unauthorized, body: "bad app id");        using var provider = Create(handler);
 
         var ex = await Assert.ThrowsAsync<AsrPermanentException>(
             () => provider.SubmitFileAsync(Request(WriteAudio())));
 
         Assert.Equal("http.401", ex.Code);
         Assert.Contains("asr.volcengine.app_id", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.Unauthorized, "http.401")]
+    [InlineData(HttpStatusCode.Forbidden, "http.403")]
+    [InlineData(HttpStatusCode.BadRequest, "http.400")]
+    public async Task TransportLevelRejection_IsPermanentEvenWhenTheProviderStatusHeaderIsPresent(
+        HttpStatusCode statusCode,
+        string expectedCode)
+    {
+        // Volcengine can answer with an HTTP error *and* its own X-Api-Status-Code. Gating the
+        // permanent classification on the absence of that header made a 401 retryable, so a bad
+        // credential would be retried instead of failing visibly.
+        var handler = new StubHttpHandler().Enqueue(
+            statusCode,
+            body: "{\"message\":\"denied\"}",
+            apiStatus: "45000010",
+            apiMessage: "auth failed");
+        using var provider = Create(handler);
+
+        var ex = await Assert.ThrowsAsync<AsrPermanentException>(
+            () => provider.SubmitFileAsync(Request(WriteAudio())));
+
+        Assert.Equal(expectedCode, ex.Code);
+        Assert.Contains("asr.volcengine.app_id", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.Unauthorized, "http.401")]
+    [InlineData(HttpStatusCode.Forbidden, "http.403")]
+    public async Task Query_TransportLevelAuthRejection_IsPermanent(HttpStatusCode statusCode, string expectedCode)
+    {
+        var handler = new StubHttpHandler().Enqueue(
+            statusCode,
+            body: "{\"message\":\"denied\"}",
+            apiStatus: "45000010");
+        using var provider = Create(handler);
+
+        var ex = await Assert.ThrowsAsync<AsrPermanentException>(
+            () => provider.GetResultAsync(
+                new AsrSubmission { ProviderRequestId = "req-0001", SanitizedRequestJson = "{}" },
+                Request(WriteAudio())));
+
+        Assert.Equal(expectedCode, ex.Code);
     }
 
     [Fact]

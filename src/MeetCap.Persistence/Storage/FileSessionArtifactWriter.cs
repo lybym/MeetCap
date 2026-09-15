@@ -28,6 +28,10 @@ public sealed class FileSessionArtifactWriter : ISessionArtifactWriter
     {
         ArgumentNullException.ThrowIfNull(paths);
 
+        // Defensive: a caller that writes artifacts without going through MeetCapDatabase
+        // still gets the private-data marker.
+        DataRootMarker.EnsureSelfIgnoring(paths.DataRoot);
+
         Directory.CreateDirectory(paths.SessionDirectory);
         Directory.CreateDirectory(paths.ImportAudioDirectory);
         Directory.CreateDirectory(paths.AsrJobsDirectory);

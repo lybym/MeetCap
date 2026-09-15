@@ -36,6 +36,7 @@ public sealed class SqliteAsrJobStore : IAsrJobStore
     public void Create(AsrJob job)
     {
         ArgumentNullException.ThrowIfNull(job);
+        EnsureProviderRequestId(job);
 
         using var conn = SqliteConnectionFactory.Open(_dbPath);
         using var cmd = new SqliteCommand(
@@ -187,6 +188,17 @@ public sealed class SqliteAsrJobStore : IAsrJobStore
         return Convert.ToInt32(cmd.ExecuteScalar());
     }
 
+    private static void EnsureProviderRequestId(AsrJob job)
+    {
+        if (string.IsNullOrWhiteSpace(job.ProviderRequestId))
+        {
+            throw new ArgumentException(
+                $"ASR job '{job.Id}' must carry a provider request id: without it a restart " +
+                "cannot avoid submitting the same audio twice.",
+                nameof(job));
+        }
+    }
+
     private static void Bind(SqliteCommand cmd, AsrJob job)
     {
         cmd.Parameters.AddWithValue("@id", job.Id);
@@ -216,21 +228,32 @@ public sealed class SqliteAsrJobStore : IAsrJobStore
         cmd.Parameters.AddWithValue("@updatedAt", job.UpdatedAt.UtcDateTime.ToString("o", CultureInfo.InvariantCulture));
     }
 
-    private static AsrJob Map(SqliteDataReader reader)
+    private AsrJob Map(SqliteDataReader reader)
     {
+        var id = reader.GetString(reader.GetOrdinal("id"));
+
         var statusText = reader.GetString(reader.GetOrdinal("status"));
         if (!AsrJobStatuses.TryParse(statusText, out var status))
         {
-            throw new InvalidOperationException($"Stored ASR job status '{statusText}' is not recognised.");
+            throw new InvalidOperationException(
+                $"Stored ASR job '{id}' has unrecognised status '{statusText}'.");
         }
 
-        var requestId = ReadText(reader, "provider_request_id")
-            ?? throw new InvalidOperationException(
-                "Every ASR job must have a provider request id; the column is null.");
+        // The column is nullable in the schema, so a hand-edited or externally written row
+        // can still violate the invariant the domain type enforces. Fail loudly and name the
+        // job, because the alternative -- carrying on with an unusable row -- would either
+        // submit the same audio twice or drop the job from the queue silently.
+        var requestId = ReadText(reader, "provider_request_id");
+        if (string.IsNullOrWhiteSpace(requestId))
+        {
+            throw new InvalidOperationException(
+                $"Stored ASR job '{id}' has no provider request id, so it cannot be resumed safely. " +
+                $"Repair or delete that row in '{_dbPath}' before resuming the queue.");
+        }
 
         return new AsrJob
         {
-            Id = reader.GetString(reader.GetOrdinal("id")),
+            Id = id,
             SessionId = reader.GetString(reader.GetOrdinal("session_id")),
             Source = reader.GetString(reader.GetOrdinal("source")),
             Tier = reader.GetString(reader.GetOrdinal("tier")),
@@ -258,7 +281,7 @@ public sealed class SqliteAsrJobStore : IAsrJobStore
         };
     }
 
-    private static IReadOnlyList<AsrJob> ReadAll(SqliteCommand cmd)
+    private IReadOnlyList<AsrJob> ReadAll(SqliteCommand cmd)
     {
         var jobs = new List<AsrJob>();
         using var reader = cmd.ExecuteReader();

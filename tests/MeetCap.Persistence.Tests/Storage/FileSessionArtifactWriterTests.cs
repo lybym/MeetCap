@@ -41,6 +41,47 @@ public class FileSessionArtifactWriterTests
     }
 
     [Fact]
+    public void EnsureLayout_MarksTheDataRootAsPrivateLocalData()
+    {
+        // The repository .gitignore no longer ignores a nested `sessions/` directory, so the
+        // data root protects itself: recordings, transcripts, and voiceprints must never be
+        // committable just because the data root sits inside a working tree.
+        using var workspace = new TempWorkspace();
+        var paths = new SessionArtifactPaths(workspace.Root, "ses_1");
+
+        new FileSessionArtifactWriter().EnsureLayout(paths);
+
+        var marker = Path.Combine(workspace.Root, DataRootMarker.MarkerFileName);
+        Assert.True(File.Exists(marker));
+        Assert.Contains("*", File.ReadAllText(marker), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void EnsureLayout_SeedsTheDataRootForANestedSessionDirectory()
+    {
+        using var workspace = new TempWorkspace();
+        var dataRoot = Path.Combine(workspace.Root, "nested", "data");
+
+        new FileSessionArtifactWriter().EnsureLayout(new SessionArtifactPaths(dataRoot, "ses_1"));
+
+        Assert.True(File.Exists(Path.Combine(dataRoot, DataRootMarker.MarkerFileName)));
+    }
+
+    [Fact]
+    public void EnsureLayout_NeverOverwritesAnExistingGitIgnore()
+    {
+        // The repository root already has a real .gitignore; pointing --data-root at a checkout
+        // must not clobber it.
+        using var workspace = new TempWorkspace();
+        var existing = Path.Combine(workspace.Root, DataRootMarker.MarkerFileName);
+        File.WriteAllText(existing, "# keep me\n");
+
+        new FileSessionArtifactWriter().EnsureLayout(new SessionArtifactPaths(workspace.Root, "ses_1"));
+
+        Assert.Equal("# keep me\n", File.ReadAllText(existing));
+    }
+
+    [Fact]
     public void SessionDocument_RoundTripsIncludingTheSourceArtifactMapping()
     {
         using var workspace = new TempWorkspace();

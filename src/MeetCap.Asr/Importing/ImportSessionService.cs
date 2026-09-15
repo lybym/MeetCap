@@ -182,7 +182,17 @@ public sealed class ImportSessionService
             UpdatedAt = now,
         };
 
+        // The session.json document is the durable record (docs/DATA_MODEL.md section 3), so
+        // it is (re)written as soon as the session exists and again as each artifact lands.
+        // Copying or normalizing can still fail, and the user must be able to see the
+        // half-materialized session rather than an orphaned row with no durable document.
+        var artifacts = new List<SourceArtifact>();
+
+        void PersistSessionDocument() =>
+            _artifacts.WriteSessionDocument(paths, SessionDocument.From(session, artifacts));
+
         _artifacts.EnsureLayout(paths);
+        PersistSessionDocument();
         _sessions.Create(session);
         _artifacts.AppendEvent(
             paths,
@@ -198,10 +208,8 @@ public sealed class ImportSessionService
                 ["tier"] = ResolveTier(request.Tier),
             });
 
-        var artifacts = new List<SourceArtifact>
-        {
-            CopySourceArtifact(paths, sourcePath),
-        };
+        artifacts.Add(CopySourceArtifact(paths, sourcePath));
+        PersistSessionDocument();
         _artifacts.AppendEvent(
             paths,
             SessionEvents.SourceImported,
@@ -233,6 +241,7 @@ public sealed class ImportSessionService
 
             artifacts.Add(BuildArtifact(SourceArtifact.Roles.Normalized, sourcePath, normalizedPath));
             inputArtifactPath = normalizedPath;
+            PersistSessionDocument();
 
             _artifacts.AppendEvent(
                 paths,
@@ -246,8 +255,6 @@ public sealed class ImportSessionService
                     ["output"] = normalizedPath,
                 });
         }
-
-        _artifacts.WriteSessionDocument(paths, SessionDocument.From(session, artifacts));
 
         var tier = ResolveTier(request.Tier);
         var job = new AsrJob

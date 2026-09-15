@@ -160,19 +160,6 @@ public sealed class AsrJobProcessor
     {
         ArgumentNullException.ThrowIfNull(job);
 
-        if (job.ProviderRequestId is null)
-        {
-            // Invariant enforced by the migration and the job store: without a stable
-            // provider task id a restart could not avoid submitting twice.
-            var broken = AsrJobTransitions.MarkFailed(
-                job,
-                Now(),
-                ConfigurationErrorCode,
-                $"Job '{job.Id}' has no provider request id and cannot be resumed safely.");
-            _jobs.Update(broken);
-            return new AsrJobProcessResult(broken, AsrJobOutcome.Failed, 0, broken.ErrorMessage);
-        }
-
         if (AsrJobStatuses.IsTerminal(job.Status))
         {
             return new AsrJobProcessResult(job, AsrJobOutcome.NoWork, 0, $"Job '{job.Id}' is already {job.Status}.");
@@ -381,8 +368,13 @@ public sealed class AsrJobProcessor
         _transcripts.WriteJsonl(normalizedPath, normalized.Segments);
 
         // raw.jsonl is the stable machine interface and is always written, whatever
-        // [transcript] says (docs/CONFIGURATION.md section 10).
-        _transcripts.AppendJsonl(paths.RawTranscriptJsonl, normalized.Segments);
+        // [transcript] says (docs/CONFIGURATION.md section 10). It is REBUILT from the
+        // per-job normalized artifacts rather than appended to, so re-completing a job
+        // replaces its contribution instead of duplicating it. That matters because the
+        // terminal status is persisted after these writes: a process killed in between
+        // leaves the job resumable, the provider returns the same immutable result, and
+        // this method runs again (docs/ARCHITECTURE.md section 14).
+        RebuildRawTranscript(paths, job.SessionId);
 
         if (_options.WriteMarkdown)
         {
@@ -407,6 +399,9 @@ public sealed class AsrJobProcessor
             now);
         _jobs.Update(job);
 
+        // The completion event is emitted only after the terminal status is durable, so a
+        // resumed re-completion cannot append a second asr.job.completed record: once the
+        // row is `succeeded` the queue no longer lists the job for work.
         _artifacts.AppendEvent(
             paths,
             SessionEvents.AsrJobCompleted,
@@ -423,6 +418,36 @@ public sealed class AsrJobProcessor
 
         CompleteSessionIfDone(job.SessionId, paths);
         return new AsrJobProcessResult(job, AsrJobOutcome.Succeeded, normalized.Segments.Count, null);
+    }
+
+    /// <summary>
+    /// Rebuilds <c>transcript/raw.jsonl</c> as the ordered concatenation of every job's
+    /// <c>normalized.jsonl</c> for the session.
+    /// </summary>
+    /// <remarks>
+    /// Deriving the session transcript from the per-job artifacts keeps the write
+    /// idempotent: finishing the same job twice produces the same file, because the job's
+    /// own contribution is replaced rather than appended. Appending would duplicate every
+    /// segment after a crash between the transcript write and the terminal status update.
+    /// </remarks>
+    private void RebuildRawTranscript(SessionArtifactPaths paths, string sessionId)
+    {
+        var segments = new List<TranscriptSegment>();
+        foreach (var sessionJob in _jobs.ListBySession(sessionId))
+        {
+            var normalizedPath = string.IsNullOrEmpty(sessionJob.NormalizedResultPath)
+                ? paths.JobNormalizedJsonl(sessionJob.Id)
+                : sessionJob.NormalizedResultPath;
+
+            if (!File.Exists(normalizedPath))
+            {
+                continue;
+            }
+
+            segments.AddRange(_transcripts.ReadJsonl(normalizedPath));
+        }
+
+        _transcripts.WriteJsonl(paths.RawTranscriptJsonl, segments);
     }
 
     private AsrJobProcessResult HandleTransient(AsrJob job, string code, string message)
@@ -511,7 +536,7 @@ public sealed class AsrJobProcessor
         InputArtifactPath = paths.ResolveRelative(job.InputArtifact),
         AudioFormat = Path.GetExtension(job.InputArtifact).TrimStart('.').ToLowerInvariant(),
         DurationMs = job.DurationMs,
-        ProviderRequestId = job.ProviderRequestId!,
+        ProviderRequestId = job.ProviderRequestId,
         ServiceTier = job.Tier,
         RequestSpeakerInfo = job.SpeakerInfoRequested,
     };
@@ -526,8 +551,7 @@ public sealed class AsrJobProcessor
 
         return new AsrSubmission
         {
-            ProviderRequestId = job.ProviderRequestId
-                ?? throw new InvalidOperationException($"Job '{job.Id}' has no provider request id."),
+            ProviderRequestId = job.ProviderRequestId,
             SanitizedRequestJson = sanitized,
         };
     }

@@ -1,5 +1,6 @@
 using MeetCap.Core.Asr;
 using MeetCap.Core.Media;
+using System.Text.Json.Nodes;
 
 namespace MeetCap.IntegrationTests;
 
@@ -15,6 +16,9 @@ internal sealed class FakeMediaPipeline : IMediaPipeline
 
     /// <summary>Every normalization the pipeline was asked to perform.</summary>
     public List<string> Normalizations { get; } = new();
+
+    /// <summary>When true, normalization fails, simulating an FFmpeg failure mid-import.</summary>
+    public bool FailNormalization { get; set; }
 
     public static MediaInfo Source(
         string path,
@@ -55,6 +59,11 @@ internal sealed class FakeMediaPipeline : IMediaPipeline
         MediaNormalizationPlan plan,
         CancellationToken cancellationToken = default)
     {
+        if (FailNormalization)
+        {
+            throw new MediaProbeException($"FFmpeg could not normalize '{inputPath}': simulated failure");
+        }
+
         Normalizations.Add($"{inputPath} -> {outputPath}");
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
         File.WriteAllBytes(outputPath, new byte[64]);
@@ -91,10 +100,37 @@ internal sealed class FakeAsrProvider : IAsrProvider
             return Task.FromResult(OnSubmit(request));
         }
 
+        // Mirrors the contract the real adapter's sanitized metadata follows: provider facts plus
+        // the audio's size, never the audio itself and never a credential. Keeping the shape
+        // realistic is what makes the import-level sanitization assertions meaningful.
+        var inlineBytes = new FileInfo(request.InputArtifactPath).Length;
+        var sanitized = new JsonObject
+        {
+            ["provider"] = Name,
+            ["endpoint_tier"] = request.ServiceTier,
+            ["resource_id"] = "volc.bigasr.auc",
+            ["job_id"] = request.JobId,
+            ["session_id"] = request.SessionId,
+            ["source"] = request.Source,
+            ["duration_ms"] = request.DurationMs,
+            ["provider_request_id"] = request.ProviderRequestId,
+            ["speaker_info_requested"] = request.RequestSpeakerInfo,
+            ["audio"] = new JsonObject
+            {
+                ["format"] = request.AudioFormat,
+                ["inline_bytes"] = inlineBytes,
+            },
+            ["request"] = new JsonObject
+            {
+                ["model_name"] = "bigmodel",
+                ["enable_speaker_info"] = request.RequestSpeakerInfo,
+            },
+        };
+
         return Task.FromResult(new AsrSubmission
         {
             ProviderRequestId = request.ProviderRequestId,
-            SanitizedRequestJson = "{\"provider\":\"volcengine\",\"speaker_info_requested\":true}",
+            SanitizedRequestJson = sanitized.ToJsonString(),
         });
     }
 

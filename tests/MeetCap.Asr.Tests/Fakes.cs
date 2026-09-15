@@ -95,6 +95,13 @@ internal sealed class InMemoryAsrJobStore : IAsrJobStore
 {
     private readonly Dictionary<string, AsrJob> _jobs = new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// Simulates a process death at a chosen persistence point: when this predicate returns
+    /// true the update is abandoned and an exception is thrown, exactly as if the process had
+    /// been killed between a side effect and the status write that would have recorded it.
+    /// </summary>
+    public Func<AsrJob, bool>? AbandonUpdateWhen { get; set; }
+
     public void Create(AsrJob job) => _jobs[job.Id] = job;
 
     public AsrJob? Get(string jobId) => _jobs.TryGetValue(jobId, out var job) ? job : null;
@@ -119,7 +126,18 @@ internal sealed class InMemoryAsrJobStore : IAsrJobStore
             .ToArray();
     }
 
-    public void Update(AsrJob job) => _jobs[job.Id] = job;
+    public void Update(AsrJob job)
+    {
+        if (AbandonUpdateWhen is not null && AbandonUpdateWhen(job))
+        {
+            // Models a process death between a side effect and its status write: the update
+            // never lands, and the caller sees the process go away.
+            throw new InvalidOperationException(
+                $"Simulated process death before persisting job '{job.Id}' as {job.Status}.");
+        }
+
+        _jobs[job.Id] = job;
+    }
 
     public int CountByStatus(AsrJobStatus status) => _jobs.Values.Count(j => j.Status == status);
 }

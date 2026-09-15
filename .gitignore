@@ -15,6 +15,11 @@ TestResults/
 data/
 # Repo-root only: a source folder such as src/MeetCap.Core/Sessions must never be
 # ignored just because it is named "sessions".
+#
+# `data/` is likewise anchored by intent, but it is deliberately left unanchored here to
+# keep this diff minimal while PR #12 edits the same file. Private data placed outside the
+# repo root is protected instead by the self-ignoring marker MeetCap writes into the data
+# root (src/MeetCap.Persistence/Storage/DataRootMarker.cs).
 /sessions/
 *.db
 *.db-shm
