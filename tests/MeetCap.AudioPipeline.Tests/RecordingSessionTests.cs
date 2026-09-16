@@ -328,9 +328,9 @@ public class RecordingSessionTests
         var session = harness.Service.PrepareSession("Liveness");
         var paths = Paths(harness, session);
 
-        // Before the recording starts the session owns nothing, so a recovery scan may
-        // legitimately adopt it.
-        Assert.False(SessionRecordingLock.IsHeld(paths.RecordingLockPath));
+        // The marker is claimed by PrepareSession, before the session is published: a
+        // session that is visible to `meetcap status` must always already be owned.
+        Assert.True(SessionRecordingLock.IsHeld(paths.RecordingLockPath));
 
         using var cancellation = new CancellationTokenSource();
         var run = session.RunAsync(cancellation.Token);
@@ -340,7 +340,7 @@ public class RecordingSessionTests
         // process) that this session is live and must not be recovered.
         Assert.True(
             await Wait.UntilAsync(() => SessionRecordingLock.IsHeld(paths.RecordingLockPath)),
-            "the recording did not claim its session liveness marker");
+            "the recording did not hold its session liveness marker");
 
         cancellation.Cancel();
         var outcome = await Finish(run);
@@ -354,6 +354,116 @@ public class RecordingSessionTests
         var reacquired = SessionRecordingLock.TryAcquire(paths.RecordingLockPath);
         Assert.NotNull(reacquired);
         reacquired!.Dispose();
+    }
+
+    [Fact]
+    public async Task PrepareSession_AStartupScanInThePrepareToRunWindowCannotMutateTheSession()
+    {
+        using var harness = new SessionHarness(chunkSeconds: 60);
+        var source = new FakeCaptureSource(Format, harness.Device);
+        harness.Sources.Enqueue(source);
+
+        // The cross-process race the liveness marker has to close: `meetcap start` publishes
+        // the session (manifest plus CREATED row) and only then begins recording, while a
+        // concurrent `meetcap status` runs the startup recovery scan. If the marker were not
+        // already held at publication, the scan would see an unowned CREATED session, rewrite
+        // it to INTERRUPTED and stamp false recovery events on a recording that is perfectly
+        // healthy — and `meetcap stop` could no longer find it.
+        var session = harness.Service.PrepareSession("Raced");
+        var paths = Paths(harness, session);
+        try
+        {
+            // Stand in for the other process's `meetcap status`: same scanner, same data root.
+            var report = harness.Service.RunStartupRecovery();
+
+            // The live session's directory really was visited — it is skipped because it is
+            // owned, not because the scan never reached it. (The harness seeds one extra
+            // session directory of its own, which has no marker and is legitimately adopted,
+            // so the report is not empty; the live session simply does not appear in it.)
+            var directories = Directory.GetDirectories(Path.Combine(harness.DataRoot, "sessions"));
+            Assert.Equal(directories.Length, report.ScannedSessions);
+            Assert.Contains(session.SessionDirectory, directories, StringComparer.OrdinalIgnoreCase);
+            Assert.True(
+                SessionRecordingLock.IsHeld(paths.RecordingLockPath),
+                "the prepared session did not claim its liveness marker");
+            Assert.DoesNotContain(session.SessionId, report.Sessions.Select(s => s.SessionId));
+
+            // No problem was reported *about the live session*: the scan did not read,
+            // repair or rewrite anything belonging to it.
+            Assert.DoesNotContain(
+                report.Problems,
+                problem => problem.Contains(session.SessionId, StringComparison.Ordinal));
+
+            // The live session is untouched: still CREATED, not degraded, not recovered.
+            var stored = harness.Database.Sessions.Find(session.SessionId)!;
+            Assert.Equal(SessionStatus.Created, stored.Status);
+            Assert.Null(stored.StoppedAt);
+
+            var manifest = ReadManifest(paths);
+            Assert.Equal(SessionStatus.Created, manifest.Status);
+            Assert.Null(manifest.RecoveredAt);
+            Assert.False(manifest.Degraded);
+
+            // The clean event log gained no fabricated failure semantics.
+            Assert.DoesNotContain(
+                ReadEvents(paths),
+                e => Name(e) == SessionEventNames.SessionRecovered);
+
+            // `meetcap stop` still finds the session, so a healthy recording stays stoppable.
+            var active = harness.Service.FindActiveSession();
+            Assert.NotNull(active);
+            Assert.Equal(session.SessionId, active!.SessionId);
+
+            // And the recording that follows the scan still completes cleanly.
+            using var cancellation = new CancellationTokenSource();
+            var run = session.RunAsync(cancellation.Token);
+            Assert.True(await Wait.UntilAsync(() => source.StartCount == 1));
+            TestAudio.EmitSeconds(source, Format, 0, milliseconds: 5_000);
+            cancellation.Cancel();
+
+            var outcome = await Finish(run);
+
+            Assert.True(outcome.IsClean);
+            Assert.Equal(0, CountEvents(ReadEvents(paths), SessionEventNames.SessionRecovered));
+        }
+        finally
+        {
+            session.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task RecordingWithoutTheClaimedMarker_FailsLoudlyInsteadOfRacingRecovery()
+    {
+        using var harness = new SessionHarness();
+
+        var prepared = harness.Service.PrepareSession("Releases");
+        var paths = Paths(harness, prepared);
+
+        // A caller that abandons the prepared session must not leave the marker held: an
+        // unheld marker is what tells a later startup scan the session was not cleanly
+        // stopped and may be adopted.
+        Assert.True(SessionRecordingLock.IsHeld(paths.RecordingLockPath));
+        prepared.Dispose();
+        Assert.False(SessionRecordingLock.IsHeld(paths.RecordingLockPath));
+
+        // Recording without the marker would let a startup recovery scan reconcile the
+        // chunk surface out from under the live session, so it must fail loudly rather
+        // than proceed unowned.
+        var unowned = new RecordingSession(
+            paths,
+            harness.Settings,
+            harness.Platform,
+            harness.Database,
+            new JsonlSessionEventSink(paths.EventsPath),
+            harness.Device,
+            harness.Clock,
+            ReadManifest(paths),
+            maxDeviceRecoveryAttempts: 0,
+            recordingLock: null);
+
+        var error = await Assert.ThrowsAsync<MeetCapException>(() => unowned.RunAsync());
+        Assert.Contains("liveness marker", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]

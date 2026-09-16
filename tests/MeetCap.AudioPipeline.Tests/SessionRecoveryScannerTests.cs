@@ -384,6 +384,102 @@ public class SessionRecoveryScannerTests
     }
 
     [Fact]
+    public async Task Scan_LeavesAPreparedSessionAloneFromTheInstantItIsPublished()
+    {
+        // The cross-process race the liveness marker has to close. `meetcap start` publishes
+        // the session — directory, manifest and CREATED row — and only then begins recording,
+        // while `meetcap status` in another process runs this scan. Before the marker was
+        // claimed at publication, a scan landing in that window saw an unowned CREATED session
+        // and rewrote a perfectly healthy recording to INTERRUPTED, stamped false
+        // `session.recovered` events on its clean event log, and made `meetcap stop` — which
+        // only finds CREATED/RECORDING sessions — unable to stop it.
+        using var harness = new SessionHarness(chunkSeconds: 60);
+        var source = new FakeCaptureSource(Format, harness.Device);
+        harness.Sources.Enqueue(source);
+
+        var session = harness.Service.PrepareSession("Raced");
+        var paths = new SessionPaths(harness.DataRoot, session.SessionId);
+
+        // A real recording writes its active chunk as a `.part` before it is ever closed, so
+        // the scan in the window has one more reason to consider the session abandoned.
+        var spool = new ChunkSpool(
+            paths,
+            AudioSource.Mic,
+            Format,
+            chunkSeconds: 60,
+            harness.Database,
+            new InMemorySessionEventSink(),
+            harness.Clock);
+        spool.Append(Packet(0, SecondBytes), new PacketTiming(0, 1_000, 0, false, false));
+
+        try
+        {
+            Assert.True(File.Exists(paths.ChunkPartPath(AudioSource.Mic, 1)));
+
+            // Run the scan the way `meetcap status` does: a separate process means a separate
+            // database connection over the same file, not a shared in-memory object.
+            var otherProcess = new MeetCapDatabase(Path.Combine(harness.DataRoot, "meetcap.db"));
+            var report = new SessionRecoveryScanner(otherProcess, harness.Clock).Scan(harness.DataRoot);
+
+            Assert.DoesNotContain(session.SessionId, report.Sessions.Select(s => s.SessionId));
+            Assert.DoesNotContain(
+                report.Problems,
+                problem => problem.Contains(session.SessionId, StringComparison.Ordinal));
+
+            // Nothing belonging to the live session was touched.
+            var stored = harness.Database.Sessions.Find(session.SessionId)!;
+            Assert.Equal(SessionStatus.Created, stored.Status);
+            Assert.Null(stored.StoppedAt);
+
+            SessionManifestStore.TryLoad(paths.ManifestPath, out var manifest, out _);
+            Assert.Equal(SessionStatus.Created, manifest!.Status);
+            Assert.Null(manifest.RecoveredAt);
+            Assert.False(manifest.Degraded);
+
+            Assert.True(File.Exists(paths.ChunkPartPath(AudioSource.Mic, 1)));
+            Assert.False(File.Exists(paths.ChunkFinalPath(AudioSource.Mic, 1)));
+            Assert.DoesNotContain(
+                ReadEvents(paths),
+                e => Name(e) == SessionEventNames.SessionRecovered);
+
+            // `meetcap stop` still finds the session, so a healthy recording stays stoppable.
+            Assert.Equal(1, harness.Database.Sessions.CountActive());
+
+            // Drop the simulated in-flight chunk, so what runs next is the ordinary recording
+            // a caller would get: the scan is what was under test, and it left this artifact
+            // exactly where it found it.
+            spool.Dispose();
+            File.Delete(paths.ChunkPartPath(AudioSource.Mic, 1));
+            using (var connection = new Microsoft.Data.Sqlite.SqliteConnection(
+                       "Data Source=" + Path.Combine(harness.DataRoot, "meetcap.db")))
+            using (var command = connection.CreateCommand())
+            {
+                connection.Open();
+                command.CommandText =
+                    "DELETE FROM audio_chunks WHERE session_id = $session AND source = 'mic' AND sequence = 1";
+                command.Parameters.AddWithValue("$session", session.SessionId);
+                command.ExecuteNonQuery();
+            }
+
+            // And the recording that follows the scan still completes cleanly.
+            using var cancellation = new CancellationTokenSource();
+            var run = session.RunAsync(cancellation.Token);
+            Assert.True(await Wait.UntilAsync(() => source.StartCount == 1));
+            TestAudio.EmitSeconds(source, Format, 0, milliseconds: 5_000);
+            cancellation.Cancel();
+
+            var outcome = await Wait.ForAsync(run, timeoutMs: 60_000, "the raced recording session");
+
+            Assert.True(outcome.IsClean);
+            Assert.Equal(0, CountEvents(ReadEvents(paths), SessionEventNames.SessionRecovered));
+        }
+        finally
+        {
+            session.Dispose();
+        }
+    }
+
+    [Fact]
     public void Scan_LeavesACleanlyCompletedSessionAlone()
     {
         using var workspace = new TempWorkspace(sessionStatus: SessionStatus.Completed);
