@@ -31,9 +31,12 @@ public sealed class JsonlSessionEventSink : ISessionEventSink, IDisposable
             path,
             FileMode.Append,
             FileAccess.Write,
-            // ReadWrite sharing so `meetcap status` and tests can read the log while a
-            // session is still recording.
-            FileShare.ReadWrite,
+            // The log has to be readable while the session is still running: `meetcap
+            // status` and the forced-kill checklist read it from another process
+            // (docs/RELIABILITY.md section 11). `FileShare.ReadWrite` only permits
+            // readers that themselves opt into ReadWrite sharing, so it is widened with
+            // FileShare.Delete and readers open with FileShare.ReadWrite.
+            FileShare.ReadWrite | FileShare.Delete,
             bufferSize: 4096,
             FileOptions.None);
     }

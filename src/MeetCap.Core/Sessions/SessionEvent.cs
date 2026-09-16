@@ -22,6 +22,7 @@ public static class SessionEventNames
     public const string CaptureDeviceLost = "capture.device_lost";
     public const string CaptureDeviceRestored = "capture.device_restored";
     public const string CaptureDeviceLostFatal = "capture.device_lost_fatal";
+    public const string CaptureFormatChanged = "capture.format_changed";
     public const string CaptureBufferOverflow = "capture.buffer_overflow";
 
     public const string StorageLowDiskSpace = "storage.low_disk_space";

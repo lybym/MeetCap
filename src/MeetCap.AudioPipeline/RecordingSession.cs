@@ -81,6 +81,7 @@ public sealed class RecordingSession
     private readonly EventHandler<CaptureStoppedEventArgs> _stoppedHandler;
 
     private CancellationTokenSource? _endCts;
+    private SessionRecordingLock? _recordingLock;
     private TaskCompletionSource? _segmentEnded;
     private Exception? _segmentFault;
     private CaptureTimeline? _timeline;
@@ -139,6 +140,13 @@ public sealed class RecordingSession
     {
         _endCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
+        // Claim the session's liveness marker before any recovery scan can mistake this
+        // recording for an abandoned one. `meetcap status` runs the startup scan from a
+        // different process, and without this marker it would rewrite this live session
+        // to INTERRUPTED — which also makes `meetcap stop` unable to find it. The marker
+        // is released by the operating system if this process is killed.
+        _recordingLock = SessionRecordingLock.TryAcquire(_paths.RecordingLockPath);
+
         IAudioCaptureSource source;
         try
         {
@@ -179,19 +187,31 @@ public sealed class RecordingSession
             var consumer = Task.Run(ConsumeAsync);
             var housekeeping = Task.Run(HousekeepAsync);
 
-            await RunCaptureLoopAsync(source).ConfigureAwait(false);
+            try
+            {
+                await RunCaptureLoopAsync(source).ConfigureAwait(false);
 
-            // Capture has ended. Transition to the documented FINALIZING checkpoint
-            // (docs/ARCHITECTURE.md section 20) before draining the queue and closing
-            // the final chunk, so a crash during that window leaves a session that
-            // startup recovery treats as not-cleanly-stopped instead of RECORDING.
-            BeginFinalizing();
+                // Capture has ended. Transition to the documented FINALIZING checkpoint
+                // (docs/ARCHITECTURE.md section 20) before draining the queue and closing
+                // the final chunk, so a crash during that window leaves a session that
+                // startup recovery treats as not-cleanly-stopped instead of RECORDING.
+                BeginFinalizing();
 
-            _channel.Writer.TryComplete();
-            await consumer.ConfigureAwait(false);
+                _channel.Writer.TryComplete();
+                await consumer.ConfigureAwait(false);
 
-            CancelEnd();
-            await housekeeping.ConfigureAwait(false);
+                CancelEnd();
+                await housekeeping.ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // An exception escaping the capture loop or the finalization awaits must
+                // not leave FINALIZING as the durable session state with no explanation.
+                // Record it as a storage failure and fall through to the same teardown,
+                // so the session always reaches a described terminal state and the
+                // already-closed chunks stay durable (docs/DEVELOPMENT.md section 8).
+                RegisterStorageFailure(ex);
+            }
 
             return Complete();
         }
@@ -202,6 +222,9 @@ public sealed class RecordingSession
             // The runner owns the event log: it must be closed and flushed before the
             // command reports the session outcome.
             (_events as IDisposable)?.Dispose();
+
+            _recordingLock?.Dispose();
+            _recordingLock = null;
 
             _endCts?.Dispose();
             _endCts = null;
@@ -327,8 +350,55 @@ public sealed class RecordingSession
                 return;
             }
 
+            if (!FormatsMatch(_format, replacement.Format))
+            {
+                // The reopened endpoint delivers a different mix format — a realistic
+                // outcome when Windows changes the shared-mode mix format, or when a
+                // different device replaces the configured one. Continuing would write
+                // the new PCM bytes under the session's original WAV header and chunk
+                // index: internally consistent, so validation would pass, and the
+                // resulting chunk would play at the wrong speed with the wrong channel
+                // mapping. docs/RELIABILITY.md forbids silently ignoring a condition
+                // that changes the meaning of the audio, so end the session visibly
+                // instead of corrupting the artifact.
+                WriteFormatChangedFatal(_format!, replacement.Format);
+                replacement.Dispose();
+                RequestEnd("device_format_changed");
+                return;
+            }
+
             source = replacement;
         }
+    }
+
+    /// <summary>
+    /// Whether a reopened endpoint delivers the same audio format the session's chunk
+    /// headers, chunk index and capture timeline are already written against.
+    /// </summary>
+    private static bool FormatsMatch(AudioFormat? expected, AudioFormat actual)
+        => expected is not null &&
+           expected.SampleRate == actual.SampleRate &&
+           expected.Channels == actual.Channels &&
+           expected.BitsPerSample == actual.BitsPerSample &&
+           expected.SampleFormat == actual.SampleFormat;
+
+    private void WriteFormatChangedFatal(AudioFormat previous, AudioFormat current)
+    {
+        _degraded = true;
+
+        _events.Write(new SessionEvent(SessionEventNames.CaptureFormatChanged, CurrentTimelineMs())
+        {
+            Source = Track.ToWireName(),
+            Detail =
+                $"the capture endpoint came back with a different format ('{current}' instead of " +
+                $"'{previous}'); the session ends so the audio already captured stays honestly labeled.",
+        });
+
+        _events.Write(new SessionEvent(SessionEventNames.CaptureDeviceLostFatal, CurrentTimelineMs())
+        {
+            Source = Track.ToWireName(),
+            Detail = "capture could not be resumed at the session format; the session ends with the audio already captured still closed.",
+        });
     }
 
     private async Task<(IAudioCaptureSource? Source, int Attempts, bool Exhausted)> TryRecoverDeviceAsync(

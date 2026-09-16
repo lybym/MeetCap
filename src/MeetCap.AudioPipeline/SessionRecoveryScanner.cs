@@ -84,9 +84,15 @@ public sealed class RecoveryReport
 /// </summary>
 /// <remarks>
 /// The scan has to run before a new recording starts, because it is the only thing
-/// that can turn a kill-9 leftover into durable audio. It is idempotent: a session
-/// whose status is already terminal and that has no <c>.part</c> files left is
-/// skipped, so running it on every command is safe.
+/// that can turn a kill-9 leftover into durable audio. Two rules make it safe to run on
+/// every command:
+/// <list type="bullet">
+/// <item>a session that has not cleanly stopped is only reconciled when its liveness
+/// marker is free, so a recording that is still in progress is never touched
+/// (<see cref="SessionRecordingLock"/>);</item>
+/// <item>a session that is already terminal keeps its terminal status and its clean-stop
+/// timestamp, even when a stray artifact is repaired.</item>
+/// </list>
 /// </remarks>
 public sealed class SessionRecoveryScanner
 {
@@ -153,6 +159,27 @@ public sealed class SessionRecoveryScanner
             return null;
         }
 
+        // A live recording owns its own chunk surface. Recovery must never run against
+        // it: it would rewrite a healthy session to INTERRUPTED, stamp false
+        // 'session.recovered' / 'audio.chunk.corrupt' events on a clean recording, and
+        // (because `meetcap stop` only finds CREATED/RECORDING sessions) leave a
+        // recording that can no longer be stopped. The session row cannot express this
+        // on its own: RECORDING is exactly what a killed process leaves behind too, so
+        // the exclusive liveness marker is the discriminator.
+        if (SessionRecordingLock.IsHeld(paths.RecordingLockPath))
+        {
+            return null;
+        }
+
+        // Only a session that never cleanly stopped is rewritten to INTERRUPTED. A
+        // terminal session may still carry a stray artifact (for example a `.part` left
+        // by a duplicate or a late close), and that artifact is repaired below — but the
+        // session stays COMPLETED and keeps its `stopped_at`, because it *was* cleanly
+        // stopped (docs/DATA_MODEL.md section 1, docs/ARCHITECTURE.md section 20).
+        var targetStatus = SessionStatus.NeedsRecovery(existing?.Status) || existing is null
+            ? SessionStatus.Interrupted
+            : existing.Status;
+
         SessionManifestStore.TryLoad(paths.ManifestPath, out var manifest, out var manifestError);
         if (manifest is null && manifestError is not null)
         {
@@ -199,7 +226,8 @@ public sealed class SessionRecoveryScanner
             }
         }
 
-        var degraded = true;
+        var interrupted = string.Equals(targetStatus, SessionStatus.Interrupted, StringComparison.Ordinal);
+        var degraded = interrupted || (manifest?.Degraded ?? false);
         var detail = BuildDetail(recoveredChunks);
         // Reconciliation above can create or extend a chunk row (notably when a
         // process died after the atomic rename but before the index upsert). Session
@@ -210,31 +238,41 @@ public sealed class SessionRecoveryScanner
         events.Write(new SessionEvent(SessionEventNames.SessionRecovered, sessionEndMs)
         {
             Count = recoveredChunks.Count,
-            Detail = "this session was not cleanly stopped; " + detail,
+            Detail = (interrupted
+                    ? "this session was not cleanly stopped; "
+                    : "this session stopped cleanly but held a stray artifact; ") + detail,
         });
 
-        var interruptedAt = _clock.UtcNow;
+        // A terminal session keeps its own metadata: its `stopped_at`, its `duration_ms`
+        // and its `recovered_at` are already the truth, and overwriting them would
+        // present a cleanly stopped recording as an interrupted one.
+        var updatedAt = interrupted ? _clock.UtcNow : existing?.UpdatedAt ?? _clock.UtcNow;
 
         if (manifest is not null)
         {
-            manifest.Status = SessionStatus.Interrupted;
-            manifest.Degraded = true;
-            manifest.EndReason = manifest.EndReason ?? "interrupted";
-            manifest.RecoveredAt = interruptedAt;
+            manifest.Status = targetStatus;
+            manifest.Degraded = degraded;
+            manifest.EndReason = manifest.EndReason ?? (interrupted ? "interrupted" : null);
+
+            if (interrupted)
+            {
+                manifest.RecoveredAt = _clock.UtcNow;
+            }
+
             SessionManifestStore.Save(paths.ManifestPath, manifest);
         }
 
         _database.Sessions.UpdateLifecycle(
             paths.SessionId,
-            SessionStatus.Interrupted,
-            interruptedAt,
-            stoppedAt: null,
-            durationMs: sessionEndMs);
+            targetStatus,
+            updatedAt,
+            stoppedAt: interrupted ? null : existing?.StoppedAt,
+            durationMs: interrupted ? sessionEndMs : existing?.DurationMs ?? sessionEndMs);
 
         return new RecoveredSession(
             paths.SessionId,
             paths.SessionDirectory,
-            SessionStatus.Interrupted,
+            targetStatus,
             recoveredChunks,
             degraded,
             detail);

@@ -17,6 +17,7 @@ public sealed class SessionPaths
     public const string ManifestFileName = "session.json";
     public const string EventsFileName = "events.jsonl";
     public const string StopRequestFileName = "stop.request";
+    public const string RecordingLockFileName = "recording.lock";
     public const string AudioFolderName = "audio";
     public const string PartSuffix = ".part";
     public const string WaveExtension = ".wav";
@@ -48,6 +49,13 @@ public sealed class SessionPaths
     /// protocol (docs/DEVELOPMENT.md section 3).
     /// </summary>
     public string StopRequestPath => Path.Combine(SessionDirectory, StopRequestFileName);
+
+    /// <summary>
+    /// Liveness marker held exclusively by the recording process while a session owns
+    /// the recording surface. Recovery scans use it to tell a live recording apart from
+    /// a session abandoned by a killed process (docs/ARCHITECTURE.md section 9.1).
+    /// </summary>
+    public string RecordingLockPath => Path.Combine(SessionDirectory, RecordingLockFileName);
 
     public string AudioDirectory(AudioSource source)
         => Path.Combine(SessionDirectory, AudioFolderName, source.ToWireName());

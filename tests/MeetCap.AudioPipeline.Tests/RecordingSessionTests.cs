@@ -247,6 +247,116 @@ public class RecordingSessionTests
     }
 
     [Fact]
+    public async Task RunAsync_RecoveredDeviceWithADifferentFormat_EndsTheSessionInsteadOfMislabelingAudio()
+    {
+        using var harness = new SessionHarness(chunkSeconds: 60, maxDeviceRecoveryAttempts: 2);
+        var first = new FakeCaptureSource(Format, harness.Device);
+
+        // The endpoint comes back at 44.1 kHz stereo float. The session's chunk headers,
+        // chunk index and capture timeline are already written against 48 kHz mono PCM,
+        // so continuing would write these bytes under the wrong header: validation would
+        // still pass and the chunk would play at the wrong speed.
+        var changedFormat = new AudioFormat(44_100, 2, 32, AudioSampleFormat.IeeeFloat);
+        var second = new FakeCaptureSource(changedFormat, harness.Device);
+        harness.Sources.Enqueue(first);
+        harness.Sources.Enqueue(second);
+
+        var session = harness.Service.PrepareSession("Format Change");
+        var paths = Paths(harness, session);
+
+        using var cancellation = new CancellationTokenSource();
+        var run = session.RunAsync(cancellation.Token);
+        Assert.True(await Wait.UntilAsync(() => first.StartCount == 1));
+
+        TestAudio.EmitSeconds(first, Format, 0, milliseconds: 10_000);
+        first.Fail(new InvalidOperationException("device unplugged"));
+
+        // Recovery opens the endpoint again, finds the new format, and must end the
+        // session. The replacement source is therefore never started: the factory is
+        // asked for it (CreateCount 2), and the session ends without ever writing its
+        // bytes.
+        var outcome = await Finish(run);
+
+        Assert.Equal(2, harness.Sources.CreateCount);
+        Assert.Equal(0, second.StartCount);
+
+        // The session stopped cleanly — capture ended and every artifact was closed — but
+        // it is degraded because the endpoint changed format underneath it, so the CLI
+        // must not report success (docs/DEVELOPMENT.md section 8).
+        Assert.True(outcome.Degraded);
+        Assert.False(outcome.IsClean);
+        Assert.Equal("device_format_changed", outcome.EndReason);
+        Assert.Equal(SessionStatus.Completed, outcome.Status);
+        Assert.Equal(1, outcome.ChunksClosed);
+
+        var events = ReadEvents(paths);
+
+        // The change is stated explicitly, with both formats, instead of being inferred
+        // from a session that merely stopped early.
+        var changed = Assert.Single(events, e => Name(e) == SessionEventNames.CaptureFormatChanged);
+        var detail = changed.GetProperty("detail").GetString()!;
+
+        // Both formats are named, so the artifact can be audited without re-deriving why
+        // the session ended. The exact rendering comes from AudioFormat.ToString().
+        Assert.Contains(changedFormat.ToString(), detail, StringComparison.Ordinal);
+        Assert.Contains(Format.ToString(), detail, StringComparison.Ordinal);
+        Assert.Contains("ieee_float", detail, StringComparison.Ordinal);
+        Assert.Contains("16-bit pcm", detail, StringComparison.Ordinal);
+
+        // The session ends through the same visible fatal path a lost device uses.
+        Assert.Equal(1, CountEvents(events, SessionEventNames.CaptureDeviceLostFatal));
+
+        // What was captured at the session format is durable under that format's header.
+        var chunk = Assert.Single(ChunkFileNames(paths));
+        var validation = MeetCap.AudioPipeline.Wave.WaveChunkValidator.ValidateClosedFile(
+            Path.Combine(paths.AudioDirectory(AudioSource.Mic), chunk),
+            Format);
+        Assert.True(validation.IsValid, validation.Error);
+
+        var stored = harness.Database.Sessions.Find(session.SessionId)!;
+        Assert.Equal(SessionStatus.Completed, stored.Status);
+        Assert.NotNull(stored.StoppedAt);
+    }
+
+    [Fact]
+    public async Task RunAsync_HoldsTheSessionRecordingLockWhileRecordingAndReleasesItAfterwards()
+    {
+        using var harness = new SessionHarness(chunkSeconds: 60);
+        var source = new FakeCaptureSource(Format, harness.Device);
+        harness.Sources.Enqueue(source);
+
+        var session = harness.Service.PrepareSession("Liveness");
+        var paths = Paths(harness, session);
+
+        // Before the recording starts the session owns nothing, so a recovery scan may
+        // legitimately adopt it.
+        Assert.False(SessionRecordingLock.IsHeld(paths.RecordingLockPath));
+
+        using var cancellation = new CancellationTokenSource();
+        var run = session.RunAsync(cancellation.Token);
+        Assert.True(await Wait.UntilAsync(() => source.StartCount == 1));
+
+        // While recording, the exclusive marker tells `meetcap status` (running in another
+        // process) that this session is live and must not be recovered.
+        Assert.True(
+            await Wait.UntilAsync(() => SessionRecordingLock.IsHeld(paths.RecordingLockPath)),
+            "the recording did not claim its session liveness marker");
+
+        cancellation.Cancel();
+        var outcome = await Finish(run);
+
+        Assert.True(outcome.IsClean);
+
+        // The marker is released, and the session is terminal, so a later scan sees a
+        // completed session rather than one that still owns the recording surface.
+        Assert.False(SessionRecordingLock.IsHeld(paths.RecordingLockPath));
+
+        var reacquired = SessionRecordingLock.TryAcquire(paths.RecordingLockPath);
+        Assert.NotNull(reacquired);
+        reacquired!.Dispose();
+    }
+
+    [Fact]
     public async Task RunAsync_DeviceLossThatCannotBeRecovered_EndsDegradedButKeepsTheAudio()
     {
         using var harness = new SessionHarness(chunkSeconds: 60, maxDeviceRecoveryAttempts: 1);
