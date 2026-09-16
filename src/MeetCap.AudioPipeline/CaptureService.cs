@@ -113,8 +113,19 @@ public sealed class CaptureService
     /// for it. Everything that can fail before recording — device resolution and the
     /// free-space check — fails here, before any artifact is written.
     /// </summary>
+    /// <remarks>
+    /// The returned session already holds its exclusive liveness marker
+    /// (<c>recording.lock</c>). Claiming ownership here rather than in
+    /// <see cref="RecordingSession.RunAsync"/> is what makes publication and recovery
+    /// exclusion atomic: <c>meetcap status</c> runs the startup recovery scan from another
+    /// process, so a session that is visible as <c>CREATED</c> but not yet owned is
+    /// indistinguishable from one abandoned by a killed recorder. Disposing the returned
+    /// session without running it releases the marker, so an abandoned session is left
+    /// recoverable (docs/ARCHITECTURE.md section 9.1).
+    /// </remarks>
     /// <exception cref="DeviceUnavailableException">No usable microphone.</exception>
     /// <exception cref="InsufficientDiskSpaceException">Not enough free space to record.</exception>
+    /// <exception cref="MeetCapException">Another process already owns this session's marker.</exception>
     public RecordingSession PrepareSession(string title)
     {
         var device = ResolveDevice();
@@ -127,43 +138,74 @@ public sealed class CaptureService
         var paths = new SessionPaths(_settings.DataRoot, sessionId);
         paths.CreateDirectories();
 
-        var manifest = new SessionManifest
+        SessionRecordingLock? recordingLock = null;
+        try
         {
-            SessionId = sessionId,
-            Title = title,
-            Mode = SessionModes.Offline,
-            SourceType = SessionSourceTypes.Live,
-            Status = SessionStatus.Created,
-            ConfigVersion = _settings.ConfigVersion,
-            Tracks = new[] { AudioSources.Mic },
-            ChunkSeconds = _settings.ChunkSeconds,
-        };
-        SessionManifestStore.Save(paths.ManifestPath, manifest);
+            // Take the liveness marker before the session exists anywhere else, so there
+            // is no instant at which a recovery scan can see it unowned.
+            recordingLock = AcquireRecordingLock(paths);
 
-        _database.Sessions.Insert(new SessionRecord
+            var manifest = new SessionManifest
+            {
+                SessionId = sessionId,
+                Title = title,
+                Mode = SessionModes.Offline,
+                SourceType = SessionSourceTypes.Live,
+                Status = SessionStatus.Created,
+                ConfigVersion = _settings.ConfigVersion,
+                Tracks = new[] { AudioSources.Mic },
+                ChunkSeconds = _settings.ChunkSeconds,
+            };
+            SessionManifestStore.Save(paths.ManifestPath, manifest);
+
+            _database.Sessions.Insert(new SessionRecord
+            {
+                Id = sessionId,
+                Title = title,
+                Mode = SessionModes.Offline,
+                SourceType = SessionSourceTypes.Live,
+                Status = SessionStatus.Created,
+                ConfigVersion = _settings.ConfigVersion,
+                ConfigSnapshot = CaptureConfigSnapshot.ToJson(_settings),
+                Tracks = new[] { AudioSources.Mic },
+                CreatedAt = now,
+                UpdatedAt = now,
+            });
+
+            var session = new RecordingSession(
+                paths,
+                _settings,
+                _platform,
+                _database,
+                new JsonlSessionEventSink(paths.EventsPath),
+                device,
+                _platform.Clock,
+                manifest,
+                _maxDeviceRecoveryAttempts,
+                recordingLock);
+
+            recordingLock = null;
+            return session;
+        }
+        finally
         {
-            Id = sessionId,
-            Title = title,
-            Mode = SessionModes.Offline,
-            SourceType = SessionSourceTypes.Live,
-            Status = SessionStatus.Created,
-            ConfigVersion = _settings.ConfigVersion,
-            ConfigSnapshot = CaptureConfigSnapshot.ToJson(_settings),
-            Tracks = new[] { AudioSources.Mic },
-            CreatedAt = now,
-            UpdatedAt = now,
-        });
+            // Only reached when publishing failed: on success the marker is owned by the
+            // returned session and must outlive this method.
+            recordingLock?.Dispose();
+        }
+    }
 
-        return new RecordingSession(
-            paths,
-            _settings,
-            _platform,
-            _database,
-            new JsonlSessionEventSink(paths.EventsPath),
-            device,
-            _platform.Clock,
-            manifest,
-            _maxDeviceRecoveryAttempts);
+    private static SessionRecordingLock AcquireRecordingLock(SessionPaths paths)
+    {
+        var acquired = SessionRecordingLock.TryAcquire(paths.RecordingLockPath);
+        if (acquired is null)
+        {
+            throw new MeetCapException(
+                $"session '{paths.SessionId}' is owned by another recording process; " +
+                "refusing to publish a session whose liveness marker is already held.");
+        }
+
+        return acquired;
     }
 
     /// <summary>

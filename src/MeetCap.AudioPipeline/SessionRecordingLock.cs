@@ -23,6 +23,14 @@ namespace MeetCap.AudioPipeline;
 /// The lock is only ever acquired by the recording process. A recovery scan never takes
 /// the lock for itself; it only asks whether someone else holds it.
 /// </para>
+/// <para>
+/// Ownership begins at <see cref="CaptureService.PrepareSession"/>, before the session
+/// manifest and index row are published, and is transferred to the returned
+/// <see cref="RecordingSession"/>. A session that is visible to a recovery scan is
+/// therefore always already owned, which closes the window between "session published as
+/// CREATED" and "recorder claimed the marker" that a concurrent <c>meetcap status</c>
+/// could otherwise exploit to rewrite a healthy recording to <c>INTERRUPTED</c>.
+/// </para>
 /// </remarks>
 internal sealed class SessionRecordingLock : IDisposable
 {
@@ -52,9 +60,10 @@ internal sealed class SessionRecordingLock : IDisposable
             Directory.CreateDirectory(directory);
         }
 
+        FileStream stream;
         try
         {
-            var stream = new FileStream(
+            stream = new FileStream(
                 path,
                 FileMode.OpenOrCreate,
                 // Write access, so a reader that merely opens the file read-only cannot
@@ -63,12 +72,24 @@ internal sealed class SessionRecordingLock : IDisposable
                 FileShare.None,
                 bufferSize: 1,
                 FileOptions.None);
-
-            return new SessionRecordingLock(path, stream);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             // A sharing violation means another live recorder owns this session.
+            return null;
+        }
+
+        try
+        {
+            // Touch the marker so it exists on disk for as long as it is held. The
+            // exclusive handle is what excludes other processes; the file being present
+            // is what makes ownership visible to anything inspecting the directory.
+            stream.Flush();
+            return new SessionRecordingLock(path, stream);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            stream.Dispose();
             return null;
         }
     }

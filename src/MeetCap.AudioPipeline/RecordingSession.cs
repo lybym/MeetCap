@@ -45,8 +45,15 @@ public sealed record RecordingSessionOutcome(
 /// marked. They are an external cancellation (Ctrl+C), a stop request written by
 /// <c>meetcap stop</c>, and an unrecoverable capture or storage failure.
 /// </para>
+/// <para>
+/// The instance owns its session's exclusive liveness marker from construction, not from
+/// <see cref="RunAsync"/>: <see cref="CaptureService.PrepareSession"/> claims the marker
+/// before it publishes the session manifest and index row, so a concurrent
+/// <c>meetcap status</c> recovery scan can never observe a published-but-unowned session.
+/// Running the session, or disposing it without running it, releases the marker.
+/// </para>
 /// </remarks>
-public sealed class RecordingSession
+public sealed class RecordingSession : IDisposable
 {
     /// <summary>How often the stop signal, flush schedule and disk policy are checked.</summary>
     internal const int HousekeepingIntervalMs = 250;
@@ -110,7 +117,8 @@ public sealed class RecordingSession
         CaptureDeviceInfo device,
         IClock clock,
         SessionManifest manifest,
-        int maxDeviceRecoveryAttempts = 3)
+        int maxDeviceRecoveryAttempts,
+        SessionRecordingLock? recordingLock)
     {
         _paths = paths ?? throw new ArgumentNullException(nameof(paths));
         _settings = settings ?? throw new ArgumentNullException(nameof(settings));
@@ -121,6 +129,7 @@ public sealed class RecordingSession
         _clock = clock ?? throw new ArgumentNullException(nameof(clock));
         _manifest = manifest ?? throw new ArgumentNullException(nameof(manifest));
         _maxDeviceRecoveryAttempts = Math.Max(0, maxDeviceRecoveryAttempts);
+        _recordingLock = recordingLock;
 
         _diskMonitor = new DiskSpaceMonitor(platform.DiskSpace, settings.MinimumFreeSpaceBytes);
         _stopSignal = new SessionStopSignal(paths.StopRequestPath);
@@ -140,12 +149,20 @@ public sealed class RecordingSession
     {
         _endCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
-        // Claim the session's liveness marker before any recovery scan can mistake this
-        // recording for an abandoned one. `meetcap status` runs the startup scan from a
-        // different process, and without this marker it would rewrite this live session
-        // to INTERRUPTED — which also makes `meetcap stop` unable to find it. The marker
-        // is released by the operating system if this process is killed.
-        _recordingLock = SessionRecordingLock.TryAcquire(_paths.RecordingLockPath);
+        // The liveness marker was already claimed by CaptureService.PrepareSession, before
+        // this session became visible to a recovery scan. There is deliberately no
+        // acquisition here: a marker claimed at this point would leave a published session
+        // unowned for as long as the caller took to reach RunAsync, and a concurrent
+        // `meetcap status` scan could rewrite the healthy session to INTERRUPTED (which
+        // also makes `meetcap stop` unable to find it).
+        if (_recordingLock is null)
+        {
+            // Defensive: a session whose marker could not be claimed must not record, or a
+            // scan could reconcile the chunk surface out from under it. Fail loudly instead.
+            throw new MeetCapException(
+                $"session '{_paths.SessionId}' does not own its recording liveness marker; " +
+                "it was released or never acquired, so recording would race startup recovery.");
+        }
 
         IAudioCaptureSource source;
         try
@@ -223,12 +240,29 @@ public sealed class RecordingSession
             // command reports the session outcome.
             (_events as IDisposable)?.Dispose();
 
-            _recordingLock?.Dispose();
-            _recordingLock = null;
+            // The marker is released only after Complete() has written the terminal status,
+            // so a scan can never see a finished session as an unowned work-in-progress.
+            Dispose();
 
             _endCts?.Dispose();
             _endCts = null;
         }
+    }
+
+    /// <summary>
+    /// Releases this session's exclusive liveness marker without running the recording.
+    /// </summary>
+    /// <remarks>
+    /// A caller that prepares a session and then abandons it must dispose it so the marker
+    /// is freed. An unheld marker is exactly what tells a later startup scan that the
+    /// session was not cleanly stopped and may be adopted (docs/ARCHITECTURE.md section
+    /// 9.1). Disposing after <see cref="RunAsync"/> is a no-op, because the recording
+    /// already released the marker during its teardown.
+    /// </remarks>
+    public void Dispose()
+    {
+        _recordingLock?.Dispose();
+        _recordingLock = null;
     }
 
     private void BeginRecording()
