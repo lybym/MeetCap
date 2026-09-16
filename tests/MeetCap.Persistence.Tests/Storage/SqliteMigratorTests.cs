@@ -70,7 +70,7 @@ public class SqliteMigratorTests
     }
 
     [Fact]
-    public void Migrate_CreatesSessionsAndMigrationsTables()
+    public void Migrate_CreatesSessionsMigrationsAndAudioChunkTables()
     {
         var db = NewDb();
         try
@@ -79,6 +79,7 @@ public class SqliteMigratorTests
             using var c = Open(db);
             Assert.True(TableExists(c, "sessions"));
             Assert.True(TableExists(c, "schema_migrations"));
+            Assert.True(TableExists(c, "audio_chunks"));
         }
         finally
         {
@@ -92,8 +93,12 @@ public class SqliteMigratorTests
         var db = NewDb();
         try
         {
-            new SqliteMigrator().Migrate(db);
+            var migrator = new SqliteMigrator();
+            migrator.Migrate(db);
             using var c = Open(db);
+
+            // The migration count is derived from the embedded resources rather than
+            // hard-coded, so adding a migration cannot silently leave this test behind.
             var expected = ExpectedVersions();
             Assert.Equal(expected.Count, Count(c, "SELECT COUNT(*) FROM schema_migrations"));
 
@@ -106,6 +111,9 @@ public class SqliteMigratorTests
             }
 
             Assert.Equal(expected, applied);
+            Assert.Contains(1, migrator.SupportedVersions);
+            Assert.Contains(2, migrator.SupportedVersions);
+            Assert.Contains(3, migrator.SupportedVersions);
         }
         finally
         {
@@ -118,14 +126,14 @@ public class SqliteMigratorTests
     {
         // Two scripts sharing a version would make the second one look already applied,
         // so its tables would never be created at runtime. This asserts the embedded set
-        // is well formed. Version 0002 is deliberately free because the M1 capture
-        // migration (issue #3, PR #12) claims it.
+        // is well formed: 0001 (M0 sessions), 0002 (M1 audio_chunks) and 0003 (M3 asr_jobs)
+        // are all present and claim distinct versions.
         var versions = new SqliteMigrator().GetMigrations().Select(m => m.Version).ToArray();
 
         Assert.Equal(versions.Length, versions.Distinct().Count());
         Assert.Contains(1, versions);
+        Assert.Contains(2, versions);
         Assert.Contains(3, versions);
-        Assert.DoesNotContain(2, versions);
     }
 
     [Fact]
@@ -313,6 +321,7 @@ public class SqliteMigratorTests
             Assert.Empty(failures);
             using var c = Open(db);
             Assert.True(TableExists(c, "sessions"));
+            Assert.True(TableExists(c, "audio_chunks"));
             Assert.True(TableExists(c, "asr_jobs"));
             Assert.Equal(ExpectedVersions().Count, Count(c, "SELECT COUNT(*) FROM schema_migrations"));
         }
@@ -342,6 +351,70 @@ public class SqliteMigratorTests
         {
             Cleanup(db);
         }
+    }
+
+    [Fact]
+    public void Migrate_AudioChunks_RejectsUnknownSourceAndStatus()
+    {
+        var db = NewDb();
+        try
+        {
+            new SqliteMigrator().Migrate(db);
+            using var c = Open(db);
+            InsertSession(c, mode: "offline", id: "ses_chunks");
+
+            Assert.ThrowsAny<SqliteException>(() => InsertChunk(c, "ses_chunks", source: "speaker"));
+            Assert.ThrowsAny<SqliteException>(() => InsertChunk(c, "ses_chunks", status: "unknown"));
+
+            InsertChunk(c, "ses_chunks", source: "mic", status: "closed");
+            Assert.Equal(1, Count(c, "SELECT COUNT(*) FROM audio_chunks"));
+        }
+        finally
+        {
+            Cleanup(db);
+        }
+    }
+
+    [Fact]
+    public void Migrate_AudioChunks_RequireAnExistingSession()
+    {
+        var db = NewDb();
+        try
+        {
+            new SqliteMigrator().Migrate(db);
+            using var c = Open(db);
+
+            // foreign_keys is enabled per connection by MeetCapDatabase; this asserts the
+            // declared reference is real and not decorative.
+            using var pragma = new SqliteCommand("PRAGMA foreign_keys = ON", c);
+            pragma.ExecuteNonQuery();
+
+            Assert.ThrowsAny<SqliteException>(() => InsertChunk(c, "ses_missing", source: "mic"));
+        }
+        finally
+        {
+            Cleanup(db);
+        }
+    }
+
+    private static void InsertChunk(
+        SqliteConnection c,
+        string sessionId,
+        string source = "mic",
+        string status = "closed")
+    {
+        using var cmd = new SqliteCommand(
+            "INSERT INTO audio_chunks (id, session_id, source, sequence, path, start_ms, end_ms, " +
+            "sample_rate, channels, bits_per_sample, sample_format, byte_length, status, created_at) " +
+            "VALUES (@id, @sid, @source, @seq, @path, 0, 60000, 48000, 1, 16, 'pcm', 100, @status, @at)", c);
+        cmd.Parameters.AddWithValue("@id", "chk_" + Guid.NewGuid().ToString("N"));
+        cmd.Parameters.AddWithValue("@sid", sessionId);
+        cmd.Parameters.AddWithValue("@source", source);
+        cmd.Parameters.AddWithValue("@seq", 1);
+        cmd.Parameters.AddWithValue("@path", "audio/mic/000001.wav");
+        cmd.Parameters.AddWithValue("@status", status);
+        cmd.Parameters.AddWithValue("@at", "2026-09-15T00:00:00Z");
+        cmd.ExecuteNonQuery();
     }
 
     [Fact]

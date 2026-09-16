@@ -72,7 +72,7 @@ public class AsrJobProcessorTests : IDisposable
         {
             Id = "job_1",
             SessionId = "ses_1",
-            Source = AudioSource.Import,
+            Source = AudioTrackName.Import,
             Tier = "standard",
             Provider = provider,
             StartMs = 0,
@@ -389,7 +389,7 @@ public class AsrJobProcessorTests : IDisposable
         {
             Id = "job_2",
             SessionId = "ses_1",
-            Source = AudioSource.Import,
+            Source = AudioTrackName.Import,
             Tier = "standard",
             Provider = "volcengine",
             InputArtifact = first.InputArtifact,

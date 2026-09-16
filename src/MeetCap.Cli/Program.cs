@@ -39,7 +39,8 @@ public static class Program
         CliEnvironment? environment = null,
         IConfigurationStore? configurationStore = null,
         InvocationConfiguration? invocationConfiguration = null,
-        ParserConfiguration? parserConfiguration = null)
+        ParserConfiguration? parserConfiguration = null,
+        ICapturePlatformFactory? platformFactory = null)
     {
         ArgumentNullException.ThrowIfNull(args);
         environment ??= CliEnvironment.Instance;
@@ -61,7 +62,14 @@ public static class Program
         Func<string, IConfigurationStore> storeFactory = directory =>
             configurationStore ?? new TomlConfigurationStore(directory);
 
-        var root = CommandTree.Build(secrets, loggerFactory, storeFactory, output, error, environment);
+        var root = CommandTree.Build(
+            secrets,
+            loggerFactory,
+            storeFactory,
+            output,
+            error,
+            environment,
+            platformFactory);
         var parseResult = CommandLineParser.Parse(root, args, parserConfiguration);
 
         if (parseResult.Errors.Count > 0)

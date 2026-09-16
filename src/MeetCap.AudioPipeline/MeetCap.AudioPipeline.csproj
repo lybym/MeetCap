@@ -5,11 +5,12 @@
     <RootNamespace>MeetCap.AudioPipeline</RootNamespace>
     <AssemblyName>MeetCap.AudioPipeline</AssemblyName>
     <PackageId>MeetCap.AudioPipeline</PackageId>
-    <Description>Media inspection and normalization behind the MeetCap.Core media abstraction, implemented with FFprobe/FFmpeg via FFMpegCore.</Description>
+    <Description>MeetCap audio pipeline: durable, recoverable WAV chunk lifecycle, session artifacts, disk-space policy and startup recovery (M1), plus media inspection and normalization via FFprobe/FFmpeg using FFMpegCore (M3).</Description>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\MeetCap.Core\MeetCap.Core.csproj" />
+    <ProjectReference Include="..\MeetCap.Persistence\MeetCap.Persistence.csproj" />
   </ItemGroup>
 
   <ItemGroup>

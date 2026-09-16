@@ -21,7 +21,7 @@ public class FileSessionArtifactWriterTests
         SourceType = SessionSourceType.Import,
         StartedAt = s_now,
         ConfigVersion = 1,
-        Tracks = new[] { AudioSource.Import },
+        Tracks = new[] { AudioTrackName.Import },
         SourceArtifacts = artifacts ?? Array.Empty<SourceArtifact>(),
     };
 

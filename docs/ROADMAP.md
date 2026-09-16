@@ -60,6 +60,18 @@ No audio capture yet.
 
 Make the application trustworthy as a recorder.
 
+## Status
+
+Implemented. Automated coverage lives in `tests/MeetCap.AudioPipeline.Tests` (chunk
+lifecycle, crash recovery, disk-space policy, device loss, bounded queue) and
+`tests/MeetCap.Cli.Tests` (the `devices`, `start` and `stop` commands end to end against
+a scripted capture source).
+
+The mandatory tests below that need real audio hardware cannot run in CI. They are
+recorded as a manual checklist in `docs/M1_WINDOWS_VALIDATION.md`, and M1 is **not**
+claimed as verified end to end until that checklist has been run on real hardware
+(`docs/DEVELOPMENT.md` section 7).
+
 ## Deliverables
 
 - list audio devices

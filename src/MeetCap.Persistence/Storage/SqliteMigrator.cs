@@ -140,6 +140,14 @@ public sealed class SqliteMigrator
         return migrations;
     }
 
+    /// <summary>
+    /// The schema versions embedded in this build, ascending. Exposed so tests and
+    /// diagnostics can assert "every embedded migration is applied exactly once"
+    /// without hard-coding the current count as migrations are added.
+    /// </summary>
+    public IReadOnlyList<int> SupportedVersions
+        => GetMigrations().Select(m => m.Version).ToList();
+
     private static string BuildConnectionString(string dbPath) =>
         new SqliteConnectionStringBuilder
         {

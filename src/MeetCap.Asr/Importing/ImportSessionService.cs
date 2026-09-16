@@ -177,7 +177,7 @@ public sealed class ImportSessionService
             DurationMs = sourceMedia.DurationMs,
             ConfigSnapshotJson = _options.ConfigSnapshotJson,
             ConfigVersion = _options.ConfigVersion,
-            Tracks = new[] { AudioSource.Import },
+            Tracks = new[] { AudioTrackName.Import },
             CreatedAt = now,
             UpdatedAt = now,
         };
@@ -261,7 +261,7 @@ public sealed class ImportSessionService
         {
             Id = jobId,
             SessionId = sessionId,
-            Source = AudioSource.Import,
+            Source = AudioTrackName.Import,
             Tier = tier,
             Provider = _options.ProviderName,
             StartMs = 0,

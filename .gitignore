@@ -11,15 +11,11 @@ TestResults/
 *.user
 *.suo
 
-# Local runtime data
-data/
-# Repo-root only: a source folder such as src/MeetCap.Core/Sessions must never be
-# ignored just because it is named "sessions".
-#
-# `data/` is likewise anchored by intent, but it is deliberately left unanchored here to
-# keep this diff minimal while PR #12 edits the same file. Private data placed outside the
-# repo root is protected instead by the self-ignoring marker MeetCap writes into the data
-# root (src/MeetCap.Persistence/Storage/DataRootMarker.cs).
+# Local runtime data, anchored to the repository root so a source or test folder
+# named `Sessions/` or `data/` elsewhere is never silently dropped from a commit.
+# Private data placed outside the repo root is protected by the self-ignoring
+# marker MeetCap writes into the data root (src/MeetCap.Persistence/Storage/DataRootMarker.cs).
+/data/
 /sessions/
 *.db
 *.db-shm

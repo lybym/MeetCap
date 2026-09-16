@@ -176,7 +176,7 @@ public class ImportEndToEndTests : IDisposable
         Assert.Equal("import", session.Mode);
         Assert.Equal(SessionStatus.Completed, session.Status);
         Assert.Equal(754_000, session.DurationMs);
-        Assert.Equal(new[] { AudioSource.Import }, session.Tracks);
+        Assert.Equal(new[] { AudioTrackName.Import }, session.Tracks);
         Assert.Equal("meeting", session.Title);
     }
 

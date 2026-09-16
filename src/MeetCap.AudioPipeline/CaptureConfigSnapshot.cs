@@ -1,0 +1,40 @@
+namespace MeetCap.AudioPipeline;
+
+using System.Buffers;
+using System.Text;
+using System.Text.Json;
+using MeetCap.Core.Capture;
+
+/// <summary>
+/// Renders the capture-relevant part of the effective configuration as the
+/// <c>config_snapshot</c> stored on a session (docs/DATA_MODEL.md section 1).
+/// </summary>
+/// <remarks>
+/// Only non-secret capture settings are included. docs/ARCHITECTURE.md section 22
+/// forbids copying credentials into session artifacts, and the snapshot is written to
+/// a local artifact that may be shared for support, so the redaction is structural
+/// rather than best-effort.
+/// </remarks>
+public static class CaptureConfigSnapshot
+{
+    public static string ToJson(CaptureSettings settings)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+
+        var buffer = new ArrayBufferWriter<byte>(256);
+        using (var writer = new Utf8JsonWriter(buffer))
+        {
+            writer.WriteStartObject();
+            writer.WriteString("data_root", settings.DataRoot);
+            writer.WriteNumber("chunk_seconds", settings.ChunkSeconds);
+            writer.WriteNumber("buffer_seconds", settings.BufferSeconds);
+            writer.WriteNumber("flush_interval_ms", settings.FlushIntervalMs);
+            writer.WriteNumber("minimum_free_space_gb", settings.MinimumFreeSpaceGb);
+            writer.WriteString("microphone_device_id", settings.MicrophoneDeviceId);
+            writer.WriteNumber("config_version", settings.ConfigVersion);
+            writer.WriteEndObject();
+        }
+
+        return Encoding.UTF8.GetString(buffer.WrittenSpan);
+    }
+}

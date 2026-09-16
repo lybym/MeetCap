@@ -6,6 +6,7 @@
     <Project Path="src/MeetCap.Cli/MeetCap.Cli.csproj" />
     <Project Path="src/MeetCap.Core/MeetCap.Core.csproj" />
     <Project Path="src/MeetCap.Persistence/MeetCap.Persistence.csproj" />
+    <Project Path="src/MeetCap.WindowsAudio/MeetCap.WindowsAudio.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/MeetCap.Asr.Tests/MeetCap.Asr.Tests.csproj" />
@@ -15,5 +16,6 @@
     <Project Path="tests/MeetCap.Core.Tests/MeetCap.Core.Tests.csproj" />
     <Project Path="tests/MeetCap.IntegrationTests/MeetCap.IntegrationTests.csproj" />
     <Project Path="tests/MeetCap.Persistence.Tests/MeetCap.Persistence.Tests.csproj" />
+    <Project Path="tests/MeetCap.WindowsAudio.Tests/MeetCap.WindowsAudio.Tests.csproj" />
   </Folder>
 </Solution>

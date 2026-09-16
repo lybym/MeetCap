@@ -19,7 +19,7 @@ public class SqliteSessionStoreTests
         DurationMs = 754_000,
         ConfigSnapshotJson = "{\"config_version\":1}",
         ConfigVersion = 1,
-        Tracks = new[] { AudioSource.Import },
+        Tracks = new[] { AudioTrackName.Import },
         CreatedAt = s_now,
         UpdatedAt = s_now,
     };
@@ -43,7 +43,7 @@ public class SqliteSessionStoreTests
         Assert.Equal(SessionSourceType.Import, loaded.SourceType);
         Assert.Equal(SessionStatus.Processing, loaded.Status);
         Assert.Equal(754_000, loaded.DurationMs);
-        Assert.Equal(new[] { AudioSource.Import }, loaded.Tracks);
+        Assert.Equal(new[] { AudioTrackName.Import }, loaded.Tracks);
         Assert.Equal(session.StartedAt, loaded.StartedAt);
         Assert.Equal(session.CreatedAt, loaded.CreatedAt);
     }

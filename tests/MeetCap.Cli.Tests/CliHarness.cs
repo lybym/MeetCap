@@ -1,4 +1,5 @@
 using System.CommandLine;
+using MeetCap.Core.Capture;
 using MeetCap.Core.Configuration;
 using MeetCap.Persistence.Configuration;
 using Xunit;
@@ -11,6 +12,11 @@ namespace MeetCap.Cli.Tests;
 /// captured output writers, so parsing, validation, help, logging, and redaction
 /// are all exercised as shipped.
 /// </summary>
+/// <remarks>
+/// The capture platform is faked: M1 commands are exercised end to end — configuration,
+/// SQLite, session directories and chunk files are real — but no audio hardware is
+/// required (docs/DEVELOPMENT.md section 7).
+/// </remarks>
 internal sealed class CliHarness : IDisposable
 {
     private readonly string _root;
@@ -25,15 +31,21 @@ internal sealed class CliHarness : IDisposable
         Directory.CreateDirectory(DataRoot);
         _store = new TomlConfigurationStore(ConfigDirectory);
         Environment = new TestCliEnvironment(ConfigDirectory);
+
+        Platform = new FakeCapturePlatformFactory();
+        Platform.Devices.Replace(new CaptureDeviceInfo("mic-default", "Test Microphone", true));
     }
 
-    public static CliHarness Create() => new(Path.Combine(Path.GetTempPath(), "meetcap-cli-test-" + Guid.NewGuid().ToString("N")));
+    public static CliHarness Create()
+        => new(Path.Combine(Path.GetTempPath(), "meetcap-cli-test-" + Guid.NewGuid().ToString("N")));
 
     public string ConfigDirectory { get; }
 
     public string DataRoot { get; }
 
     public CliEnvironment Environment { get; }
+
+    public FakeCapturePlatformFactory Platform { get; }
 
     public string ConfigFilePath => _store.ConfigFilePath;
 
@@ -49,7 +61,8 @@ internal sealed class CliHarness : IDisposable
             args,
             Environment,
             configurationStore: null,
-            invocationConfiguration: new InvocationConfiguration { Output = output, Error = error });
+            invocationConfiguration: new InvocationConfiguration { Output = output, Error = error },
+            platformFactory: Platform);
 
         // Capture the text after Run returns; the harness owns the writers and the
         // production pipeline does not write once Run has completed.
@@ -57,6 +70,30 @@ internal sealed class CliHarness : IDisposable
     }
 
     public void WriteConfig(string toml) => File.WriteAllText(ConfigFilePath, toml);
+
+    /// <summary>Writes a capture-oriented configuration pointing at the temporary data root.</summary>
+    public void WriteCaptureConfig(
+        int chunkSeconds = 2,
+        double minimumFreeSpaceGb = 1,
+        string microphoneDeviceId = "default")
+        => WriteConfig(
+            "config_version = 1\n" +
+            "\n" +
+            "[app]\n" +
+            "default_title = \"Untitled Meeting\"\n" +
+            "\n" +
+            "[capture]\n" +
+            "default_mode = \"offline\"\n" +
+            $"chunk_seconds = {chunkSeconds}\n" +
+            "buffer_seconds = 5\n" +
+            "flush_interval_ms = 200\n" +
+            "\n" +
+            "[capture.offline]\n" +
+            $"microphone_device_id = \"{microphoneDeviceId}\"\n" +
+            "\n" +
+            "[storage]\n" +
+            $"data_root = '{DataRoot}'\n" +
+            $"minimum_free_space_gb = {minimumFreeSpaceGb}\n");
 
     public void Dispose()
     {

@@ -29,18 +29,23 @@ meetcap import .\meeting.m4a --title "Project Review"
 
 ## Implemented so far
 
-M0 (skeleton) and M3 (import + file ASR) are implemented:
+M0 (skeleton), M1 (offline microphone capture), and M3 (recording import + file ASR) are implemented:
 
 ```powershell
+meetcap devices                  # active capture endpoints, default and configured
+meetcap start "Weekly Meeting" --mode offline
+meetcap stop                     # signals the running recording to finish
+meetcap status                   # config, data root, database, incomplete sessions
 meetcap config init
+meetcap config path
 meetcap config validate
 meetcap config show
-meetcap status
 meetcap import .\meeting.m4a --title "Project Review"   # inspect, normalize, file ASR, transcript
 meetcap asr resume                                     # continue queued/retried ASR jobs
 ```
 
-An import:
+Offline capture (M1) writes recoverable WAV chunks, indexes them in `audio_chunks`, and
+crash-recovers unfinished sessions on the next start. An import (M3):
 
 1. inspects the file with FFprobe and normalizes it with FFmpeg only when required;
 2. copies the source into `sessions/<id>/audio/import/` (the original file is never modified);
@@ -51,20 +56,15 @@ Provider speaker labels are preserved exactly as anonymous, session-scoped data.
 treated as persistent human identities.
 
 Real Volcengine transcription is not verified by CI: no credentials are available there, so the
-provider boundary is mocked in tests.
+provider boundary is mocked in tests. M1's hardware-dependent acceptance tests are still open
+and are tracked as a manual checklist in `docs/M1_WINDOWS_VALIDATION.md`; nothing here claims M1
+is verified end to end on real audio hardware yet.
 
 ## Planned CLI
 
 ```powershell
-meetcap start "Weekly Meeting" --mode offline
 meetcap start "Remote Review" --mode online
-meetcap stop
-meetcap status
-meetcap import .\recording.m4a
-meetcap devices
 meetcap speakers list
-meetcap config path
-meetcap config validate
 ```
 
 ## Documentation
@@ -77,6 +77,7 @@ meetcap config validate
 - [Data Model & Artifact Contract](docs/DATA_MODEL.md)
 - [Reliability Requirements](docs/RELIABILITY.md)
 - [Development Rules](docs/DEVELOPMENT.md)
+- [M1 Windows validation checklist](docs/M1_WINDOWS_VALIDATION.md)
 
 ## Technology direction
 
@@ -121,4 +122,11 @@ See `docs/ARCHITECTURE.md` for the authoritative architecture.
 
 ## Repository status
 
-This repository starts documentation-first. Code should be added milestone by milestone according to `docs/ROADMAP.md`; agents should not implement later milestones opportunistically.
+This repository starts documentation-first. Code is added milestone by milestone
+according to `docs/ROADMAP.md`; agents should not implement later milestones
+opportunistically.
+
+M0 (repository and executable skeleton), M1 (offline microphone capture), and M3 (recording
+import and file ASR) are implemented. M1's hardware-dependent acceptance tests are still open and are tracked as
+a manual checklist in `docs/M1_WINDOWS_VALIDATION.md`; nothing here claims M1 is verified
+end to end on real audio hardware yet.
