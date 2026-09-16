@@ -325,11 +325,60 @@ public class LiveTranscriptionCommandTests
         Assert.Equal(0, harness.AsrHttp.Submits);
     }
 
+    [Fact]
+    public void AsrResume_QueuesARecoveredOrphanForTheProviderAndTierItsManifestRecords()
+    {
+        // A recovered orphan must not silently inherit the resuming process's configuration: the
+        // manifest records what the batch was built for, and that is what its audio is billed to
+        // (docs/ARCHITECTURE.md section 10.1).
+        using var harness = CliHarness.Create();
+        harness.WriteLiveAsrConfig(chunkSeconds: 1, fileBatchSeconds: 2);
+
+        var sessionId = SeedSessionWithAnOrphanedBatch(
+            harness,
+            "Orphaned Batch",
+            provider: "volcengine",
+            tier: "idle");
+        var database = new MeetCapDatabase(Path.Combine(harness.DataRoot, "meetcap.db"));
+
+        // The running configuration uses `standard` (see WriteLiveAsrConfig), which the job must
+        // not adopt, because its manifest says `idle`.
+        var resume = harness.Run("asr", "resume");
+        Assert.Equal(0, resume.ExitCode);
+
+        var job = Assert.Single(database.AsrJobs.ListBySession(sessionId));
+        Assert.Equal("volcengine", job.Provider);
+        Assert.Equal("idle", job.Tier);
+    }
+
+    [Fact]
+    public void AsrResume_FallsBackToConfigurationWhenTheManifestRecordsNoProvenance()
+    {
+        // A manifest written before the provider/tier fields existed carries no provenance, so
+        // recovery uses the running configuration rather than inventing one.
+        using var harness = CliHarness.Create();
+        harness.WriteLiveAsrConfig(chunkSeconds: 1, fileBatchSeconds: 2);
+
+        var sessionId = SeedSessionWithAnOrphanedBatch(harness, "Legacy Batch");
+        var database = new MeetCapDatabase(Path.Combine(harness.DataRoot, "meetcap.db"));
+
+        var resume = harness.Run("asr", "resume");
+        Assert.Equal(0, resume.ExitCode);
+
+        var job = Assert.Single(database.AsrJobs.ListBySession(sessionId));
+        Assert.Equal("volcengine", job.Provider);
+        Assert.Equal("standard", job.Tier);
+    }
+
     /// <summary>
     /// Creates the durable state a killed recorder leaves behind: a session with a finalized
     /// batch WAV and its timeline manifest, and no <c>asr_jobs</c> row for it.
     /// </summary>
-    private static string SeedSessionWithAnOrphanedBatch(CliHarness harness, string title)
+    private static string SeedSessionWithAnOrphanedBatch(
+        CliHarness harness,
+        string title,
+        string? provider = null,
+        string? tier = null)
     {
         var sessionId = "ses_20260915T140000Z_0a0b0c0d";
         var database = new MeetCapDatabase(Path.Combine(harness.DataRoot, "meetcap.db"));
@@ -367,6 +416,13 @@ public class LiveTranscriptionCommandTests
             writer.Close(DateTimeOffset.UtcNow);
         }
 
+        var provenance = provider is null && tier is null
+            ? string.Empty
+            : $"""
+              "provider": "{provider}",
+                "tier": "{tier}",
+              """;
+
         File.WriteAllText(
             Path.ChangeExtension(batchPath, ".json"),
             $$"""
@@ -379,6 +435,7 @@ public class LiveTranscriptionCommandTests
               "end_ms": 4000,
               "duration_ms": 4000,
               "data_bytes": {{dataBytes}},
+              {{provenance}}
               "chunks": [
                 {
                   "sequence": 1,

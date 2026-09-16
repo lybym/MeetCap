@@ -405,6 +405,151 @@ public class AsrBatchBuilderTests : IDisposable
     }
 
     [Fact]
+    public void AManifestThatCannotBeWrittenIsContainedLikeAnyOtherWriteFailure()
+    {
+        // The manifest is the second write site of a window (`File.WriteAllText`), and it used to
+        // sit outside the containment that covers the batch WAV. On a full disk, a read-only
+        // artifact directory or a permissions problem it threw out of `OnChunkClosed` and travelled
+        // to the recording's chunk-close path, where RegisterStorageFailure turns it into
+        // `degraded` + `end_reason=storage_error` + SessionStatus.Interrupted and makes
+        // `meetcap start` exit 1 — for a transcript-layer write, which is exactly what
+        // docs/ARCHITECTURE.md section 10.2 promises cannot happen.
+        //
+        // A directory in place of `batch-NNNNNN.json` makes File.WriteAllText fail deterministically
+        // on Windows and Linux, so no permission trickery is needed.
+        var builder = CreateBuilder(batchSeconds: 20);
+        builder.AttachEventSink(_events);
+
+        var first = CreateChunk(1, 0, 10_000);
+        var second = CreateChunk(2, 10_000, 10_000);
+        Assert.Null(builder.OnChunkClosed(first));
+
+        var manifestDirectory = Path.Combine(Paths.AsrBatchesDirectory, "mic", "batch-000001.json");
+        Directory.CreateDirectory(manifestDirectory);
+
+        // No exception may leave the builder: it contains its own failures.
+        var failed = builder.OnChunkClosed(second);
+
+        Assert.Null(failed);
+
+        // The failure is recorded with the documented reason, not passed silently.
+        var failure = Assert.Single(
+            _events.Events,
+            e => string.Equals(e.Name, SessionEvents.AsrBatchFailed, StringComparison.Ordinal));
+        Assert.Equal("batch_write_failed", failure.Reason);
+        Assert.Contains("batch-000001.json", failure.Detail!, StringComparison.Ordinal);
+
+        // Nothing is dropped: the whole window is still pending so its audio is retried.
+        Assert.Equal(2, builder.PendingChunkCount);
+        Assert.Equal(0, builder.UnreadableChunks);
+        Assert.Equal(0, builder.DroppedAudioMs);
+        Assert.Empty(_jobs.ListBySession(SessionId));
+
+        // And no manifest-less batch WAV is left behind for recovery to trip over: a WAV without
+        // its manifest cannot state its own timeline, so TryReadBatchManifest refuses it and
+        // RecoverFinalizedBatches could never queue it.
+        Assert.Empty(Directory.GetFiles(Paths.AsrBatchesDirectory, "*.wav", SearchOption.AllDirectories));
+        Assert.Empty(Directory.GetFiles(Paths.AsrBatchesDirectory, "*.part", SearchOption.AllDirectories));
+
+        // Once the obstruction is gone the same window is materialized and queued normally, which
+        // is what "the window stays pending and is retried" has to mean.
+        Directory.Delete(manifestDirectory);
+
+        var recovered = builder.FlushPendingBatches();
+
+        var batch = Assert.Single(recovered);
+        Assert.Equal(0, batch.StartMs);
+        Assert.Equal(20_000, batch.EndMs);
+        Assert.Equal(2, batch.Chunks.Count);
+        Assert.True(File.Exists(Path.ChangeExtension(batch.FilePath, ".json")));
+        Assert.Single(_jobs.ListBySession(SessionId));
+        Assert.Equal(0, builder.PendingChunkCount);
+    }
+
+    [Fact]
+    public void APersistentWriteFailureKeepsEveryChunkAndSpansTheWholeFailedStretch()
+    {
+        // The write-failure branch, which the unreadable-chunk test above does not reach: every
+        // iteration there deletes a chunk, i.e. exercises `reason=chunk_unreadable`. Here the
+        // failure is a write site (the manifest path), which is the branch that deliberately
+        // retains the window instead of dropping anything.
+        //
+        // This test pins what the branch actually does, and therefore what
+        // docs/ARCHITECTURE.md section 10.2 has to say: nothing is lost or discarded, no
+        // exception leaves the builder, and the retained window spans the whole failed stretch,
+        // so recovering after a long failure submits that stretch as one request.
+        var builder = CreateBuilder(batchSeconds: 20);
+        builder.AttachEventSink(_events);
+
+        var batchDirectory = Path.Combine(Paths.AsrBatchesDirectory, "mic");
+        Directory.CreateDirectory(batchDirectory);
+
+        // Obstruct the manifest path for the whole streak. A directory in place of a file makes
+        // File.WriteAllText fail deterministically on Windows and Linux, and because the directory
+        // survives the attempt it blocks whatever batch number the builder chooses next, which
+        // keeps this test independent of the numbering it is not about.
+        var obstruction = Path.Combine(batchDirectory, "batch-000001.json");
+        Directory.CreateDirectory(obstruction);
+
+        var sequence = 1;
+        var windows = 10;
+        for (var window = 1; window <= windows; window++)
+        {
+            var first = CreateChunk(sequence++, (window - 1) * 20_000, 10_000);
+            var second = CreateChunk(sequence++, (window - 1) * 20_000 + 10_000, 10_000);
+
+            // Neither call throws: no exception may leave the builder, at either write site.
+            Assert.Null(builder.OnChunkClosed(first));
+            Assert.Null(builder.OnChunkClosed(second));
+
+            // Every attempt is reported with the write reason, and the retained window is retried
+            // at each later threshold crossing, so at least one record exists per window.
+            var failures = _events.Events
+                .Where(e => string.Equals(e.Name, SessionEvents.AsrBatchFailed, StringComparison.Ordinal))
+                .ToArray();
+            Assert.True(
+                failures.Length >= window,
+                $"window {window}: expected at least {window} failure record(s), found {failures.Length}");
+            Assert.All(failures, e => Assert.Equal("batch_write_failed", e.Reason));
+
+            // Nothing usable is left on disk: the batch WAV is removed with the manifest it
+            // cannot be paired with, because RecoverFinalizedBatches refuses a manifest-less WAV.
+            Assert.Empty(Directory.GetFiles(batchDirectory, "*.wav"));
+        }
+
+        Assert.All(
+            _events.Events.Where(e => string.Equals(e.Name, SessionEvents.AsrBatchFailed, StringComparison.Ordinal)),
+            e => Assert.Equal("batch_write_failed", e.Reason));
+        Assert.Equal(0, builder.UnreadableChunks);
+        Assert.Equal(0, builder.DroppedAudioMs);
+        Assert.Empty(_jobs.ListBySession(SessionId));
+
+        // Every chunk is still retained: a write failure never drops audio. The window is retried
+        // at each later threshold crossing and absorbs the chunks that closed in the meantime —
+        // this is the consequence the docs name, and it is why recovering after a long outage
+        // submits the whole stretch as one request.
+        Assert.Equal(2 * windows, builder.PendingChunkCount);
+
+        // Remove the obstruction and let the accumulated window through: it is submitted as one
+        // request covering the entire failed stretch, and nothing is missing from it.
+        Directory.Delete(obstruction);
+
+        var recovered = builder.FlushPendingBatches();
+
+        var batch = Assert.Single(recovered);
+        Assert.Equal(2 * windows, batch.Chunks.Count);
+        Assert.Equal(0, batch.StartMs);
+        Assert.Equal(windows * 20_000, batch.EndMs);
+        Assert.Single(_jobs.ListBySession(SessionId));
+        Assert.Equal(0, builder.PendingChunkCount);
+        Assert.True(File.Exists(Path.ChangeExtension(batch.FilePath, ".json")));
+
+        // The retry kept the failed window's own number instead of advancing past it: the session
+        // has one batch artifact, numbered 1, with no gap in the sequence.
+        Assert.Equal("asr/batches/mic/batch-000001.wav", batch.RelativePath);
+    }
+
+    [Fact]
     public void AChunkWithNoBatchFileYetQueuesNothingOnRecovery()
     {
         var builder = CreateBuilder(batchSeconds: 300);

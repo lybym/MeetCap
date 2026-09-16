@@ -244,13 +244,25 @@ Implemented, and covered by the automated suite that runs in CI (`.github/workfl
   and the documented restart entry point `meetcap asr resume`. Covered by
   `tests/MeetCap.Asr.Tests/AsrBatchBuilderTests.cs` and, through the CLI resume path, by
   `tests/MeetCap.Cli.Tests/LiveTranscriptionCommandTests.AsrResume_RecoversABatchThatWasFinalizedBeforeItsJobRowExisted`.
-- **A batch window that cannot be built does not stop the track (section 4).** An unreadable
-  capture chunk makes its window fail, but the builder records an explicit `asr.batch.failed`,
-  drops only that chunk, and retries the rest of the window, so one bad chunk cannot block later
-  windows and the pending window stays bounded by the batch window rather than by the number of
-  failures. Covered by
+- **A batch window that cannot be built does not stop the track (section 4).** Every failure of the
+  materialization path is contained and recorded as an explicit `asr.batch.failed`; no exception
+  leaves `CompleteBatch`, so a transcript-layer write can never mark the recording degraded or
+  interrupted. An unreadable chunk is dropped and the rest of its window is retried, so one bad
+  chunk cannot block later windows. A write failure drops nothing: the window stays pending and is
+  retried. Covered by
   `tests/MeetCap.Asr.Tests/AsrBatchBuilderTests.ABatchWindowThatCannotBeMaterializedDoesNotBlockLaterWindows`
-  and `...RepeatedMaterializationFailureLeavesThePendingWindowBounded`.
+  (chunk branch, `reason=chunk_unreadable`),
+  `...RepeatedMaterializationFailureLeavesThePendingWindowBounded` (chunk branch, 20 windows),
+  `...AManifestThatCannotBeWrittenIsContainedLikeAnyOtherWriteFailure` (manifest write branch,
+  `reason=batch_write_failed`, and the same window is queued once the write site recovers) and
+  `...APersistentWriteFailureKeepsEveryChunkAndSpansTheWholeFailedStretch` (write branch, 10
+  windows: nothing dropped, no exception, and the accumulated window recovered afterwards).
+  Boundedness is stated precisely rather than generally: the chunk branch leaves at most one
+  `file_batch_seconds` window pending, while the write branch deliberately retains the window and
+  therefore grows by the chunks that close between attempts — bounded by the number of chunks the
+  recording produced (per-chunk metadata only, never audio), with the doc'd consequence that
+  recovery submits the accumulated stretch as one request
+  (`docs/ARCHITECTURE.md` section 10.2).
 - **A closed chunk cannot be announced before it is durable (section 5).**
   `RecordingSession.ChunkClosed` is raised after the header patch, flush, validation and rename,
   and a subscriber's failure is reported as an explicit `capture.discontinuity` event instead of

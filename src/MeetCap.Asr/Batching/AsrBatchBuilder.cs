@@ -62,6 +62,18 @@ public sealed record AsrBatch
     /// <summary>Audio data bytes in the batch, excluding the WAV header.</summary>
     public required long DataBytes { get; init; }
 
+    /// <summary>
+    /// Provider the batch was built for, read back from its manifest. Null when the manifest
+    /// predates the field or the batch was not reconstructed from one.
+    /// </summary>
+    public string? Provider { get; init; }
+
+    /// <summary>
+    /// Service tier the batch was built for, read back from its manifest. Null when the manifest
+    /// predates the field or the batch was not reconstructed from one.
+    /// </summary>
+    public string? Tier { get; init; }
+
     public long DurationMs => EndMs - StartMs;
 }
 
@@ -103,6 +115,12 @@ public sealed class AsrBatchBuilder
     private readonly AsrBatchBuilderOptions _options;
     private readonly Dictionary<string, PendingBatch> _pending = new(StringComparer.Ordinal);
     private readonly Dictionary<string, int> _nextBatchNumber = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Per-track batch number that a failed materialization must reuse, so a retry overwrites the
+    /// same artifact name instead of advancing past it.
+    /// </summary>
+    private readonly Dictionary<string, int> _retryBatchNumber = new(StringComparer.Ordinal);
 
     /// <summary>
     /// The session's own event sink, so batch events share the recorder's append lock and
@@ -278,7 +296,17 @@ public sealed class AsrBatchBuilder
             var batch = TryReadBatchManifest(sessionId, file, relativePath);
             if (batch is not null)
             {
-                var queued = QueueJob(paths, batch, jobs, options, events, onQueued: null);
+                // The batch's own provider/tier, so a recovered orphan is queued for what the
+                // recording was actually configured with rather than for whatever the resuming
+                // process happens to be using. Falls back to the caller's options when the
+                // manifest predates the fields.
+                var provenance = options with
+                {
+                    ProviderName = batch.Provider ?? options.ProviderName,
+                    ServiceTier = batch.Tier ?? options.ServiceTier,
+                };
+
+                var queued = QueueJob(paths, batch, jobs, provenance, events, onQueued: null);
                 if (queued is not null)
                 {
                     recovered.Add(queued);
@@ -358,6 +386,10 @@ public sealed class AsrBatchBuilder
                 StartMs = root.TryGetProperty("start_ms", out var start) ? start.GetInt64() : 0,
                 EndMs = root.TryGetProperty("end_ms", out var end) ? end.GetInt64() : 0,
                 DataBytes = root.TryGetProperty("data_bytes", out var bytes) ? bytes.GetInt64() : 0,
+                // Provenance written with the batch. Null for a manifest from a build that did not
+                // record it, in which case the caller falls back to its own configuration.
+                Provider = ReadOptionalString(root, "provider"),
+                Tier = ReadOptionalString(root, "tier"),
             };
         }
         catch (JsonException)
@@ -374,15 +406,26 @@ public sealed class AsrBatchBuilder
         }
     }
 
+    private static string? ReadOptionalString(JsonElement element, string name) =>
+        element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
+
     /// <summary>Materializes a batch, writes its timeline manifest, then queues its job.</summary>
     /// <remarks>
-    /// A window that cannot be built must never block the track. The failure is recorded with
-    /// the chunk that caused it, that one chunk is dropped from the pending window, and the
-    /// remaining chunks stay pending so their audio still reaches the provider in the next
-    /// window. Without the drop, one unreadable chunk would re-run the same failing build for
-    /// every later chunk — permanently stopping that track's transcription and growing the
-    /// pending list without bound (issue #6 hard constraint,
-    /// <c>docs/ARCHITECTURE.md</c> section 10.2).
+    /// <para>
+    /// No exception may leave this method. A window that cannot be built is a transcript problem:
+    /// letting it escape would travel out of the recording's chunk-close path into
+    /// <c>RegisterStorageFailure</c>, which marks a healthy recording degraded and ends it
+    /// <c>INTERRUPTED</c> and makes <c>meetcap start</c> exit non-zero — for a batch or manifest
+    /// write (<c>docs/ARCHITECTURE.md</c> section 10.2, <c>docs/RELIABILITY.md</c> section 2).
+    /// </para>
+    /// <para>
+    /// A chunk-attributable failure drops only the chunk that caused it and retries the rest of
+    /// the window. A write failure drops nothing: the whole window stays pending and is retried,
+    /// because discarding audio over a full disk or a permissions problem would be worse than
+    /// retrying it.
+    /// </para>
     /// </remarks>
     /// <returns>The queued batch, or <c>null</c> when the window could not be built.</returns>
     private AsrBatch? CompleteBatch(string sessionId, string source, PendingBatch pending)
@@ -416,7 +459,26 @@ public sealed class AsrBatchBuilder
                     DroppedAudioMs += chunk.DurationMs;
                 }
 
+                var before = pending.Chunks.Count;
                 pending.Drop(ex.ChunkPath);
+
+                // Termination is asserted here rather than assumed from PendingBatch.Drop's exact
+                // RelativePath match succeeding: a retry that makes no progress would otherwise
+                // spin forever on the recording consumer thread, which is the worst place to hang.
+                if (pending.Chunks.Count >= before)
+                {
+                    _events?.Write(new SessionEvent(SessionEvents.AsrBatchFailed, pending.StartMs)
+                    {
+                        Source = source,
+                        Reason = "chunk_unreadable",
+                        Detail =
+                            $"the builder could not remove '{ex.ChunkPath}' from the open window, so it " +
+                            "stopped retrying that window instead of looping. The window stays pending " +
+                            "and is retried by the next closed chunk.",
+                    });
+
+                    return null;
+                }
 
                 if (pending.Chunks.Count == 0)
                 {
@@ -435,6 +497,7 @@ public sealed class AsrBatchBuilder
                 // The window could not be written (disk, permissions, capacity). No chunk is
                 // to blame, so none is dropped: the chunks stay pending and the next window
                 // retries them rather than discarding audio over a transient condition.
+                RememberRetryNumber(source, number);
                 RecordFailedWindow(sessionId, source, number, relativePath, pending, ex, unreadableChunk: false);
                 return null;
             }
@@ -452,10 +515,62 @@ public sealed class AsrBatchBuilder
                 DataBytes = dataBytes,
             };
 
-            WriteManifest(batch);
+            // The manifest is the window's second write site, and it is inside its own
+            // containment for the same reason the first one is: it is a transcript-layer file, so
+            // its failure must not reach the recording. The batch WAV is removed with it, because
+            // a WAV with no manifest cannot state its own timeline: TryReadBatchManifest refuses
+            // it, so RecoverFinalizedBatches could never queue it and it would accumulate on disk
+            // as an artifact nothing can use.
+            try
+            {
+                WriteManifest(batch, _options);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
+            {
+                var orphan = RemoveUnusableArtifact(batchPath);
+                RememberRetryNumber(source, number);
+                RecordFailedWindow(
+                    sessionId,
+                    source,
+                    number,
+                    relativePath,
+                    pending,
+                    ex,
+                    unreadableChunk: false,
+                    orphanPath: orphan);
+
+                return null;
+            }
+
+            ClearRetryNumber(source);
             pending.Chunks.Clear();
 
             return QueueJob(paths, batch);
+        }
+    }
+
+    /// <summary>
+    /// Deletes a batch WAV whose manifest could not be written, returning the path when it could
+    /// not be removed.
+    /// </summary>
+    /// <remarks>
+    /// Best effort by design: the window is retried either way, so a failure here only decides
+    /// whether an unusable artifact is reported in the event rather than left silently on disk.
+    /// </remarks>
+    private static string? RemoveUnusableArtifact(string batchPath)
+    {
+        try
+        {
+            if (File.Exists(batchPath))
+            {
+                File.Delete(batchPath);
+            }
+
+            return null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return batchPath;
         }
     }
 
@@ -465,6 +580,10 @@ public sealed class AsrBatchBuilder
     /// fails because one chunk is unreadable loses only that chunk, and the rest of the window is
     /// retried, so the window's whole duration is not missing from the transcript.
     /// </remarks>
+    /// <param name="orphanPath">
+    /// A batch WAV that could not be removed after its manifest failed to write, so it is on disk
+    /// with nothing that can queue it. Null in every other case.
+    /// </param>
     private void RecordFailedWindow(
         string sessionId,
         string source,
@@ -472,13 +591,28 @@ public sealed class AsrBatchBuilder
         string relativePath,
         PendingBatch pending,
         Exception failure,
-        bool unreadableChunk)
+        bool unreadableChunk,
+        string? orphanPath = null)
     {
         var affectedMs = pending.DurationMs;
 
         if (unreadableChunk)
         {
             UnreadableChunks++;
+        }
+
+        var outcome = unreadableChunk
+            ? "The unreadable chunk was dropped from the window and the remaining audio is " +
+              "retried; the capture chunk itself is still on disk, so this is a transcript gap."
+            : "No chunk was dropped; the window stays pending and is retried.";
+
+        if (orphanPath is not null)
+        {
+            // Reported rather than hidden: the artifact is unusable (no manifest, so no timeline)
+            // and this is the only record that it exists.
+            outcome +=
+                $" The batch WAV '{orphanPath}' could not be removed and is unusable without its " +
+                "manifest; delete it manually.";
         }
 
         _events?.Write(new SessionEvent(SessionEvents.AsrBatchFailed, pending.StartMs)
@@ -490,11 +624,7 @@ public sealed class AsrBatchBuilder
             Reason = unreadableChunk ? "chunk_unreadable" : "batch_write_failed",
             Detail =
                 $"batch '{relativePath}' (window {number}, {affectedMs} ms of session audio over " +
-                $"{pending.Chunks.Count} chunk(s)) could not be built: {failure.Message} " +
-                (unreadableChunk
-                    ? "The unreadable chunk was dropped from the window and the remaining audio is " +
-                      "retried; the capture chunk itself is still on disk, so this is a transcript gap."
-                    : "No chunk was dropped; the window stays pending and is retried."),
+                $"{pending.Chunks.Count} chunk(s)) could not be built: {failure.Message} {outcome}",
         });
     }
 
@@ -504,7 +634,7 @@ public sealed class AsrBatchBuilder
     /// given. Without it a batch file could not be traced back to the audio it was built
     /// from, and the original session timeline could not be reconstructed.
     /// </summary>
-    private static void WriteManifest(AsrBatch batch)
+    private static void WriteManifest(AsrBatch batch, AsrBatchBuilderOptions options)
     {
         var manifestPath = Path.ChangeExtension(batch.FilePath, ".json");
         var directory = Path.GetDirectoryName(manifestPath);
@@ -536,6 +666,11 @@ public sealed class AsrBatchBuilder
             ["end_ms"] = batch.EndMs,
             ["duration_ms"] = batch.DurationMs,
             ["data_bytes"] = batch.DataBytes,
+            // What this batch was built for. Recorded so an orphan recovered by a later process
+            // is queued for the provider and tier the recording actually used, instead of
+            // silently inheriting whatever the resuming process happens to be configured with.
+            ["provider"] = options.ProviderName,
+            ["tier"] = options.ServiceTier,
             ["chunks"] = chunks,
         };
 
@@ -682,6 +817,16 @@ public sealed class AsrBatchBuilder
 
     private int NextBatchNumber(SessionArtifactPaths paths, string source)
     {
+        // A window that failed to materialize reuses its own number on the next attempt. Advancing
+        // on failure would make each retry target a different artifact name, which both
+        // accumulates half-written files on disk and makes the batch that finally succeeds carry a
+        // number unrelated to how many batches exist — the reason a long write outage left gaps in
+        // the numbering for no reason.
+        if (_retryBatchNumber.TryGetValue(source, out var retry))
+        {
+            return retry;
+        }
+
         // The number only has to be unique within the session directory, so a per-track counter
         // is enough; it starts from whatever a previous process already wrote, which is what
         // keeps recovery from reusing a batch file's name.
@@ -689,7 +834,6 @@ public sealed class AsrBatchBuilder
             ? known
             : HighestExistingBatchNumber(paths, source);
 
-        var directory = BatchDirectory(paths, source);
         int candidate;
         do
         {
@@ -701,6 +845,12 @@ public sealed class AsrBatchBuilder
         _nextBatchNumber[source] = candidate;
         return candidate;
     }
+
+    /// <summary>Remembers a batch number whose materialization failed, so the retry reuses it.</summary>
+    private void RememberRetryNumber(string source, int number) => _retryBatchNumber[source] = number;
+
+    /// <summary>Clears the retry number once the batch it names has been materialized.</summary>
+    private void ClearRetryNumber(string source) => _retryBatchNumber.Remove(source);
 
     private static int HighestExistingBatchNumber(SessionArtifactPaths paths, string source)
     {

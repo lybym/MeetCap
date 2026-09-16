@@ -728,36 +728,66 @@ those (`docs/DATA_MODEL.md` sections 6 and 12).
 
 ### 10.2 A window that cannot be built must not stop the track
 
-Materializing a window reads the durable capture chunks, so it can fail for reasons the recorder
-never controls: a chunk that an aborted write left unreadable, a chunk in a different format, a
-disk that refuses the batch write. The distinction that matters is whether a *chunk* is at fault
-or the *write* is:
+Materializing a window reads the durable capture chunks and writes two files, so it can fail for
+reasons the recorder never controls: a chunk that an aborted write left unreadable, a chunk in a
+different format, a disk that refuses one of the writes. The distinction that matters is whether a
+*chunk* is at fault or a *write* is:
 
 ```text
 a capture chunk cannot be read (missing, short, not a WAV, wrong format)
   -> asr.batch.failed (reason=chunk_unreadable), naming the batch and the chunk
   -> that one chunk is dropped from the window and counted (UnreadableChunks / DroppedAudioMs)
-  -> the remaining chunks are retried, so their audio still reaches the provider
+  -> the remaining chunks are retried in the same call, so their audio still reaches the provider
   -> the dropped chunk stays on disk: this is a transcript gap, not lost audio
 
-the window itself cannot be written (disk, permissions, capacity, the job row)
-  -> asr.batch.failed (reason=batch_write_failed or job_queue_failed)
-  -> nothing is dropped; the chunks stay pending for the next window
+the batch WAV or its timeline manifest cannot be written (disk, permissions, capacity)
+  -> asr.batch.failed (reason=batch_write_failed), naming the batch
+  -> nothing is dropped; the whole window stays pending and is retried
+  -> a batch WAV whose manifest could not be written is removed from disk, because
+     TryReadBatchManifest refuses a manifest-less WAV and RecoverFinalizedBatches could never
+     queue it (if even the removal fails, the event names the leftover artifact)
+
+the job row cannot be written (the window is already durable on disk)
+  -> asr.batch.failed (reason=job_queue_failed)
+  -> nothing is dropped; the durable batch is re-queued by `meetcap asr resume`
 ```
 
-Three rules follow, and all three are load-bearing:
+Two rules follow, and both are load-bearing:
 
 - **The track never stops.** Dropping the offending chunk is what lets the loop make progress.
   Without it one unreadable chunk would re-run the same failing build for every later chunk —
   permanently stopping that track's transcription for the rest of the meeting.
-- **The pending window stays bounded.** The open window is bounded by `file_batch_seconds` of
-  audio plus the retry of the failed window, not by the number of failures, so a long failure
-  streak cannot grow memory (the issue's hard constraint, `docs/RELIABILITY.md` section 4).
-- **A transcript gap is never a failed recording.** The builder contains the failure and records
-  it; it does not throw into the recording's chunk-close path, so the session is not marked
-  degraded or interrupted and `meetcap start` still exits 0
-  (`docs/RELIABILITY.md` sections 1 and 2). `meetcap start`'s stop summary names the unreadable
-  chunk count and the milliseconds that were never transcribed.
+- **A transcript gap is never a failed recording.** The builder contains every one of those
+  failures and records it; no exception leaves `CompleteBatch`, so nothing reaches the recording's
+  chunk-close path, the session is not marked degraded or interrupted, and `meetcap start` still
+  exits 0 (`docs/RELIABILITY.md` sections 1 and 2). `meetcap start`'s stop summary names the
+  unreadable chunk count and the milliseconds that were never transcribed.
+
+**What is bounded, and what is not.** The two failure kinds retain different amounts, and the
+difference is deliberate rather than an omission:
+
+| Failure | Retained pending window | Why |
+| --- | --- | --- |
+| chunk unreadable | falls back to at most one `file_batch_seconds` window | the offending chunk is dropped and the rest is retried immediately, so the window empties and the next window starts clean |
+| write failure | grows by the chunks that close between attempts | nothing may be discarded, so the audio is kept and retried; the window is retried at each later threshold crossing rather than re-based or capped |
+
+The write-failure case is therefore *not* bounded by `file_batch_seconds`. Its bound is the number
+of chunks the recording produced: what accumulates is per-chunk metadata (a path, a sequence and
+two timestamps), never audio, so a two-hour recording at 60 s chunks holds about 120 records in the
+worst case. The operator-visible consequence is stated rather than hidden: when the write site
+recovers, that accumulated window is materialized and submitted as **one** request covering the
+whole failed stretch, which is the oversized-first-request shape
+`docs/ASR_STRATEGY.md` section 12 discusses for imports. Failure windows are also never assigned a
+new batch number, so a long outage leaves no gaps in the batch numbering and no half-written files
+behind.
+
+Two smaller guarantees keep the loop honest:
+
+- the retry loop asserts that a chunk-attributable failure actually removed a chunk; if it did not,
+  the builder records the fact and returns instead of retrying the same failing build. Termination
+  is therefore local to the loop rather than dependent on `PendingBatch.Drop`'s exact-path match.
+- the pending window's own duration is what the manifest and the job record, so an accumulated
+  window's span is stated in its artifacts and never inferred.
 
 ---
 
