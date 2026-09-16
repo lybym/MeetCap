@@ -177,7 +177,7 @@ public class SessionRecoveryScannerTests
     }
 
     [Fact]
-    public void Scan_MarksASessionInterruptedWhenItWasNeverStoppedEvenWithoutPartFiles()
+    public void Scan_ReconcilesAFinalWavAndMarksTheSessionInterruptedWhenItWasNeverStopped()
     {
         using var workspace = new TempWorkspace(sessionStatus: SessionStatus.Recording);
         WriteChunk(workspace.Paths, sequence: 1, dataBytes: 2 * SecondBytes, close: true);
@@ -186,7 +186,59 @@ public class SessionRecoveryScannerTests
         var report = new SessionRecoveryScanner(workspace.Database, new FakeClock()).Scan(workspace.DataRoot);
 
         var session = Assert.Single(report.Sessions);
-        Assert.Equal(0, session.RepairedChunks);
+        // The closed WAV's index row was never written, so recovery reconciles it to
+        // durable instead of leaving it unindexed for downstream consumers to skip.
+        Assert.Equal(1, session.RepairedChunks);
+        Assert.Equal(0, session.CorruptChunks);
+
+        var chunk = workspace.Database.Chunks.Find(workspace.SessionId, AudioSource.Mic, 1)!;
+        Assert.Equal(ChunkStates.Recovered, chunk.Status);
+        Assert.Equal(2 * SecondBytes, chunk.ByteLength);
+
+        var events = ReadEvents(workspace.Paths);
+        Assert.Equal(1, CountEvents(events, SessionEventNames.ChunkRecovered));
+
+        // The session was never cleanly stopped, so it stays interrupted even though its
+        // one chunk was made durable.
+        Assert.Equal(SessionStatus.Interrupted, workspace.Database.Sessions.Find(workspace.SessionId)!.Status);
+    }
+
+    [Fact]
+    public void Scan_ReconcilesAFinalWavWhoseIndexRowIsStillOpenAfterAKillBetweenRenameAndUpsert()
+    {
+        using var workspace = new TempWorkspace(sessionStatus: SessionStatus.Recording);
+
+        // The spool opened the chunk (open index row + .part), then the close path ran
+        // far enough to atomically rename .part -> .wav, but the process was killed
+        // before the closed-index upsert landed. The row is still 'open' while the WAV
+        // is already durable on disk.
+        WriteFinalWavWithOpenRow(workspace.Paths, workspace.Database, sequence: 1, dataBytes: 2 * SecondBytes);
+        WriteManifest(workspace.Paths, SessionStatus.Recording);
+
+        var rowBefore = workspace.Database.Chunks.Find(workspace.SessionId, AudioSource.Mic, 1)!;
+        Assert.Equal(ChunkStates.Open, rowBefore.Status);
+        Assert.True(File.Exists(workspace.Paths.ChunkFinalPath(AudioSource.Mic, 1)));
+        Assert.False(File.Exists(workspace.Paths.ChunkPartPath(AudioSource.Mic, 1)));
+
+        var hashBefore = HashFile(workspace.Paths.ChunkFinalPath(AudioSource.Mic, 1));
+
+        var report = new SessionRecoveryScanner(workspace.Database, new FakeClock()).Scan(workspace.DataRoot);
+
+        var session = Assert.Single(report.Sessions);
+        Assert.Equal(1, session.RepairedChunks);
+        Assert.Equal(0, session.CorruptChunks);
+
+        // The dangling 'open' row is promoted to durable; the WAV itself is untouched.
+        var rowAfter = workspace.Database.Chunks.Find(workspace.SessionId, AudioSource.Mic, 1)!;
+        Assert.Equal(ChunkStates.Recovered, rowAfter.Status);
+        Assert.Equal(2 * SecondBytes, rowAfter.ByteLength);
+        Assert.NotNull(rowAfter.ClosedAt);
+        Assert.Equal(hashBefore, HashFile(workspace.Paths.ChunkFinalPath(AudioSource.Mic, 1)));
+
+        var events = ReadEvents(workspace.Paths);
+        Assert.Equal(1, CountEvents(events, SessionEventNames.ChunkRecovered));
+        Assert.Equal(1, CountEvents(events, SessionEventNames.SessionRecovered));
+
         Assert.Equal(SessionStatus.Interrupted, workspace.Database.Sessions.Find(workspace.SessionId)!.Status);
     }
 
@@ -297,6 +349,40 @@ public class SessionRecoveryScannerTests
         }
 
         writer.Dispose();
+    }
+
+    /// <summary>
+    /// Reproduces the crash window in <c>ChunkSpool.CloseCurrentChunk</c> between the
+    /// atomic rename and the closed-index upsert: the WAV is finalized on disk, but the
+    /// index row is still <c>open</c> from when the chunk was opened.
+    /// </summary>
+    private static void WriteFinalWavWithOpenRow(
+        SessionPaths paths, MeetCapDatabase database, int sequence, int dataBytes)
+    {
+        var writer = new WaveChunkWriter(
+            paths.ChunkPartPath(AudioSource.Mic, sequence),
+            paths.ChunkFinalPath(AudioSource.Mic, sequence),
+            Format,
+            capacityBytes: 60L * SecondBytes,
+            sequence);
+
+        writer.Append(new byte[dataBytes]);
+        writer.Close(DateTimeOffset.UnixEpoch); // patches header, validates, atomic rename
+
+        database.Chunks.Upsert(new AudioChunkRecord
+        {
+            Id = AudioChunkRecord.BuildId(paths.SessionId, AudioSource.Mic, sequence),
+            SessionId = paths.SessionId,
+            Source = AudioSource.Mic,
+            Sequence = sequence,
+            RelativePath = paths.RelativeChunkPath(AudioSource.Mic, sequence),
+            StartMs = 0,
+            EndMs = 0,
+            Format = Format,
+            ByteLength = 0,
+            Status = ChunkStates.Open,
+            CreatedAt = DateTimeOffset.UnixEpoch,
+        });
     }
 
     private static void WriteManifest(SessionPaths paths, string status)

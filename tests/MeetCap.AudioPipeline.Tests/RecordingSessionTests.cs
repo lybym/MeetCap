@@ -564,6 +564,34 @@ public class RecordingSessionTests
         Assert.False(manifest.Degraded);
     }
 
+    [Fact]
+    public async Task RunAsync_WritesTheDocumentedFinalizingCheckpointBeforeCompleting()
+    {
+        using var harness = new SessionHarness(chunkSeconds: 60);
+        var source = new FakeCaptureSource(Format, harness.Device);
+        harness.Sources.Enqueue(source);
+
+        var session = harness.Service.PrepareSession("Finalizing");
+        var paths = Paths(harness, session);
+
+        using var cancellation = new CancellationTokenSource();
+        var run = session.RunAsync(cancellation.Token);
+        Assert.True(await Wait.UntilAsync(() => source.StartCount == 1));
+        TestAudio.EmitSeconds(source, Format, 0, milliseconds: 10_000);
+        cancellation.Cancel();
+
+        await Finish(run);
+
+        // The documented CREATED -> RECORDING -> FINALIZING -> COMPLETED lifecycle
+        // writes an explicit 'session.stopping' checkpoint while artifacts are being
+        // closed, so a crash during finalization is recoverable instead of looking like
+        // a clean RECORDING.
+        var events = ReadEvents(paths);
+        Assert.Equal(1, CountEvents(events, SessionEventNames.SessionStopping));
+
+        Assert.Equal(SessionStatus.Completed, harness.Database.Sessions.Find(session.SessionId)!.Status);
+    }
+
     private static SessionPaths Paths(SessionHarness harness, RecordingSession session)
         => new(harness.DataRoot, session.SessionId);
 

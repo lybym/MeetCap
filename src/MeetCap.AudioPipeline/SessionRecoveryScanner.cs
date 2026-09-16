@@ -172,6 +172,21 @@ public sealed class SessionRecoveryScanner
             }
         }
 
+        // A chunk may also have been atomically renamed to its final .wav and then the
+        // process died before the closed-index upsert landed (docs/RELIABILITY.md
+        // section 5: "atomic rename -> mark CLOSED"). Those final WAVs are durable on
+        // disk but their index row is still 'open' (or was never written), so without
+        // this pass they would never be promoted to durable and downstream consumers
+        // would skip them. Reconcile them the same way a repaired .part is reconciled.
+        foreach (var wavPath in EnumerateFinalWavFiles(paths))
+        {
+            var chunk = ReconcileFinalWav(paths, wavPath, events, atMs);
+            if (chunk is not null)
+            {
+                recoveredChunks.Add(chunk);
+            }
+        }
+
         var degraded = true;
         var detail = BuildDetail(recoveredChunks);
 
@@ -344,6 +359,127 @@ public sealed class SessionRecoveryScanner
             ChunkStates.Recovered,
             dataBytes,
             null);
+    }
+
+    /// <summary>
+    /// Reconciles one final <c>.wav</c> whose index row is not durable. This is the
+    /// recovery path for a crash that landed between the atomic rename in
+    /// <see cref="WaveChunkWriter.Close"/> and the closed-index upsert in
+    /// <see cref="ChunkSpool.CloseCurrentChunk"/>: the WAV is already durable on disk,
+    /// but its row is still <c>open</c> (or was never written).
+    /// </summary>
+    /// <returns>A recovered/corrupt chunk, or <c>null</c> when there is nothing to do.</returns>
+    private RecoveredChunk? ReconcileFinalWav(
+        SessionPaths paths,
+        string wavPath,
+        ISessionEventSink events,
+        long atMs)
+    {
+        var fileName = Path.GetFileName(wavPath);
+        var sourceName = Path.GetFileName(Path.GetDirectoryName(wavPath));
+        var sequence = ParseSequence(fileName);
+
+        if (sequence is null || !AudioSources.TryParse(sourceName, out var source))
+        {
+            return null;
+        }
+
+        var existing = _database.Chunks.Find(paths.SessionId, source, sequence.Value);
+        if (existing is not null && ChunkStates.IsDurable(existing.Status))
+        {
+            // Already closed cleanly or already recovered: never touch durable audio.
+            return null;
+        }
+
+        // The close/index transition was interrupted between the atomic rename and the
+        // closed-index upsert. The WAV is durable on disk, but its index row is still
+        // 'open' (or was never written). Validate it and make it durable.
+        var expectedFormat = existing?.Format;
+        if (expectedFormat is null)
+        {
+            if (!WaveChunkValidator.TryReadHeader(wavPath, out var header, out var readError) || !header.IsValid)
+            {
+                return MarkFinalWavCorrupt(
+                    paths, source, sequence.Value, wavPath, events, atMs,
+                    reason: header.Error ?? readError ?? "header could not be read");
+            }
+
+            expectedFormat = header.Format!;
+        }
+
+        var validation = WaveChunkValidator.ValidateClosedFile(wavPath, expectedFormat);
+        if (!validation.IsValid)
+        {
+            return MarkFinalWavCorrupt(
+                paths, source, sequence.Value, wavPath, events, atMs,
+                reason: validation.Error ?? "the final WAV did not validate");
+        }
+
+        var dataBytes = validation.DataBytes;
+        var durationMs = expectedFormat.FramesToMilliseconds(expectedFormat.BytesToFrames(dataBytes));
+        var startMs = existing?.StartMs ?? 0;
+
+        UpsertChunk(paths, source, sequence.Value, wavPath, expectedFormat, dataBytes, ChunkStates.Recovered, durationMs);
+
+        events.Write(new SessionEvent(SessionEventNames.ChunkRecovered, startMs + durationMs)
+        {
+            Source = source.ToWireName(),
+            Chunk = fileName,
+            StartMs = startMs,
+            EndMs = startMs + durationMs,
+            Detail = "the final WAV was on disk but its index row was not durable; it was reconciled on recovery.",
+        });
+
+        return new RecoveredChunk(
+            sequence.Value,
+            source.ToWireName(),
+            paths.RelativeChunkPath(source, sequence.Value),
+            ChunkStates.Recovered,
+            dataBytes,
+            null);
+    }
+
+    private RecoveredChunk MarkFinalWavCorrupt(
+        SessionPaths paths,
+        AudioSource source,
+        int sequence,
+        string wavPath,
+        ISessionEventSink events,
+        long atMs,
+        string reason)
+    {
+        var dataBytes = Math.Max(0L, new FileInfo(wavPath).Length - WavHeader.Size);
+
+        events.Write(new SessionEvent(SessionEventNames.ChunkCorrupt, atMs)
+        {
+            Source = source.ToWireName(),
+            Chunk = Path.GetFileName(wavPath),
+            Detail = "the final WAV could not be reconciled: " + reason,
+        });
+
+        MarkCorrupt(paths, source, sequence, wavPath, dataBytes);
+
+        return new RecoveredChunk(
+            sequence,
+            source.ToWireName(),
+            wavPath,
+            ChunkStates.Corrupt,
+            dataBytes,
+            reason);
+    }
+
+    private static IEnumerable<string> EnumerateFinalWavFiles(SessionPaths paths)
+    {
+        var audioRoot = Path.Combine(paths.SessionDirectory, SessionPaths.AudioFolderName);
+        if (!Directory.Exists(audioRoot))
+        {
+            return Array.Empty<string>();
+        }
+
+        return Directory.EnumerateFiles(audioRoot, "*" + SessionPaths.WaveExtension, SearchOption.AllDirectories)
+            .Where(p => !p.EndsWith(SessionPaths.PartSuffix, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(p => p, StringComparer.Ordinal)
+            .ToList();
     }
 
     private static void RepairHeader(string partPath, long dataBytes)

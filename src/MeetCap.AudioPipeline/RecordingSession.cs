@@ -181,6 +181,12 @@ public sealed class RecordingSession
 
             await RunCaptureLoopAsync(source).ConfigureAwait(false);
 
+            // Capture has ended. Transition to the documented FINALIZING checkpoint
+            // (docs/ARCHITECTURE.md section 20) before draining the queue and closing
+            // the final chunk, so a crash during that window leaves a session that
+            // startup recovery treats as not-cleanly-stopped instead of RECORDING.
+            BeginFinalizing();
+
             _channel.Writer.TryComplete();
             await consumer.ConfigureAwait(false);
 
@@ -223,6 +229,41 @@ public sealed class RecordingSession
         {
             Source = Track.ToWireName(),
             Detail = $"device='{_device.DisplayName}' format='{format}'",
+        });
+    }
+
+    /// <summary>
+    /// Writes the documented FINALIZING checkpoint (docs/ARCHITECTURE.md section 20):
+    /// capture has ended and the recording artifacts are about to be drained and closed.
+    /// A crash in that window leaves the session in FINALIZING, which startup recovery
+    /// treats as not-cleanly-stopped (docs/RELIABILITY.md section 6), so the already-
+    /// renamed final WAVs are reconciled rather than left unindexed.
+    /// </summary>
+    private void BeginFinalizing()
+    {
+        if (!_captureStarted)
+        {
+            // A session whose capture never started has no artifacts to finalize; it is
+            // marked interrupted directly by Complete().
+            return;
+        }
+
+        var atMs = CurrentTimelineMs();
+
+        _manifest.Status = SessionStatus.Finalizing;
+        SessionManifestStore.Save(_paths.ManifestPath, _manifest);
+
+        _database.Sessions.UpdateLifecycle(
+            _paths.SessionId,
+            SessionStatus.Finalizing,
+            _clock.UtcNow,
+            stoppedAt: null,
+            durationMs: atMs);
+
+        _events.Write(new SessionEvent(SessionEventNames.SessionStopping, atMs)
+        {
+            Source = Track.ToWireName(),
+            Detail = "capture ended; closing recording artifacts before the session completes.",
         });
     }
 
