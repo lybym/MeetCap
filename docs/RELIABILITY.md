@@ -174,11 +174,14 @@ Implemented, and covered by the automated suite that runs in CI (`.github/workfl
   `tests/MeetCap.Cli.Tests/CaptureCommandTests.cs`.
 - **One gap, one record (section 7).** A gap has two observers — the live timeline and the
   recovery audit — so `capture.gap` carries the hole's own interval (`gap_start_ms` /
-  `gap_end_ms`) and recovery recognises its own finding against the recording's by interval
-  overlap rather than by a single position. Recovering an already-reported hole therefore does
-  not report it a second time, and a *different* hole that merely shares a boundary position is
-  still reported. `session.repair.incomplete` is likewise written once per verdict rather than
-  once per pass. Covered by
+  `gap_end_ms`) and recovery recognises its own finding against the recording's by a bounded
+  coverage test rather than by a single position: a recorded gap accounts for an audit gap only
+  when it covers that span to within 50 ms. Recovering an already-reported hole therefore does not
+  report it a second time, a hole the recording's shorter gap merely overlaps is still reported,
+  and a *different* hole that shares only a boundary position is not merged into it. Both weaker
+  rules fail: a position key duplicates one hole, an unbounded intersection hides the uncovered
+  part of the loss from the event log. `session.repair.incomplete` is likewise written once per
+  verdict rather than once per pass. Covered by
   `tests/MeetCap.AudioPipeline.Tests/SessionRecoveryScannerTests.cs`,
   `tests/MeetCap.AudioPipeline.Tests/RecordingSessionTests.cs` and
   `tests/MeetCap.Core.Tests/Capture/CaptureTimelineTests.cs`.

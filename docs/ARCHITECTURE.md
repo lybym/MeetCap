@@ -582,10 +582,14 @@ Recovery is honest about what it could not fix. `SessionRecoveryScanner` audits 
 after repairing it, and then:
 
 - writes an explicit `capture.gap` event for every gap the live recording never saw, naming the
-  hole's own interval and recognising a hole the recording already reported by interval overlap.
-  A repeated scan therefore never appends the same gap twice, and a different hole that merely
-  shares a boundary position is still reported — matching on a position alone would hide real
-  lost audio, which is worse than the duplicate it would prevent;
+  hole's own interval and recognising a hole the recording already reported by a **bounded
+  coverage** test: a recorded gap accounts for an audit gap only when it covers the audit's span,
+  boundary for boundary, to within 50 ms of quantisation tolerance
+  (`SessionRecoveryScanner.GapMatchToleranceMs`, `docs/DATA_MODEL.md` section 4.1). A repeated
+  scan therefore never appends the same gap twice, a hole a *shorter* live gap merely overlaps is
+  still reported, and a hole that shares only a boundary position is not merged into it. Both
+  weaker rules are wrong in opposite directions: a single-position key duplicates one hole, and an
+  unbounded intersection hides part of the loss from the event log;
 - marks the session degraded when its audit is incomplete or the manifest's `capture_health`
   is degraded, and records `gaps_remain` / `gap_details` on the manifest;
 - writes `session.repair.incomplete` (`reason = gap_detected`, or `audit_failed` when the chunk

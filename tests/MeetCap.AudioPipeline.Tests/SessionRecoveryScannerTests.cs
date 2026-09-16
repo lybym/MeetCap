@@ -870,13 +870,116 @@ public class SessionRecoveryScannerTests
         // already-recorded hole a second time would describe one hole as two.
         Assert.Equal(2, gaps.Count);
 
-        var newlyReported = Assert.Single(gaps, e => e.TryGetProperty("reason", out _));
-        Assert.Equal(35_000, newlyReported.GetProperty("gap_start_ms").GetInt64());
+        // Select the audit's own event by the interval it reports, not by the presence of a
+        // field the live writer happens not to set: identity here is the hole, and a test that
+        // keyed on the current wire shape would break for a reason unrelated to de-duplication.
+        var newlyReported = Assert.Single(gaps, e => e.GetProperty("gap_start_ms").GetInt64() == 35_000);
         Assert.Equal(40_000, newlyReported.GetProperty("gap_end_ms").GetInt64());
     }
 
     [Fact]
-    public void Scan_StillReportsAHoleThatAConcurrentLiveGapDoesNotCover()
+    public void Scan_ReportsThePartOfAHoleAConcurrentLiveGapDoesNotCover()
+    {
+        using var workspace = new TempWorkspace(sessionStatus: SessionStatus.Recording);
+        var paths = workspace.Paths;
+
+        // Durable audio 0..10 s, a stretch with no readable audio, durable audio from 15 s.
+        WriteChunk(paths, sequence: 1, dataBytes: 10 * SecondBytes, close: true);
+        IndexChunk(paths, workspace.Database, sequence: 1, startMs: 0, endMs: 10_000, ChunkStates.Closed);
+        WriteChunk(paths, sequence: 2, dataBytes: 20 * SecondBytes, close: true);
+        IndexChunk(paths, workspace.Database, sequence: 2, startMs: 15_000, endMs: 35_000, ChunkStates.Closed);
+
+        // The live recorder reported a hole that starts where this one does but reaches past its
+        // end. The audit's span is what the chunk index can prove, so the recording's longer
+        // wall-clock measurement does not explain it away: the hole the audit found is still
+        // real, and the recording's event stands beside it.
+        File.AppendAllText(
+            paths.EventsPath,
+            "{\"event\":\"capture.gap\",\"at_ms\":17000,\"source\":\"mic\"," +
+            "\"gap_start_ms\":10000,\"gap_end_ms\":17000,\"gap_ms\":7000," +
+            "\"detail\":\"the device skipped audio between buffers.\"}\n");
+
+        WriteManifest(paths, SessionStatus.Recording);
+
+        var report = new SessionRecoveryScanner(workspace.Database, new FakeClock()).Scan(workspace.DataRoot);
+
+        Assert.Single(report.Sessions);
+        Assert.Equal(2, CountEvents(ReadEvents(paths), SessionEventNames.CaptureGap));
+    }
+
+    [Fact]
+    public void Scan_ReportsTheUncoveredPartOfAHoleANarrowerLiveGapOverlaps()
+    {
+        using var workspace = new TempWorkspace(sessionStatus: SessionStatus.Recording);
+        var paths = workspace.Paths;
+
+        // A 2 s stretch at 2..4 s holds an unreadable chunk, while the live recording only
+        // observed a 500 ms device skip at its start. Suppressing the audit's gap because the two
+        // intervals intersect would drop the only durable record of the other 1.5 s of lost audio
+        // and leave the event log contradicting the session's own gaps_remain.
+        IndexChunk(paths, workspace.Database, sequence: 1, startMs: 0, endMs: 2_000, ChunkStates.Closed);
+        IndexChunk(paths, workspace.Database, sequence: 2, startMs: 2_000, endMs: 4_000, ChunkStates.Corrupt);
+        IndexChunk(paths, workspace.Database, sequence: 3, startMs: 4_000, endMs: 8_000, ChunkStates.Closed);
+
+        File.AppendAllText(
+            paths.EventsPath,
+            "{\"event\":\"capture.gap\",\"at_ms\":2500,\"source\":\"mic\"," +
+            "\"gap_start_ms\":2000,\"gap_end_ms\":2500,\"gap_ms\":500," +
+            "\"detail\":\"the device skipped audio between buffers.\"}\n");
+
+        WriteManifest(paths, SessionStatus.Recording);
+
+        var report = new SessionRecoveryScanner(workspace.Database, new FakeClock()).Scan(workspace.DataRoot);
+        var session = Assert.Single(report.Sessions);
+
+        Assert.Equal(2_000, Assert.Single(session.Audit.Gaps).GapMs);
+
+        var gaps = ReadEvents(paths).Where(e => Name(e) == SessionEventNames.CaptureGap).ToList();
+        Assert.Equal(2, gaps.Count);
+
+        // The audit's reason survives in the log. Losing it is how the loss disappears from the
+        // only event a downstream reader sees.
+        var auditGap = Assert.Single(gaps, e => e.GetProperty("gap_start_ms").GetInt64() == 2_000
+                                                && e.GetProperty("gap_end_ms").GetInt64() == 4_000);
+        Assert.Equal(AudioGapReasons.ChunkUnreadable, auditGap.GetProperty("reason").GetString());
+        Assert.Equal(2_000, auditGap.GetProperty("gap_ms").GetInt64());
+
+        SessionManifestStore.TryLoad(paths.ManifestPath, out var manifest, out _);
+        Assert.True(manifest!.GapsRemain);
+    }
+
+    [Fact]
+    public void Scan_StillSuppressesAHoleALiveGapCoversMoreWidely()
+    {
+        using var workspace = new TempWorkspace(sessionStatus: SessionStatus.Recording);
+        var paths = workspace.Paths;
+
+        // The other direction: the recording's outage covers the span the audit can prove, within
+        // the quantisation tolerance, so the hole is already reported and must not be reported
+        // again. (A live interval that exceeds the audit's by far more than the tolerance is a
+        // different measurement, not the same hole — see
+        // Scan_ReportsThePartOfAHoleAConcurrentLiveGapDoesNotCover.)
+        WriteChunk(paths, sequence: 1, dataBytes: 10 * SecondBytes, close: true);
+        IndexChunk(paths, workspace.Database, sequence: 1, startMs: 0, endMs: 10_000, ChunkStates.Closed);
+        WriteChunk(paths, sequence: 2, dataBytes: 20 * SecondBytes, close: true);
+        IndexChunk(paths, workspace.Database, sequence: 2, startMs: 15_000, endMs: 35_000, ChunkStates.Closed);
+
+        File.AppendAllText(
+            paths.EventsPath,
+            "{\"event\":\"capture.gap\",\"at_ms\":15010,\"source\":\"mic\"," +
+            "\"gap_start_ms\":9990,\"gap_end_ms\":15010,\"gap_ms\":5020," +
+            "\"detail\":\"the device skipped audio between buffers.\"}\n");
+
+        WriteManifest(paths, SessionStatus.Recording);
+
+        var report = new SessionRecoveryScanner(workspace.Database, new FakeClock()).Scan(workspace.DataRoot);
+
+        Assert.Single(report.Sessions);
+        Assert.Equal(1, CountEvents(ReadEvents(paths), SessionEventNames.CaptureGap));
+    }
+
+    [Fact]
+    public void Scan_StillSuppressesAHoleWhoseBoundariesDifferOnlyByQuantisation()
     {
         using var workspace = new TempWorkspace(sessionStatus: SessionStatus.Recording);
         var paths = workspace.Paths;
@@ -886,15 +989,12 @@ public class SessionRecoveryScannerTests
         WriteChunk(paths, sequence: 2, dataBytes: 20 * SecondBytes, close: true);
         IndexChunk(paths, workspace.Database, sequence: 2, startMs: 15_000, endMs: 35_000, ChunkStates.Closed);
 
-        // The live recorder reported a hole that starts where this one does but reaches past
-        // its end: the wall-clock outage it measured lasted longer than the span the chunk
-        // index shows, because another skip happened inside it. Suppressing the audit's gap on
-        // a matching start position alone would hide real lost audio, which is worse than the
-        // duplicate this de-duplication exists to prevent.
+        // Both boundaries off by a few milliseconds: a wall-clock outage measurement against a
+        // chunk-boundary derivation of the same hole. The tolerance exists for exactly this.
         File.AppendAllText(
             paths.EventsPath,
-            "{\"event\":\"capture.gap\",\"at_ms\":17000,\"source\":\"mic\"," +
-            "\"gap_start_ms\":10000,\"gap_end_ms\":17000,\"gap_ms\":7000," +
+            "{\"event\":\"capture.gap\",\"at_ms\":15004,\"source\":\"mic\"," +
+            "\"gap_start_ms\":9996,\"gap_end_ms\":15004,\"gap_ms\":5008," +
             "\"detail\":\"the device skipped audio between buffers.\"}\n");
 
         WriteManifest(paths, SessionStatus.Recording);
@@ -949,8 +1049,69 @@ public class SessionRecoveryScannerTests
     }
 
     [Fact]
-    public void Scan_LeavesTheLiveGapMeasurementAloneAndRecordsItsOwnFindingsSeparately()
+    public async Task Scan_CrossChecksTheLiveGapAgainstTheAuditOfARealRecording()
     {
+        // The invariant the de-duplication rests on, checked against a real recording rather than
+        // a hand-written index: the live event and the audit must name the same hole with the same
+        // interval, or recovery cannot recognise the hole it already reported.
+        using var harness = new SessionHarness(chunkSeconds: 1, bufferSeconds: 30);
+        var source = new FakeCaptureSource(Format, harness.Device);
+        harness.Sources.Enqueue(source);
+
+        var session = harness.Service.PrepareSession("Cross check");
+        var paths = new SessionPaths(harness.DataRoot, session.SessionId);
+
+        using var cancellation = new CancellationTokenSource();
+        var run = session.RunAsync(cancellation.Token);
+        Assert.True(await Wait.UntilAsync(() => source.StartCount == 1));
+
+        // 1 s of audio, then a device-position skip that resumes at 5 s, then 20 s more. The chunk
+        // that is open when the skip happens is closed at the boundary, so the hole spans two
+        // chunks and the audit can see it.
+        TestAudio.EmitSeconds(source, Format, 0, milliseconds: 1_000);
+        long frame = 5 * Format.SampleRate;
+        for (var elapsed = 0; elapsed < 20_000; elapsed += 1_000)
+        {
+            source.Emit(TestAudio.Packet(Format, frame, TestAudio.Frames(Format, 1_000)));
+            frame += TestAudio.Frames(Format, 1_000);
+        }
+
+        cancellation.Cancel();
+        await Wait.ForAsync(run, timeoutMs: 60_000, "the cross-check recording");
+
+        var liveGap = Assert.Single(ReadEvents(paths), e => Name(e) == SessionEventNames.CaptureGap);
+        var liveStart = liveGap.GetProperty("gap_start_ms").GetInt64();
+        var liveEnd = liveGap.GetProperty("gap_end_ms").GetInt64();
+
+        // A stray .part, so the session is scanned and audited the way `meetcap status` audits a
+        // session a killed process left behind.
+        var stray = new WaveChunkWriter(
+            paths.ChunkPartPath(AudioSource.Mic, 22),
+            paths.ChunkFinalPath(AudioSource.Mic, 22),
+            Format,
+            capacityBytes: 60L * SecondBytes,
+            22);
+        stray.Append(new byte[SecondBytes]);
+        stray.Dispose();
+
+        // Another process scans, the way `meetcap status` does.
+        var otherProcess = new MeetCapDatabase(Path.Combine(harness.DataRoot, "meetcap.db"));
+        var report = new SessionRecoveryScanner(otherProcess, harness.Clock)
+            .Scan(harness.DataRoot, session.SessionId);
+        var recovered = Assert.Single(report.Sessions);
+
+        var auditGap = Assert.Single(recovered.Audit.Gaps);
+        Assert.Equal(liveStart, auditGap.StartMs);
+        Assert.Equal(liveEnd, auditGap.EndMs);
+        Assert.Equal(liveEnd, liveGap.GetProperty("at_ms").GetInt64());
+
+        // Because both producers agree, the audit has nothing new to say: the live event already
+        // reports the hole, so recovery must not append it a second time.
+        Assert.Equal(1, CountEvents(ReadEvents(paths), SessionEventNames.CaptureGap));
+    }
+
+    [Fact]
+    public void Scan_LeavesTheLiveGapMeasurementAloneAndRecordsItsOwnFindingsSeparately()    {
         using var workspace = new TempWorkspace(sessionStatus: SessionStatus.Completed);
         var paths = workspace.Paths;
 

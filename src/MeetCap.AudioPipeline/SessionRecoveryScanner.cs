@@ -518,14 +518,37 @@ public sealed class SessionRecoveryScanner
     }
 
     /// <summary>
-    /// Whether two gap events describe the same hole.
+    /// How far a recorded gap's boundary may sit from the audit's and still be the same hole,
+    /// in milliseconds.
     /// </summary>
     /// <remarks>
-    /// The test is interval overlap, not position equality. Quantisation alone can move a
-    /// boundary — a device outage is measured by wall clock while the audit derives the same
-    /// span from chunk boundaries, so the two records of one hole can be a few milliseconds
-    /// apart — and two adjacent holes share the boundary position without being the same
-    /// hole. Overlap is true in the first case and false in the second.
+    /// A measured device outage is derived from wall-clock downtime while the audit derives the
+    /// same span from chunk boundaries, so two records of one hole can differ by a few
+    /// milliseconds of quantisation. The bound is deliberately small: it absorbs that, and it
+    /// cannot let a short device skip stand in for a stretch of genuinely lost audio.
+    /// </remarks>
+    private const long GapMatchToleranceMs = 50;
+
+    /// <summary>
+    /// Whether a gap the session already recorded accounts for a gap the audit found.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The test is bounded coverage, not overlap. A recorded gap counts only when it
+    /// <em>covers</em> the audit's span to within <see cref="GapMatchToleranceMs"/>; any part the
+    /// recording did not account for is still lost audio and must be reported. Treating any
+    /// intersection as a match would let a 100 ms device skip suppress a multi-second stretch that
+    /// the chunk index shows holds no readable bytes, leaving the event log under-reporting the
+    /// loss and contradicting the session's own <c>gaps_remain</c>.
+    /// </para>
+    /// <para>
+    /// The reason is deliberately not part of identity. Artifact-level loss
+    /// (<c>chunk_unreadable</c>, <c>chunk_missing</c>) cannot coincide with a live device-skip
+    /// event, because the audit's span is at least one chunk while a device skip is bounded by the
+    /// gap in device positions the recording actually observed — the coverage bound already
+    /// excludes it. Adding a reason rule on top would be a branch that cannot be reached and
+    /// therefore cannot be tested, which is its own defect.
+    /// </para>
     /// </remarks>
     private static bool IsSameGap(RecordedGap recorded, AudioGap gap)
     {
@@ -536,19 +559,20 @@ public sealed class SessionRecoveryScanner
 
         if (recorded.StartMs is { } recordedStart && recorded.EndMs is { } recordedEnd)
         {
-            // Both events carry the gap's own interval.
-            return Overlaps(recordedStart, recordedEnd, gap.StartMs, gap.EndMs);
+            return WithinTolerance(recordedStart, gap.StartMs)
+                   && WithinTolerance(recordedEnd, gap.EndMs);
         }
 
-        // An event written before the interval fields existed, or a live event that only
-        // knows where audio resumed: the recorded resume position is inside the hole the
-        // audit derived, or exactly at its end when the hole is zero-length.
-        return recorded.ResumeMs >= gap.StartMs && recorded.ResumeMs <= gap.EndMs;
+        // An event written before the interval fields existed. Its resume position is where the
+        // hole it reported ended, so it can only account for the audit's hole when that hole ends
+        // where the recording resumed: a hole the audit extends past the resume position is more
+        // loss than the recording knew about, and a hole that starts after it is a different one.
+        return WithinTolerance(recorded.ResumeMs, gap.EndMs)
+               && recorded.ResumeMs + GapMatchToleranceMs >= gap.StartMs;
     }
 
-    private static bool Overlaps(long leftStart, long leftEnd, long rightStart, long rightEnd)
-        => (leftStart < rightEnd && rightStart < leftEnd)
-           || (leftStart == rightStart && leftEnd == rightEnd);
+    private static bool WithinTolerance(long value, long target)
+        => Math.Abs(value - target) <= GapMatchToleranceMs;
 
     /// <summary>
     /// Whether the session's log already states, for this outcome, that recovery could not

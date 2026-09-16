@@ -295,11 +295,27 @@ writer is the resume position.
 
 Those are deliberately not the same coordinate. The live writer's `start_ms`, when it sets it
 at all, is the position of the *buffer* it is writing (where audio resumes), while the audit's
-span runs from the end of the last durable chunk to the start of the next one. Recovering a
-session must be able to tell that its own gap and the live recording's gap are one hole rather
-than two, so it compares intervals, not a single position. Matching on a position alone both
-duplicates one hole and can collide two different ones — the second failure hides real lost
-audio, which is worse than the first.
+span runs from the end of the last durable chunk to the start of the next one.
+
+Recovering a session must be able to tell that its own gap and the live recording's gap are one
+hole rather than two, so recovery compares the two intervals under a **bounded** rule: a recorded
+gap accounts for an audit gap only when it **covers** the audit's span, boundary for boundary,
+within a small quantisation tolerance (50 ms, `SessionRecoveryScanner.GapMatchToleranceMs`). A
+device-position skip is bounded by the gap in device positions the recording actually observed, so
+it cannot cover a stretch the chunk index shows holds no readable bytes — which is why an
+unreadable or missing chunk is always reported even when an unrelated live gap starts inside it.
+
+Two weaker rules were tried and rejected, and the reasons are worth keeping:
+
+- matching on a single position (`(start_ms, source)`, or the recorded resume position) misses the
+  hole when the two producers place it differently, so one hole is reported twice;
+- matching on any intersection suppresses an audit gap that a *shorter* live gap merely overlaps.
+  That drops the only durable record of the rest of the loss from the event log and leaves the log
+  contradicting the session's own `gaps_remain`, which is worse than the duplicate it prevents.
+
+Boundary equality within the tolerance also covers the case where both producers agree exactly,
+which is what a real recording produces: the audit's boundaries come from the same chunk
+`start_ms` / `end_ms` values the live timeline wrote.
 
 A degraded condition always produces at least one of these events; nothing about lost
 audio is inferred from a missing chunk.
