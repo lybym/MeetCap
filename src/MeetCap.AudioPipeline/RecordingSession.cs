@@ -750,17 +750,26 @@ public sealed class RecordingSession : IDisposable
 
     private void CloseActiveChunk()
     {
+        // Closing the chunk is recording work; announcing it is not. They are deliberately
+        // separate so a failure of the second can never be classified as a failure of the first:
+        // docs/ARCHITECTURE.md section 9.3 promises that a subscriber cannot fail the recording,
+        // and RegisterStorageFailure would end the session as INTERRUPTED if a subscriber's
+        // exception reached it (docs/RELIABILITY.md section 2).
         try
         {
             // The spool counts every chunk it closes, including the ones it rotates
             // internally at a chunk boundary.
             _spool!.CloseCurrentChunk();
-            AnnounceClosedChunk();
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             RegisterStorageFailure(ex);
+            return;
         }
+
+        // AnnounceClosedChunk contains its own failures; it is called outside the block above so
+        // that containment does not depend on the order of two statements in one try.
+        AnnounceClosedChunk();
     }
 
     /// <summary>

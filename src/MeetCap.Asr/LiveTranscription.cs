@@ -65,7 +65,8 @@ public sealed class LiveTranscription
     private readonly LiveTranscriptionOptions _options;
 
     private int _queuedBatches;
-    private int _transientFailures;
+    private int _providerFailures;
+    private int _localFailures;
     private volatile bool _stopRequested;
 
     /// <summary>Serializes queue drains so the background loop and the stop-time drain cannot race.</summary>
@@ -88,14 +89,43 @@ public sealed class LiveTranscription
     /// <summary>Batches queued as persistent jobs so far.</summary>
     public int QueuedBatches => _queuedBatches;
 
-    /// <summary>Drain failures that were not provider failures (each of which is durable).</summary>
-    public int TransientFailures => _transientFailures;
+    /// <summary>
+    /// Drains that ended because the provider refused or could not be reached. The job keeps its
+    /// durable state, so this counts observations, not lost work.
+    /// </summary>
+    public int ProviderFailures => _providerFailures;
+
+    /// <summary>
+    /// Drains that ended because of a local failure (the filesystem or the job store), as opposed
+    /// to anything the network did.
+    /// </summary>
+    /// <remarks>
+    /// Kept apart from <see cref="ProviderFailures"/> deliberately: "the provider is unreachable"
+    /// and "this machine cannot read or write something" are different operator problems, and
+    /// collapsing them into one "drain failure" count made the stop summary unactionable
+    /// (<c>docs/RELIABILITY.md</c> section 2 separates the failure domains for the same reason).
+    /// </remarks>
+    public int LocalFailures => _localFailures;
+
+    /// <summary>
+    /// Session-relative milliseconds of captured audio that could not be read into any batch, so
+    /// it never reached the provider.
+    /// </summary>
+    /// <remarks>
+    /// A transcript gap, not lost audio: the capture chunk stays on disk, and the builder records
+    /// one explicit <c>asr.batch.failed</c> per failed window.
+    /// </remarks>
+    public long DroppedAudioMs => _batches.DroppedAudioMs;
 
     /// <summary>Takes one closed chunk into its batch window and queues the job when it closes.</summary>
     public void OnChunkClosed(ClosedAudioChunk chunk)
     {
         ArgumentNullException.ThrowIfNull(chunk);
 
+        // The builder records and contains its own batch-materialization failures, so an
+        // unreadable chunk produces no batch rather than an exception that would travel out of
+        // the recording's chunk-close path. What can still reach here is a provider-agnostic
+        // write failure (the job row), which the builder reports as a failed window.
         if (_batches.OnChunkClosed(chunk) is not null)
         {
             _queuedBatches++;
@@ -183,8 +213,14 @@ public sealed class LiveTranscription
             drain.Failures,
             drain.AwaitingRetry,
             drain.StillRunning,
-            _transientFailures,
-            Remaining(sessionId));
+            _providerFailures + _localFailures,
+            Remaining(sessionId))
+        {
+            ProviderFailures = _providerFailures,
+            LocalFailures = _localFailures,
+            DroppedAudioMs = _batches.DroppedAudioMs,
+            UnreadableChunks = _batches.UnreadableChunks,
+        };
     }
 
     /// <summary>Jobs of this session that still need work.</summary>
@@ -252,21 +288,23 @@ public sealed class LiveTranscription
                 // A provider transport failure is the expected offline case: the durable job
                 // state already records it and `next_retry_at` schedules the next attempt, so
                 // nothing has to be invented here and capture is unaffected.
-                _transientFailures++;
+                _providerFailures++;
                 break;
             }
             catch (AsrPermanentException)
             {
                 // The job itself records a permanent provider failure. The drain survives so the
                 // remaining jobs still get their turn.
-                _transientFailures++;
+                _providerFailures++;
                 break;
             }
             catch (Exception ex) when (ex is IOException or InvalidOperationException or UnauthorizedAccessException)
             {
                 // A background drain must not take the recorder down with it. The jobs keep their
-                // durable state, so the next drain — or `meetcap asr resume` — continues.
-                _transientFailures++;
+                // durable state, so the next drain — or `meetcap asr resume` — continues. This is
+                // a local failure, not a provider one, and it is counted separately so the stop
+                // summary says which domain actually failed (docs/RELIABILITY.md section 2).
+                _localFailures++;
                 break;
             }
 
@@ -354,6 +392,24 @@ public sealed record LiveTranscriptionSummary(
     int DrainFailures,
     int JobsRemaining)
 {
+    /// <summary>
+    /// Drains that ended because the provider refused or could not be reached, as opposed to a
+    /// local failure. Reported apart so the summary says which domain failed.
+    /// </summary>
+    public int ProviderFailures { get; init; }
+
+    /// <summary>Drains that ended because of a local filesystem or job-store failure.</summary>
+    public int LocalFailures { get; init; }
+
+    /// <summary>
+    /// Session-relative milliseconds of captured audio that could not be read into any batch, so
+    /// it never reached the provider. A transcript gap whose audio is still on disk.
+    /// </summary>
+    public long DroppedAudioMs { get; init; }
+
+    /// <summary>Capture chunks that could not be batched because they were unreadable.</summary>
+    public int UnreadableChunks { get; init; }
+
     /// <summary>True when this session's transcription has no outstanding or failed work.</summary>
     public bool IsComplete => JobsRemaining == 0 && FailedJobs == 0;
 
@@ -372,9 +428,21 @@ public sealed record LiveTranscriptionSummary(
             text += $", {FailedJobs} failed";
         }
 
-        if (DrainFailures > 0)
+        if (UnreadableChunks > 0)
         {
-            text += $", {DrainFailures} drain failure(s)";
+            // Named separately from a provider failure: this audio is on disk and simply could
+            // not be read into a batch, so no amount of retrying or network will transcribe it.
+            text += $", {UnreadableChunks} unreadable chunk(s) ({DroppedAudioMs} ms never transcribed, audio intact)";
+        }
+
+        if (ProviderFailures > 0)
+        {
+            text += $", {ProviderFailures} provider failure(s)";
+        }
+
+        if (LocalFailures > 0)
+        {
+            text += $", {LocalFailures} local failure(s)";
         }
 
         return text;

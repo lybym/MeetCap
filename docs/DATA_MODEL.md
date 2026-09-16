@@ -274,6 +274,12 @@ M4 adds the ASR batch vocabulary:
 ```text
 asr.batch.closed           a batch window was materialized into a durable WAV plus its
                            timeline manifest, immediately before its job is queued
+asr.batch.failed           a batch window could not be built, so its audio never
+                           reached the provider. `reason` is `chunk_unreadable` when one
+                           capture chunk could not be read (that chunk is dropped from
+                           the window and the rest is retried) or `batch_write_failed`
+                           when the window itself could not be written (nothing is
+                           dropped; the window stays pending and is retried)
 asr.batch.discarded        recovery discarded an unfinished batch .part; the capture
                            chunks it would have held are still durable
 ```
@@ -281,6 +287,11 @@ asr.batch.discarded        recovery discarded an unfinished batch .part; the cap
 `asr.batch.closed` is written before `asr.job.queued` because the durable batch artifact is what
 the job names (`docs/ARCHITECTURE.md` section 10.1). Both are written only when a job is actually
 created, so a recovery pass that finds an already-queued batch does not restate them.
+
+`asr.batch.failed` is the record that a stretch of the session timeline has no transcript. It
+never means the audio is gone: the capture chunk it names is still under `audio/`, and the event
+says so. It exists because the alternative — a window that quietly produces no batch — is a
+silence in the transcript that nothing explains.
 
 `session.repair.incomplete` is written by startup recovery and by `meetcap session repair`
 when the session's timeline still holds a provable gap after every repair that could be

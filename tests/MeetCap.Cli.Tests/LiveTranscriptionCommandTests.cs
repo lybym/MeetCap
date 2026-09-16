@@ -1,3 +1,6 @@
+using MeetCap.AudioPipeline;
+using MeetCap.AudioPipeline.Wave;
+using MeetCap.Core.Capture;
 using MeetCap.Core.Sessions;
 using MeetCap.Persistence.Storage;
 using Xunit;
@@ -239,6 +242,156 @@ public class LiveTranscriptionCommandTests
         Assert.Equal(
             normalizedArtifacts.Sum(path => File.ReadAllLines(path).Length),
             File.ReadAllLines(rawTranscript).Length);
+    }
+
+    [Fact]
+    public void AsrResume_RecoversABatchThatWasFinalizedBeforeItsJobRowExisted()
+    {
+        // The crash window `AsrBatchBuilder` exists to close: the batch WAV and its manifest are
+        // durable, and the process died before the `asr_jobs` row was written. Before this was
+        // wired into the documented restart entry point, only `meetcap start` could see that
+        // batch, so `meetcap asr resume` answered "No ASR jobs need work" while the audio sat
+        // orphaned (docs/ARCHITECTURE.md sections 10.1 and 12).
+        using var harness = CliHarness.Create();
+        harness.WriteLiveAsrConfig(chunkSeconds: 1, fileBatchSeconds: 2);
+
+        var sessionId = SeedSessionWithAnOrphanedBatch(harness, "Orphaned Batch");
+        var database = new MeetCapDatabase(Path.Combine(harness.DataRoot, "meetcap.db"));
+
+        Assert.Empty(database.AsrJobs.ListBySession(sessionId));
+
+        var resume = harness.Run("asr", "resume");
+
+        Assert.Equal(0, resume.ExitCode);
+
+        var job = Assert.Single(database.AsrJobs.ListBySession(sessionId));
+        Assert.Equal("asr/batches/mic/batch-000001.wav", job.InputArtifact);
+        Assert.Equal(0, job.StartMs);
+        Assert.Equal(4_000, job.EndMs);
+        Assert.Equal(Core.Asr.AsrJobStatus.Succeeded, job.Status);
+
+        // The batch was submitted and transcribed, so the orphan produced a transcript rather
+        // than a silent hole.
+        Assert.True(harness.AsrHttp.Submits > 0, "the recovered batch was never submitted");
+        Assert.Equal(
+            harness.AsrHttp.RecognizedText,
+            Assert.Single(File.ReadAllLines(
+                Path.Combine(harness.DataRoot, "sessions", sessionId, "transcript", "raw.jsonl"))
+                .Select(line => System.Text.Json.JsonDocument.Parse(line).RootElement.GetProperty("raw_text").GetString())));
+    }
+
+    [Fact]
+    public void Status_ReportsABatchThatHasNoJobRow()
+    {
+        // The orphan has to be visible without running resume: a clean-looking queue is exactly
+        // how a batch finalized before its job row existed goes unnoticed.
+        using var harness = CliHarness.Create();
+        harness.WriteLiveAsrConfig(chunkSeconds: 1, fileBatchSeconds: 2);
+
+        var sessionId = SeedSessionWithAnOrphanedBatch(harness, "Orphaned Batch");
+
+        var status = harness.Run("status");
+
+        // `status` describes state and keeps exiting 0 (docs/ARCHITECTURE.md section 9.2).
+        Assert.Equal(0, status.ExitCode);
+        Assert.Contains("asr orphaned:", status.Output, StringComparison.Ordinal);
+        Assert.Contains(sessionId, status.Output, StringComparison.Ordinal);
+        Assert.Contains("asr/batches/mic/batch-000001.wav", status.Output, StringComparison.Ordinal);
+        Assert.Contains("meetcap asr resume", status.Output, StringComparison.Ordinal);
+
+        // After the recovery the orphan is gone from the report, because it is now a job.
+        harness.Run("asr", "resume");
+        var after = harness.Run("status");
+        Assert.Equal(0, after.ExitCode);
+        Assert.DoesNotContain("asr orphaned:", after.Output, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AsrResume_ReportsNoWorkWhenThereIsNoOrphanedBatch()
+    {
+        // The repeat-run / empty-state half: a `resume` against a data root with nothing to do
+        // stays a clean no-op instead of inventing work or failing.
+        using var harness = CliHarness.Create();
+        harness.WriteLiveAsrConfig(chunkSeconds: 1, fileBatchSeconds: 2);
+
+        var first = harness.Run("asr", "resume");
+        Assert.Equal(0, first.ExitCode);
+        Assert.Contains("No ASR jobs need work.", first.Output, StringComparison.Ordinal);
+
+        var second = harness.Run("asr", "resume");
+        Assert.Equal(0, second.ExitCode);
+        Assert.Contains("No ASR jobs need work.", second.Output, StringComparison.Ordinal);
+        Assert.False(harness.AsrHttp.Offline);
+        Assert.Equal(0, harness.AsrHttp.Submits);
+    }
+
+    /// <summary>
+    /// Creates the durable state a killed recorder leaves behind: a session with a finalized
+    /// batch WAV and its timeline manifest, and no <c>asr_jobs</c> row for it.
+    /// </summary>
+    private static string SeedSessionWithAnOrphanedBatch(CliHarness harness, string title)
+    {
+        var sessionId = "ses_20260915T140000Z_0a0b0c0d";
+        var database = new MeetCapDatabase(Path.Combine(harness.DataRoot, "meetcap.db"));
+        database.EnsureMigrated();
+        database.Sessions.Insert(new SessionRecord
+        {
+            Id = sessionId,
+            Title = title,
+            Mode = SessionModes.Offline,
+            SourceType = SessionSourceTypes.Live,
+            Status = SessionStatus.Processing,
+            ConfigVersion = 1,
+            Tracks = new[] { AudioSources.Mic },
+            CreatedAt = new DateTimeOffset(2026, 9, 15, 14, 0, 0, TimeSpan.Zero),
+            UpdatedAt = new DateTimeOffset(2026, 9, 15, 14, 0, 0, TimeSpan.Zero),
+        });
+
+        var paths = new SessionPaths(harness.DataRoot, sessionId);
+        paths.CreateDirectories();
+
+        var batchDirectory = Path.Combine(paths.SessionDirectory, "asr", "batches", "mic");
+        Directory.CreateDirectory(batchDirectory);
+
+        var format = new AudioFormat(48_000, 1, 16, AudioSampleFormat.Pcm);
+        var batchPath = Path.Combine(batchDirectory, "batch-000001.wav");
+        var dataBytes = format.FramesToBytes(format.MillisecondsToFrames(4_000));
+        using (var writer = new WaveChunkWriter(
+                   batchPath + ".part",
+                   batchPath,
+                   format,
+                   capacityBytes: dataBytes + format.BlockAlign,
+                   sequence: 1))
+        {
+            writer.Append(new byte[dataBytes]);
+            writer.Close(DateTimeOffset.UtcNow);
+        }
+
+        File.WriteAllText(
+            Path.ChangeExtension(batchPath, ".json"),
+            $$"""
+            {
+              "session_id": "{{sessionId}}",
+              "source": "mic",
+              "batch": 1,
+              "artifact": "asr/batches/mic/batch-000001.wav",
+              "start_ms": 0,
+              "end_ms": 4000,
+              "duration_ms": 4000,
+              "data_bytes": {{dataBytes}},
+              "chunks": [
+                {
+                  "sequence": 1,
+                  "artifact": "audio/mic/000001.wav",
+                  "start_ms": 0,
+                  "end_ms": 4000,
+                  "data_bytes": {{dataBytes}}
+                }
+              ]
+            }
+            """);
+
+        return sessionId;
     }
 
     private static string Describe(CliResult start, CliResult stop) =>

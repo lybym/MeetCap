@@ -57,17 +57,23 @@ public class AsrBatchBuilderTests : IDisposable
             });
 
     /// <summary>Writes a real durable chunk file and describes it the way the recorder does.</summary>
-    private ClosedAudioChunk CreateChunk(int sequence, long startMs, long durationMs, byte fill = 0x7f)
+    private ClosedAudioChunk CreateChunk(
+        int sequence,
+        long startMs,
+        long durationMs,
+        byte fill = 0x7f,
+        AudioFormat? format = null)
     {
+        var effectiveFormat = format ?? s_format;
         var relativePath = Path.Combine("audio", "mic", $"{sequence:D6}.wav").Replace('\\', '/');
         var finalPath = Paths.ResolveRelative(relativePath);
         var partPath = finalPath + ".part";
 
         Directory.CreateDirectory(Path.GetDirectoryName(finalPath)!);
 
-        var dataBytes = s_format.FramesToBytes(s_format.MillisecondsToFrames(durationMs));
-        var capacity = dataBytes + s_format.BlockAlign;
-        using (var writer = new WaveChunkWriter(partPath, finalPath, s_format, capacity, sequence))
+        var dataBytes = effectiveFormat.FramesToBytes(effectiveFormat.MillisecondsToFrames(durationMs));
+        var capacity = dataBytes + effectiveFormat.BlockAlign;
+        using (var writer = new WaveChunkWriter(partPath, finalPath, effectiveFormat, capacity, sequence))
         {
             var buffer = new byte[dataBytes];
             Array.Fill(buffer, fill);
@@ -85,7 +91,7 @@ public class AsrBatchBuilderTests : IDisposable
             StartMs = startMs,
             EndMs = startMs + durationMs,
             DataBytes = dataBytes,
-            Format = s_format,
+            Format = effectiveFormat,
         };
     }
 
@@ -269,6 +275,133 @@ public class AsrBatchBuilderTests : IDisposable
         Assert.Contains(
             _events.Events,
             e => string.Equals(e.Name, SessionEvents.AsrBatchDiscarded, StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void AChunkInADifferentFormatIsRejectedInsteadOfChangingHowTheAudioDecodes()
+    {
+        // The guard in WavBatchConcatenator: concatenating a chunk whose header describes a
+        // different sample rate / channel count / sample format would produce a file that is
+        // internally consistent and plays at the wrong speed, with nothing in the artifact saying
+        // so. It has to fail loudly, and the builder has to contain that failure like any other
+        // unreadable chunk.
+        var builder = CreateBuilder(batchSeconds: 20);
+        builder.AttachEventSink(_events);
+
+        var good = CreateChunk(1, 0, 10_000);
+
+        var otherFormat = new AudioFormat(16_000, 1, 16, AudioSampleFormat.Pcm);
+        var mismatched = CreateChunk(2, 10_000, 10_000, format: otherFormat);
+
+        Assert.Null(builder.OnChunkClosed(good));
+        var salvaged = builder.OnChunkClosed(mismatched);
+
+        // The mismatched chunk is dropped, its window is recorded, and the good chunk is still
+        // submitted: the failure is contained to the chunk that caused it.
+        Assert.NotNull(salvaged);
+        Assert.Equal(good.RelativePath, Assert.Single(salvaged!.Chunks).RelativePath);
+        Assert.Equal(1, builder.UnreadableChunks);
+        Assert.Equal(10_000, builder.DroppedAudioMs);
+
+        var failure = Assert.Single(
+            _events.Events,
+            e => string.Equals(e.Name, SessionEvents.AsrBatchFailed, StringComparison.Ordinal));
+        Assert.Equal("chunk_unreadable", failure.Reason);
+        Assert.Contains("Mixing formats", failure.Detail!, StringComparison.Ordinal);
+
+        // And no batch artifact was left claiming to hold audio it decoded differently.
+        var batch = Assert.Single(Directory.GetFiles(Paths.AsrBatchesDirectory, "*.wav", SearchOption.AllDirectories));
+        var validation = WaveChunkValidator.ValidateClosedFile(batch, s_format);
+        Assert.True(validation.IsValid, validation.Error);
+        Assert.Equal(good.DataBytes, validation.DataBytes);
+    }
+
+    [Fact]
+    public void ABatchWindowThatCannotBeMaterializedDoesNotBlockLaterWindows()
+    {
+        // A chunk that is missing or not readable audio is exactly what an aborted capture
+        // write leaves behind. The window cannot reach the provider, but batching must advance
+        // past it: one poisoned chunk must not stop the track's transcription for the rest of
+        // the meeting (issue #6 hard constraint: a stalled ASR queue must not produce unbounded
+        // growth). The rest of the window is retried, so only the unreadable chunk is missing.
+        var builder = CreateBuilder(batchSeconds: 20);
+        builder.AttachEventSink(_events);
+
+        var first = CreateChunk(1, 0, 10_000);
+        var second = CreateChunk(2, 10_000, 10_000);
+        Assert.Null(builder.OnChunkClosed(first));
+
+        // The chunk goes away between being announced and the window closing.
+        File.Delete(second.FilePath);
+
+        // The remaining chunk is retried on its own and still reaches the provider: the window
+        // is not discarded along with the chunk that could not be read.
+        var salvaged = builder.OnChunkClosed(second);
+
+        Assert.NotNull(salvaged);
+        Assert.Equal(first.RelativePath, Assert.Single(salvaged!.Chunks).RelativePath);
+        Assert.Equal(0, builder.PendingChunkCount);
+        Assert.Equal(1, builder.UnreadableChunks);
+        Assert.Equal(10_000, builder.DroppedAudioMs);
+
+        var failure = Assert.Single(
+            _events.Events,
+            e => string.Equals(e.Name, SessionEvents.AsrBatchFailed, StringComparison.Ordinal));
+        Assert.Equal("chunk_unreadable", failure.Reason);
+        Assert.Contains("still on disk", failure.Detail!, StringComparison.Ordinal);
+
+        // The next window batches normally, which is the whole point.
+        var third = CreateChunk(3, 20_000, 10_000);
+        var fourth = CreateChunk(4, 30_000, 10_000);
+        Assert.Null(builder.OnChunkClosed(third));
+        var next = builder.OnChunkClosed(fourth);
+
+        Assert.NotNull(next);
+        Assert.Equal(20_000, next!.StartMs);
+        Assert.Equal(40_000, next.EndMs);
+        Assert.Equal(2, _jobs.ListBySession(SessionId).Count);
+        Assert.Equal(2, builder.BatchesQueued);
+
+        // The pending window is bounded by the batch window, not by the number of failures.
+        Assert.Equal(0, builder.PendingChunkCount);
+    }
+
+    [Fact]
+    public void RepeatedMaterializationFailureLeavesThePendingWindowBounded()
+    {
+        // The unbounded-growth half of the same defect, driven through the CLI-shaped path
+        // (OnChunkClosed) rather than only through FlushPendingBatches.
+        var builder = CreateBuilder(batchSeconds: 20);
+        builder.AttachEventSink(_events);
+
+        var sequence = 1;
+        var queued = 0;
+        for (var window = 0; window < 20; window++)
+        {
+            var first = CreateChunk(sequence++, window * 20_000, 10_000);
+            var second = CreateChunk(sequence++, window * 20_000 + 10_000, 10_000);
+            Assert.Null(builder.OnChunkClosed(first));
+            File.Delete(second.FilePath);
+            if (builder.OnChunkClosed(second) is not null)
+            {
+                queued++;
+            }
+
+            Assert.True(
+                builder.PendingChunkCount <= 2,
+                $"the open batch window grew to {builder.PendingChunkCount} chunks after {window + 1} failures");
+        }
+
+        // Every window advanced: the unreadable chunk was dropped and the good chunk was queued,
+        // so no window is stuck and nothing accumulates.
+        Assert.Equal(20, queued);
+        Assert.Equal(0, builder.PendingChunkCount);
+        Assert.Equal(20, builder.UnreadableChunks);
+        Assert.Equal(200_000, builder.DroppedAudioMs);
+        Assert.Equal(20, _jobs.ListBySession(SessionId).Count);
+        Assert.Equal(
+            20,
+            _events.Events.Count(e => string.Equals(e.Name, SessionEvents.AsrBatchFailed, StringComparison.Ordinal)));
     }
 
     [Fact]

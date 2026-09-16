@@ -299,7 +299,132 @@ meetcap session repair --session <session-id>
 
 ---
 
-## 11. Result
+## 12. M4 additions — live file-first transcription
+
+Issue #6 (M4, *file-first transcription during live recording*) adds behaviour that also needs a
+real Windows run, and specifically needs a **real Volcengine credential** and a **real network**:
+the automated coverage substitutes both boundaries. It lives in
+`tests/MeetCap.Asr.Tests/AsrBatchBuilderTests.cs`,
+`tests/MeetCap.Asr.Tests/AsrJobProcessorTests.cs`,
+`tests/MeetCap.Asr.Volcengine.Tests/VolcengineResponseNormalizerTests.cs`,
+`tests/MeetCap.AudioPipeline.Tests/ChunkClosedSubscriberTests.cs` and
+`tests/MeetCap.Cli.Tests/LiveTranscriptionCommandTests.cs`.
+
+Prerequisites on top of section 2: a working `[asr.volcengine]` configuration
+(`app_id` + a resolvable credential via `env:` or a literal), and enough provider quota to submit
+the recorded windows.
+
+### 12.1 Settings used by the scenarios below
+
+```powershell
+# A short window keeps the run cheap; production windows are 300 s.
+#   [capture]  chunk_seconds = 10
+#   [asr]      file_batch_seconds = 30
+#   [transcript] live_markdown = true
+```
+
+### 12.2 A live meeting transcribes while it records
+
+```powershell
+meetcap start "M4 live check" --mode offline
+# speak into the microphone for about three minutes, then `meetcap stop` from another shell
+```
+
+- [ ] `meetcap start` prints `asr: file ASR, batch window 30s, tier standard`.
+- [ ] **While the recording is still running**, `transcript/raw.jsonl` exists and grows, and
+      `transcript/live.md` contains the recognized text.
+- [ ] `asr/batches/mic/batch-00000N.wav` files appear, one per closed window, each a playable
+      WAV whose duration matches its window, with a `batch-00000N.json` beside it.
+- [ ] Every job's `asr/jobs/<job-id>/response.json` is the raw provider response and
+      `normalized.jsonl` holds the normalized segments.
+- [ ] Segments carry session-relative `start_ms` values that match where the speech actually
+      happened in the meeting (check the third or fourth window specifically: a missing batch
+      offset shows up as early timestamps repeated for later windows).
+- [ ] Where the configured tier supports it, segments carry an anonymous `speaker_label` such as
+      `speaker_1`, and `speaker_id` / `speaker_name` / `speaker_confidence` are still `null`.
+- [ ] `meetcap stop` prints `asr batches: N queued, ...`, the session reaches `COMPLETED` once the
+      queue is terminal, and `meetcap start` exits `0`.
+
+### 12.3 Thirty-minute network outage during a recording
+
+```powershell
+meetcap start "M4 outage check" --mode offline
+# after two minutes, disable the network adapter (do not touch the microphone)
+# leave it disabled for 30 minutes, still speaking
+# re-enable the network, then `meetcap stop`
+```
+
+- [ ] Audio capture is never disturbed: `meetcap start` reports the full duration, `chunks closed`
+      matches the elapsed time, and every `audio/mic/*.wav` is readable with no `.part` left.
+- [ ] During the outage, `meetcap status` prints an `asr queue:` line with outstanding jobs and
+      `asr state: behind`, and it still exits `0`.
+- [ ] During the outage, `asr/batches/mic/` keeps growing: batching is local and unaffected.
+- [ ] Jobs sit in `retry_wait` with a durable `next_retry_at`; they do **not** burn their whole
+      attempt budget in a tight loop (inspect `attempt_count` in `meetcap.db`).
+- [ ] After the network returns, `meetcap asr resume` (or a later drain) completes the queue and
+      the transcript contains the audio recorded during the outage.
+- [ ] No streaming endpoint was ever contacted (the adapter has no streaming call at all; confirm
+      by inspecting the retained `request.json` files, which name only the submit/query tier).
+- [ ] `meetcap start` exited `0` even though the queue was behind.
+
+### 12.4 Restart with work outstanding
+
+```powershell
+meetcap start "M4 restart check" --mode offline
+# record two minutes, disable the network, then kill the process: taskkill /F /IM meetcap.exe
+# re-enable the network
+meetcap asr resume
+```
+
+- [ ] `meetcap status` reports the session as `INTERRUPTED` (it was not cleanly stopped) and lists
+      its outstanding jobs; the already-closed chunks are durable.
+- [ ] `meetcap asr resume` picks up every job rather than creating a second billable task for the
+      same audio: the `provider_request_id` in `asr_jobs` is unchanged for each job.
+- [ ] `transcript/raw.jsonl` can be rebuilt from the per-job `normalized.jsonl` files, and its
+      line count equals their total (the derived-vs-durable property of
+      `docs/DATA_MODEL.md` section 6).
+- [ ] `meetcap asr resume` reports a recovered batch when a batch WAV exists with no job row
+      (reproduce by deleting one `asr_jobs` row while keeping its `asr/batches/mic/*.wav`).
+
+### 12.5 An unreadable capture chunk degrades the transcript, not the recording
+
+```powershell
+# during a recording, corrupt one closed chunk (keep its length):
+#   $f = "...\sessions\<id>\audio\mic\000002.wav"; $b = [IO.File]::ReadAllBytes($f)
+#   $b[10] = 0xFF; [IO.File]::WriteAllBytes($f, $b)
+# let the window that contains it close (or run `meetcap stop`)
+```
+
+- [ ] `events.jsonl` contains `asr.batch.failed` with `reason=chunk_unreadable`, naming the batch
+      and stating that the capture chunk is still on disk.
+- [ ] The **rest of that window is still submitted**: a subsequent batch contains the other
+      chunks, so later windows keep working.
+- [ ] The session still reaches a clean terminal state and `meetcap start` exits `0`. A transcript
+      gap must never be reported as an interrupted recording.
+- [ ] `meetcap start`'s stop summary names the unreadable chunk count and the milliseconds that
+      were never transcribed.
+- [ ] The corrupted chunk is still on disk under `audio/mic/` (the audio was never deleted).
+
+### 12.6 Provider rejects a batch permanently
+
+Point `[asr.volcengine] credential` at a wrong token and run the 12.2 scenario.
+
+- [ ] `meetcap asr resume` exits non-zero and names the failing job.
+- [ ] The session stays `PROCESSING` (audio recoverable), not `COMPLETED`.
+- [ ] `meetcap start` still exits `0` when the *recording* was clean.
+- [ ] The raw response that carried the rejection is retained in the job's `response.json`.
+
+### 12.7 Artifact and disk footprint
+
+- [ ] A session keeps `audio/mic/*.wav`, `asr/batches/mic/*.wav` and `asr/jobs/*/response.json`;
+      it never deletes the source audio.
+- [ ] The batch WAVs are real audio: open one in a player and confirm it plays at the session's
+      format with no click or truncation at the chunk joins.
+- [ ] `meetcap.db` carries no new table or column (the M3 `asr_jobs` schema is unchanged).
+
+---
+
+## 13. Result
 
 | Scenario | Result | Notes |
 | --- | --- | --- |
@@ -313,6 +438,14 @@ meetcap session repair --session <session-id>
 | 10.2 M2 slow consumer | | |
 | 10.3 M2 explicit gaps | | |
 | 10.4 M2 session repair | | |
+| 12.2 M4 live transcription | | |
+| 12.3 M4 30-minute outage | | |
+| 12.4 M4 restart with work outstanding | | |
+| 12.5 M4 unreadable chunk | | |
+| 12.6 M4 provider rejection | | |
+| 12.7 M4 artifact footprint | | |
 
-M1 and M2 may be described as verified on real hardware only when every row above is filled
-in and passing, or when the residual failure is written down here as a known limitation.
+M1, M2 and M4 may be described as verified on real hardware only when every row above is filled
+in and passing, or when the residual failure is written down here as a known limitation. The M4
+rows additionally require a real credential: without one, 12.2-12.4 and 12.6 cannot be run and
+must be recorded as not run rather than as passed.

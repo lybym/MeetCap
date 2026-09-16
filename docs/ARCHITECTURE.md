@@ -711,7 +711,9 @@ Three properties of that ordering are deliberate:
   (`job_batch-NNNNNN`), so re-running recovery against a batch file that already has a job is a
   no-op. `RecoverFinalizedBatches` re-queues a finalized batch whose job row is missing and
   discards any `.part` left by an unfinished batch; the chunks it would have contained are still
-  durable and are picked up by the next window.
+  durable and are picked up by the next window. It runs from both `meetcap start` and
+  `meetcap asr resume`, because the documented restart entry point has to be able to see the whole
+  crash surface (section 12.1).
 
 Batch numbering is per track, starts above whatever a previous process already wrote, and skips
 a number whose file already exists, so a restarted recorder cannot overwrite a batch.
@@ -723,6 +725,39 @@ derived from the other.
 The batch WAV is an intermediate artifact. The capture chunks, the provider's raw response, and
 the per-job `normalized.jsonl` are the durable record; `transcript/raw.jsonl` is derived from
 those (`docs/DATA_MODEL.md` sections 6 and 12).
+
+### 10.2 A window that cannot be built must not stop the track
+
+Materializing a window reads the durable capture chunks, so it can fail for reasons the recorder
+never controls: a chunk that an aborted write left unreadable, a chunk in a different format, a
+disk that refuses the batch write. The distinction that matters is whether a *chunk* is at fault
+or the *write* is:
+
+```text
+a capture chunk cannot be read (missing, short, not a WAV, wrong format)
+  -> asr.batch.failed (reason=chunk_unreadable), naming the batch and the chunk
+  -> that one chunk is dropped from the window and counted (UnreadableChunks / DroppedAudioMs)
+  -> the remaining chunks are retried, so their audio still reaches the provider
+  -> the dropped chunk stays on disk: this is a transcript gap, not lost audio
+
+the window itself cannot be written (disk, permissions, capacity, the job row)
+  -> asr.batch.failed (reason=batch_write_failed or job_queue_failed)
+  -> nothing is dropped; the chunks stay pending for the next window
+```
+
+Three rules follow, and all three are load-bearing:
+
+- **The track never stops.** Dropping the offending chunk is what lets the loop make progress.
+  Without it one unreadable chunk would re-run the same failing build for every later chunk —
+  permanently stopping that track's transcription for the rest of the meeting.
+- **The pending window stays bounded.** The open window is bounded by `file_batch_seconds` of
+  audio plus the retry of the failed window, not by the number of failures, so a long failure
+  streak cannot grow memory (the issue's hard constraint, `docs/RELIABILITY.md` section 4).
+- **A transcript gap is never a failed recording.** The builder contains the failure and records
+  it; it does not throw into the recording's chunk-close path, so the session is not marked
+  degraded or interrupted and `meetcap start` still exits 0
+  (`docs/RELIABILITY.md` sections 1 and 2). `meetcap start`'s stop summary names the unreadable
+  chunk count and the milliseconds that were never transcribed.
 
 ---
 
@@ -857,6 +892,14 @@ at a bare `submitted` would leave that job's audio submitted but never collected
 future. That is the operator's statement that the reason for the backoff is over — the network
 is back — and the schedule is otherwise respected, so repeated commands cannot create a retry
 storm.
+
+`meetcap asr resume` also runs the batch-recovery pass of section 10.1 before it drives the
+queue. The restart entry point has to see the whole crash surface, not only the half that already
+has a job row: a process killed between writing a batch WAV and creating its job leaves audio
+that `asr_jobs` knows nothing about, and requiring a *new* recording to recover the previous one
+was not a recovery path an operator could find. `meetcap status` reports the same orphans as
+`asr orphaned:` lines (and still exits 0), so they are visible before anyone thinks to look for
+them.
 
 A transport failure is classified by the provider adapter, not leak out of it:
 `VolcengineAsrProvider` wraps the exceptions its Polly pipeline rethrows
@@ -1072,7 +1115,8 @@ No component may read ad-hoc environment variables directly except the configura
       asr/
         jobs/
         batches/
-      transcript/        raw.jsonl
+      transcript/
+        raw.jsonl
         live.md
         final.jsonl
         final.md

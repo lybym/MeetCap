@@ -6,6 +6,7 @@ using MeetCap.Core.Capture;
 using MeetCap.Core.Configuration;
 using MeetCap.Core.Diagnostics;
 using MeetCap.Core.Secrets;
+using MeetCap.Core.Sessions;
 using MeetCap.Persistence.Storage;
 using Microsoft.Extensions.Logging;
 
@@ -56,7 +57,7 @@ internal static class StatusCommand
             ? $"sessions: {activeSessions} active"
             : "sessions: none active");
 
-        WriteAsrQueue(context, database, dbInitialized, load.Configuration);
+        WriteAsrQueue(context, database, dbInitialized, dataRoot, load.Configuration);
 
         if (report is null)
         {
@@ -112,6 +113,7 @@ internal static class StatusCommand
         CliContext context,
         MeetCapDatabase database,
         bool dbInitialized,
+        string dataRoot,
         MeetCapConfiguration configuration)
     {
         if (!configuration.Asr.Enabled)
@@ -146,6 +148,8 @@ internal static class StatusCommand
                 "asr state: behind (transcription is queued or failed; recording and audio artifacts are unaffected)");
         }
 
+        WriteOrphanedBatches(context, database, dataRoot, configuration);
+
         foreach (var session in database.Sessions.ListActive())
         {
             var sessionQueue = database.AsrQueue.InspectSession(session.Id);
@@ -155,6 +159,53 @@ internal static class StatusCommand
             }
 
             context.Out.WriteLine($"  {session.Id}: {sessionQueue.Describe()}");
+        }
+    }
+
+    /// <summary>
+    /// Reports batch artifacts that have no job row, which is the one crash window
+    /// <c>asr_jobs</c> cannot describe (<c>docs/ARCHITECTURE.md</c> section 10.1).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Without this, an operator whose process died exactly between the batch WAV becoming
+    /// durable and its job row being written sees a clean-looking queue and has no way to learn
+    /// that a recording's audio is sitting untranscribed. <c>meetcap asr resume</c> repairs it;
+    /// this says it exists.
+    /// </para>
+    /// <para>
+    /// <c>status</c> keeps exiting 0 in every case — it describes state, and a command whose exit
+    /// code is always 0 never has to be interpreted (<c>docs/ARCHITECTURE.md</c> section 9.2).
+    /// </para>
+    /// </remarks>
+    private static void WriteOrphanedBatches(
+        CliContext context,
+        MeetCapDatabase database,
+        string dataRoot,
+        MeetCapConfiguration configuration)
+    {
+        if (!configuration.Asr.Enabled)
+        {
+            return;
+        }
+
+        foreach (var sessionId in SessionArtifactPaths.EnumerateSessionsWithBatchArtifacts(dataRoot))
+        {
+            var paths = new SessionArtifactPaths(dataRoot, sessionId);
+            var known = database.AsrJobs
+                .ListBySession(sessionId)
+                .Select(job => job.InputArtifact)
+                .ToHashSet(StringComparer.Ordinal);
+
+            var orphaned = paths.BatchArtifacts().Where(artifact => !known.Contains(artifact)).ToArray();
+            if (orphaned.Length == 0)
+            {
+                continue;
+            }
+
+            context.Out.WriteLine(
+                $"asr orphaned: {sessionId} has {orphaned.Length} batch(es) with no job row " +
+                $"({string.Join(", ", orphaned)}); run 'meetcap asr resume' to queue them.");
         }
     }
 

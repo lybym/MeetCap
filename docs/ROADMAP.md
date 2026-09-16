@@ -294,6 +294,12 @@ Implemented (issue #6):
   stop and `COMPLETED` when its queue is terminal;
 - `meetcap asr resume --force`: process jobs whose durable retry backoff has not come due yet,
   for an operator who knows the outage is over;
+- `meetcap asr resume` also runs the batch-recovery pass, so a batch finalized before its job row
+  existed is recoverable through the documented restart entry point and not only by starting a new
+  recording;
+- a window that cannot be built does not stop the track: the unreadable chunk is dropped with an
+  explicit `asr.batch.failed` record and the rest of the window is retried, so the pending window
+  stays bounded and later windows keep transcribing;
 - `meetcap status`: `asr:`, `asr queue:` and `asr state: behind` lines, so queue depth and
   degraded transcription state are visible without reading SQLite;
 - `transcript/raw.jsonl` and `transcript/live.md` advance during the meeting, rebuilt from each
@@ -314,8 +320,9 @@ Not implemented in this milestone, and deliberately out of scope:
 
 Real-world validation has not been performed: the exit criteria above were exercised in CI
 against a scripted capture source and a scripted provider transport, so the two-hour meeting and
-the thirty-minute outage are automated coverage, not a measured soak. See
-`docs/RELIABILITY.md` section 15.
+the thirty-minute outage are automated coverage, not a measured soak. The manual Windows checklist
+for M4 is `docs/M1_WINDOWS_VALIDATION.md` section 12, and it has not been run (its 12.2–12.4 and
+12.6 rows need a real Volcengine credential). See `docs/RELIABILITY.md` section 15.
 
 ---
 

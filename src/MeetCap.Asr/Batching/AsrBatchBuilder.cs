@@ -129,6 +129,19 @@ public sealed class AsrBatchBuilder
     /// <summary>Batches queued as jobs so far in this process.</summary>
     public int BatchesQueued { get; private set; }
 
+    /// <summary>
+    /// Capture chunks this process had to drop from a batch window because they were unreadable.
+    /// </summary>
+    /// <remarks>
+    /// The chunk stays durable under <c>audio/</c>; what is missing is its transcript, and the
+    /// drop is recorded as an explicit <c>asr.batch.failed</c> event rather than passed over in
+    /// silence (<c>docs/RELIABILITY.md</c> section 2).
+    /// </remarks>
+    public int UnreadableChunks { get; private set; }
+
+    /// <summary>Session-relative milliseconds of capture that could not be read into any batch.</summary>
+    public long DroppedAudioMs { get; private set; }
+
     /// <summary>Chunks buffered into the open batch of each track but not yet queued.</summary>
     public int PendingChunkCount
     {
@@ -171,7 +184,7 @@ public sealed class AsrBatchBuilder
 
     /// <summary>
     /// Closes and queues the remaining partial batch of every track
-    /// (<c>docs/ROADMAP.md</c> M4: "flush remaining batch at stop").
+    /// (<c>docs/ROADMAP.md</c> M4: "flush remaining partial batch at stop").
     /// </summary>
     /// <returns>The batches that were queued by this call.</returns>
     public IReadOnlyList<AsrBatch> FlushPendingBatches()
@@ -185,7 +198,14 @@ public sealed class AsrBatchBuilder
                 continue;
             }
 
-            flushed.Add(CompleteBatch(pending.Chunks[0].SessionId, source, pending));
+            // A window that cannot be built (an unreadable chunk, or a write failure) produces
+            // no batch; the builder has already recorded why, and a stop is not the place to
+            // turn a transcript gap into a failed recording.
+            var batch = CompleteBatch(pending.Chunks[0].SessionId, source, pending);
+            if (batch is not null)
+            {
+                flushed.Add(batch);
+            }
         }
 
         return flushed;
@@ -196,45 +216,35 @@ public sealed class AsrBatchBuilder
     /// discards the <c>.part</c> files of batches it never finalized.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// This is the crash-recovery half of "pending batches survive restart". The ordinary
     /// case — a job row that exists and still needs work — is already handled by
     /// <c>meetcap asr resume</c> reading <c>asr_jobs</c>; this method only covers the narrow
     /// window between a batch file becoming durable and its job row being written.
+    /// </para>
+    /// <para>
+    /// Static so the restart entry point can run exactly this pass. It is reachable from both
+    /// commands an operator would try: <c>meetcap start</c> (which owns the session it is about
+    /// to record) and <c>meetcap asr resume</c>, via
+    /// <see cref="EnumerateSessionsWithBatchArtifacts"/>. Requiring a *new* recording to recover
+    /// the previous one was not a recovery path an operator could find.
+    /// </para>
     /// </remarks>
     /// <returns>The batches that were re-created as jobs.</returns>
-    public IReadOnlyList<AsrBatch> RecoverFinalizedBatches(string sessionId)
+    public static IReadOnlyList<AsrBatch> RecoverFinalizedBatches(
+        string dataRoot,
+        string sessionId,
+        IAsrJobStore jobs,
+        AsrBatchBuilderOptions options,
+        ISessionEventSink? events)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(sessionId);
-
-        var paths = new SessionArtifactPaths(_options.DataRoot, sessionId);
+        var paths = new SessionArtifactPaths(dataRoot, sessionId);
+        var recovered = new List<AsrBatch>();
         if (!Directory.Exists(paths.AsrBatchesDirectory))
         {
-            return Array.Empty<AsrBatch>();
+            return recovered;
         }
 
-        DiscardOrphanedPartFiles(paths);
-
-        var recovered = new List<AsrBatch>();
-        foreach (var file in EnumerateBatchFiles(paths))
-        {
-            var relativePath = paths.ToRelative(file);
-            if (HasJobForArtifact(sessionId, relativePath))
-            {
-                continue;
-            }
-
-            var batch = TryReadBatchManifest(sessionId, file, relativePath);
-            if (batch is not null)
-            {
-                recovered.Add(QueueJob(paths, batch));
-            }
-        }
-
-        return recovered;
-    }
-
-    private void DiscardOrphanedPartFiles(SessionArtifactPaths paths)
-    {
         foreach (var part in Directory.EnumerateFiles(
                      paths.AsrBatchesDirectory,
                      "*" + WavBatchConcatenator.PartSuffix,
@@ -246,19 +256,58 @@ public sealed class AsrBatchBuilder
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                // A batch file that cannot be discarded is inert: no job references it, and
-                // its capture chunks are still durable under audio/.
                 continue;
             }
 
-            _events?.Write(new SessionEvent(SessionEvents.AsrBatchDiscarded, 0)
+            events?.Write(new SessionEvent(SessionEvents.AsrBatchDiscarded, 0)
             {
                 Detail =
                     "an unfinished batch file was discarded; its capture chunks are still durable " +
                     "and are batched by the next window.",
             });
         }
+
+        foreach (var file in EnumerateBatchFiles(paths))
+        {
+            var relativePath = paths.ToRelative(file);
+            if (HasJobForArtifact(jobs, sessionId, relativePath))
+            {
+                continue;
+            }
+
+            var batch = TryReadBatchManifest(sessionId, file, relativePath);
+            if (batch is not null)
+            {
+                var queued = QueueJob(paths, batch, jobs, options, events, onQueued: null);
+                if (queued is not null)
+                {
+                    recovered.Add(queued);
+                }
+            }
+        }
+
+        return recovered;
     }
+
+    /// <summary>
+    /// Runs <see cref="RecoverFinalizedBatches(string, string, IAsrJobStore, AsrBatchBuilderOptions, ISessionEventSink?)"/>
+    /// for this builder's own session and job store.
+    /// </summary>
+    /// <returns>The batches that were re-created as jobs.</returns>
+    public IReadOnlyList<AsrBatch> RecoverFinalizedBatches(string sessionId) =>
+        RecoverFinalizedBatches(_options.DataRoot, sessionId, _jobs, _options, _events);
+
+    /// <summary>
+    /// Sessions under a data root that still hold batch artifacts, newest name last.
+    /// </summary>
+    /// <remarks>
+    /// <c>meetcap asr resume</c> has no session id when it is run without <c>--session</c>, so it
+    /// discovers the sessions whose batch surface exists on disk. Reading the artifact tree —
+    /// rather than the database — is what makes the pass able to see a batch that was finalized
+    /// before its job row existed, which is the whole point of the recovery.
+    /// </remarks>
+    public static IReadOnlyList<string> EnumerateSessionsWithBatchArtifacts(string dataRoot) =>
+        SessionArtifactPaths.EnumerateSessionsWithBatchArtifacts(dataRoot);
 
     private static IEnumerable<string> EnumerateBatchFiles(SessionArtifactPaths paths) =>
         Directory
@@ -326,33 +375,127 @@ public sealed class AsrBatchBuilder
     }
 
     /// <summary>Materializes a batch, writes its timeline manifest, then queues its job.</summary>
-    private AsrBatch CompleteBatch(string sessionId, string source, PendingBatch pending)
+    /// <remarks>
+    /// A window that cannot be built must never block the track. The failure is recorded with
+    /// the chunk that caused it, that one chunk is dropped from the pending window, and the
+    /// remaining chunks stay pending so their audio still reaches the provider in the next
+    /// window. Without the drop, one unreadable chunk would re-run the same failing build for
+    /// every later chunk — permanently stopping that track's transcription and growing the
+    /// pending list without bound (issue #6 hard constraint,
+    /// <c>docs/ARCHITECTURE.md</c> section 10.2).
+    /// </remarks>
+    /// <returns>The queued batch, or <c>null</c> when the window could not be built.</returns>
+    private AsrBatch? CompleteBatch(string sessionId, string source, PendingBatch pending)
     {
         var paths = new SessionArtifactPaths(_options.DataRoot, sessionId);
-        var number = NextBatchNumber(paths, source);
-        var batchPath = BatchFilePath(paths, source, number);
-        var relativePath = paths.ToRelative(batchPath);
 
-        // The audio artifact is durable before anything references it.
-        var dataBytes = WavBatchConcatenator.Concatenate(batchPath, pending.Chunks, pending.Format);
-
-        var batch = new AsrBatch
+        while (true)
         {
-            SessionId = sessionId,
+            var number = NextBatchNumber(paths, source);
+            var batchPath = BatchFilePath(paths, source, number);
+            var relativePath = paths.ToRelative(batchPath);
+
+            long dataBytes;
+            try
+            {
+                // The audio artifact is durable before anything references it.
+                dataBytes = WavBatchConcatenator.Concatenate(batchPath, pending.Chunks, pending.Format);
+            }
+            catch (AsrBatchMaterializationException ex)
+            {
+                RecordFailedWindow(sessionId, source, number, relativePath, pending, ex, unreadableChunk: true);
+
+                // Only the chunk that could not be read is dropped, and it is counted here rather
+                // than as the whole window: the remaining chunks are retried below, so counting
+                // the window would overstate what the transcript is actually missing.
+                var dropped = pending.Chunks
+                    .Where(chunk => string.Equals(chunk.RelativePath, ex.ChunkPath, StringComparison.Ordinal))
+                    .ToArray();
+                foreach (var chunk in dropped)
+                {
+                    DroppedAudioMs += chunk.DurationMs;
+                }
+
+                pending.Drop(ex.ChunkPath);
+
+                if (pending.Chunks.Count == 0)
+                {
+                    // Nothing usable is left in this window; the next closed chunk opens a new
+                    // one. The caller sees "no batch queued", which is also what it sees for an
+                    // open window.
+                    return null;
+                }
+
+                // The rest of the window is still good audio. Try it again so it is not lost
+                // along with the chunk that could not be read.
+                continue;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
+            {
+                // The window could not be written (disk, permissions, capacity). No chunk is
+                // to blame, so none is dropped: the chunks stay pending and the next window
+                // retries them rather than discarding audio over a transient condition.
+                RecordFailedWindow(sessionId, source, number, relativePath, pending, ex, unreadableChunk: false);
+                return null;
+            }
+
+            var batch = new AsrBatch
+            {
+                SessionId = sessionId,
+                Source = source,
+                Number = number,
+                Chunks = pending.Chunks.ToArray(),
+                FilePath = batchPath,
+                RelativePath = relativePath,
+                StartMs = pending.StartMs,
+                EndMs = pending.EndMs,
+                DataBytes = dataBytes,
+            };
+
+            WriteManifest(batch);
+            pending.Chunks.Clear();
+
+            return QueueJob(paths, batch);
+        }
+    }
+
+    /// <summary>Records a batch window whose audio did not reach the provider as one batch.</summary>
+    /// <remarks>
+    /// The count of genuinely lost audio is kept separately from this record: a window that
+    /// fails because one chunk is unreadable loses only that chunk, and the rest of the window is
+    /// retried, so the window's whole duration is not missing from the transcript.
+    /// </remarks>
+    private void RecordFailedWindow(
+        string sessionId,
+        string source,
+        int number,
+        string relativePath,
+        PendingBatch pending,
+        Exception failure,
+        bool unreadableChunk)
+    {
+        var affectedMs = pending.DurationMs;
+
+        if (unreadableChunk)
+        {
+            UnreadableChunks++;
+        }
+
+        _events?.Write(new SessionEvent(SessionEvents.AsrBatchFailed, pending.StartMs)
+        {
             Source = source,
-            Number = number,
-            Chunks = pending.Chunks.ToArray(),
-            FilePath = batchPath,
-            RelativePath = relativePath,
             StartMs = pending.StartMs,
             EndMs = pending.EndMs,
-            DataBytes = dataBytes,
-        };
-
-        WriteManifest(batch);
-        pending.Chunks.Clear();
-
-        return QueueJob(paths, batch);
+            Count = pending.Chunks.Count,
+            Reason = unreadableChunk ? "chunk_unreadable" : "batch_write_failed",
+            Detail =
+                $"batch '{relativePath}' (window {number}, {affectedMs} ms of session audio over " +
+                $"{pending.Chunks.Count} chunk(s)) could not be built: {failure.Message} " +
+                (unreadableChunk
+                    ? "The unreadable chunk was dropped from the window and the remaining audio is " +
+                      "retried; the capture chunk itself is still on disk, so this is a transcript gap."
+                    : "No chunk was dropped; the window stays pending and is retried."),
+        });
     }
 
     /// <summary>
@@ -402,38 +545,86 @@ public sealed class AsrBatchBuilder
     }
 
     /// <summary>Creates the persistent job for a materialized batch, plus its events.</summary>
-    private AsrBatch QueueJob(SessionArtifactPaths paths, AsrBatch batch)
+    /// <returns>The batch, or <c>null</c> when the job row could not be written.</returns>
+    private AsrBatch? QueueJob(SessionArtifactPaths paths, AsrBatch batch)
     {
-        if (HasJobForArtifact(batch.SessionId, batch.RelativePath))
+        if (QueueJob(paths, batch, _jobs, _options, _events, onQueued: null) is not { } queued)
+        {
+            return null;
+        }
+
+        BatchesQueued++;
+        return queued;
+    }
+
+    /// <summary>
+    /// Creates the persistent job for a materialized batch, plus its events.
+    /// </summary>
+    /// <remarks>
+    /// Static so <see cref="RecoverFinalizedBatches(string, string, IAsrJobStore, AsrBatchBuilderOptions, ISessionEventSink?)"/>
+    /// can run the identical logic for a command that owns no live builder.
+    /// </remarks>
+    private static AsrBatch? QueueJob(
+        SessionArtifactPaths paths,
+        AsrBatch batch,
+        IAsrJobStore jobs,
+        AsrBatchBuilderOptions options,
+        ISessionEventSink? events,
+        Action? onQueued)
+    {
+        if (HasJobForArtifact(jobs, batch.SessionId, batch.RelativePath))
         {
             // Idempotent: a job derived from this batch artifact already exists, so the audio
             // must not be queued (and therefore billed) a second time.
             return batch;
         }
 
-        var now = Now();
+        var now = options.TimeProvider.GetUtcNow();
         var job = new AsrJob
         {
             Id = JobIdFor(batch.RelativePath),
             SessionId = batch.SessionId,
             Source = batch.Source,
-            Tier = _options.ServiceTier,
-            Provider = _options.ProviderName,
+            Tier = options.ServiceTier,
+            Provider = options.ProviderName,
             StartMs = batch.StartMs,
             EndMs = batch.EndMs,
             InputArtifact = batch.RelativePath,
             Status = AsrJobStatus.Pending,
             ProviderRequestId = Ids.NewProviderRequestId(),
             DurationMs = (int)Math.Min(int.MaxValue, batch.DurationMs),
-            SpeakerInfoRequested = _options.RequestSpeakerInfo,
-            EstimatedCostCny = AsrCostEstimator.Estimate(batch.DurationMs, _options.CostPerHourCny),
+            SpeakerInfoRequested = options.RequestSpeakerInfo,
+            EstimatedCostCny = AsrCostEstimator.Estimate(batch.DurationMs, options.CostPerHourCny),
             CreatedAt = now,
             UpdatedAt = now,
         };
 
-        _jobs.Create(job);
+        try
+        {
+            jobs.Create(job);
+        }
+        catch (Exception ex) when (ex is IOException or InvalidOperationException or UnauthorizedAccessException)
+        {
+            // The audio artifact and its manifest are already durable, so the next
+            // `meetcap asr resume` (or the next start) finds the batch and queues it then. The
+            // recording is unaffected; only the transcript is delayed.
+            events?.Write(new SessionEvent(SessionEvents.AsrBatchFailed, batch.EndMs)
+            {
+                Source = batch.Source,
+                StartMs = batch.StartMs,
+                EndMs = batch.EndMs,
+                Count = batch.Chunks.Count,
+                Reason = "job_queue_failed",
+                Detail =
+                    $"batch '{batch.RelativePath}' is durable but its job row could not be written: " +
+                    $"{ex.Message} The session timeline keeps the window; run 'meetcap asr resume' " +
+                    "to queue it, or start the next recording, which recovers it automatically.",
+            });
 
-        _events?.Write(new SessionEvent(SessionEvents.AsrBatchClosed, batch.EndMs)
+            return null;
+        }
+
+        events?.Write(new SessionEvent(SessionEvents.AsrBatchClosed, batch.EndMs)
         {
             Source = batch.Source,
             StartMs = batch.StartMs,
@@ -444,7 +635,7 @@ public sealed class AsrBatchBuilder
                 $"({batch.DurationMs} ms of session audio).",
         });
 
-        _events?.Write(new SessionEvent(SessionEvents.AsrJobQueued, batch.StartMs)
+        events?.Write(new SessionEvent(SessionEvents.AsrJobQueued, batch.StartMs)
         {
             Source = batch.Source,
             StartMs = batch.StartMs,
@@ -455,20 +646,23 @@ public sealed class AsrBatchBuilder
                 $"tier '{job.Tier}'. Submission happens off the capture path.",
         });
 
-        BatchesQueued++;
+        onQueued?.Invoke();
         return batch;
     }
 
-    private bool HasJobForArtifact(string sessionId, string relativePath)
+    private static bool HasJobForArtifact(IAsrJobStore jobs, string sessionId, string relativePath)
     {
-        if (_jobs.Get(JobIdFor(relativePath)) is not null)
+        if (jobs.Get(JobIdFor(relativePath)) is not null)
         {
             return true;
         }
 
-        return _jobs.ListBySession(sessionId)
+        return jobs.ListBySession(sessionId)
             .Any(job => string.Equals(job.InputArtifact, relativePath, StringComparison.Ordinal));
     }
+
+    private bool HasJobForArtifact(string sessionId, string relativePath) =>
+        HasJobForArtifact(_jobs, sessionId, relativePath);
 
     /// <summary>
     /// Derives the job id from the batch artifact path, so a batch file and its job are
@@ -554,5 +748,22 @@ public sealed class AsrBatchBuilder
         public long EndMs => Chunks.Count == 0 ? 0 : Chunks[^1].EndMs;
 
         public long DurationMs => EndMs - StartMs;
+
+        /// <summary>
+        /// Drops the chunk with the given session-relative path from the open window.
+        /// </summary>
+        /// <remarks>
+        /// Order is preserved for the chunks that remain, so the window's own span still
+        /// describes where its audio sits on the session timeline.
+        /// </remarks>
+        public void Drop(string relativePath)
+        {
+            if (string.IsNullOrEmpty(relativePath))
+            {
+                return;
+            }
+
+            Chunks.RemoveAll(chunk => string.Equals(chunk.RelativePath, relativePath, StringComparison.Ordinal));
+        }
     }
 }

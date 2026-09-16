@@ -1,6 +1,7 @@
 namespace MeetCap.Cli.Commands;
 
 using MeetCap.Asr;
+using MeetCap.Asr.Batching;
 using MeetCap.Core.Asr;
 using MeetCap.Core.Configuration;
 using Microsoft.Extensions.Logging;
@@ -10,11 +11,19 @@ using Microsoft.Extensions.Logging;
 /// ASR job queue (<c>docs/ARCHITECTURE.md</c> section 12).
 /// </summary>
 /// <remarks>
+/// <para>
 /// A process that dies while an ASR job is pending, submitted, or waiting to retry
 /// leaves the job's state in SQLite. This command re-drives those jobs, which is what
 /// makes "incomplete work survives process restart" an observable property rather than
 /// a claim. It never submits a job that already has a provider request id unless the
 /// provider reports the task as unknown.
+/// </para>
+/// <para>
+/// It also runs the batch-recovery pass before it drives the queue, because the restart
+/// entry point has to see the whole crash surface, not only the half that already has a job
+/// row: a process killed between writing a batch WAV and creating its job leaves audio that
+/// <c>asr_jobs</c> knows nothing about (<c>docs/ARCHITECTURE.md</c> section 10.1).
+/// </para>
 /// </remarks>
 internal static class AsrCommand
 {
@@ -45,11 +54,13 @@ internal static class AsrCommand
 
         using var ownedStack = stack;
 
+        var recovered = RecoverOrphanedBatches(context, configuration, dataRoot, stack, sessionId);
+
         var results = await stack.Processor
             .RunDueAsync(maxJobs, sessionId, cancellationToken, ignoreRetrySchedule: force)
             .ConfigureAwait(false);
 
-        if (results.Count == 0)
+        if (results.Count == 0 && recovered.Count == 0)
         {
             context.Out.WriteLine(
                 sessionId is null
@@ -73,9 +84,10 @@ internal static class AsrCommand
         }
 
         Logger(context).LogInformation(
-            "asr resume: jobs={Jobs} failures={Failures}",
+            "asr resume: jobs={Jobs} failures={Failures} recoveredBatches={Recovered}",
             results.Count,
-            failures);
+            failures,
+            recovered.Count);
 
         if (failures > 0)
         {
@@ -84,6 +96,58 @@ internal static class AsrCommand
         }
 
         return 0;
+    }
+
+    /// <summary>
+    /// Queues every finalized-but-unqueued batch under the requested session, or under every
+    /// session that still holds batch artifacts when no session was named.
+    /// </summary>
+    /// <remarks>
+    /// This is the half of the crash window that <c>asr_jobs</c> cannot describe: the batch WAV
+    /// and its manifest are durable, but the process died before the job row existed. Running it
+    /// here is what makes the documented restart entry point actually a restart entry point
+    /// (<c>docs/ARCHITECTURE.md</c> sections 10.1 and 12).
+    /// </remarks>
+    private static IReadOnlyList<AsrBatch> RecoverOrphanedBatches(
+        CliContext context,
+        MeetCapConfiguration configuration,
+        string dataRoot,
+        AsrStack stack,
+        string? sessionId)
+    {
+        var options = new AsrBatchBuilderOptions
+        {
+            DataRoot = dataRoot,
+            ProviderName = stack.Provider.Name,
+            BatchSeconds = configuration.Asr.FileBatchSeconds,
+            ServiceTier = configuration.Asr.ServiceTier,
+            RequestSpeakerInfo = configuration.Asr.Volcengine.RequestSpeakerInfo,
+            CostPerHourCny = configuration.Asr.Volcengine.CostPerHourCny,
+        };
+
+        var sessions = sessionId is null
+            ? AsrBatchBuilder.EnumerateSessionsWithBatchArtifacts(dataRoot)
+            : new[] { sessionId };
+
+        var recovered = new List<AsrBatch>();
+        foreach (var candidate in sessions)
+        {
+            recovered.AddRange(AsrBatchBuilder.RecoverFinalizedBatches(
+                dataRoot,
+                candidate,
+                stack.Jobs,
+                options,
+                events: null));
+        }
+
+        foreach (var batch in recovered)
+        {
+            context.Out.WriteLine(
+                $"recovered batch {batch.RelativePath} for session {batch.SessionId} " +
+                $"({batch.DurationMs} ms of session audio).");
+        }
+
+        return recovered;
     }
 
     private static ILogger Logger(CliContext context)

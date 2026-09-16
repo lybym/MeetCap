@@ -240,16 +240,32 @@ Implemented, and covered by the automated suite that runs in CI (`.github/workfl
   job row exists, so a crash can leave an orphaned batch but never a queued job whose audio is
   missing. `AsrBatchBuilder.RecoverFinalizedBatches` re-queues a finalized batch with no job and
   discards the `.part` of an unfinished one, using a job id derived from the batch artifact path
-  so recovery is idempotent. Covered by
-  `tests/MeetCap.Asr.Tests/AsrBatchBuilderTests.cs`.
+  so recovery is idempotent. It runs from both commands an operator would try — `meetcap start`
+  and the documented restart entry point `meetcap asr resume`. Covered by
+  `tests/MeetCap.Asr.Tests/AsrBatchBuilderTests.cs` and, through the CLI resume path, by
+  `tests/MeetCap.Cli.Tests/LiveTranscriptionCommandTests.AsrResume_RecoversABatchThatWasFinalizedBeforeItsJobRowExisted`.
+- **A batch window that cannot be built does not stop the track (section 4).** An unreadable
+  capture chunk makes its window fail, but the builder records an explicit `asr.batch.failed`,
+  drops only that chunk, and retries the rest of the window, so one bad chunk cannot block later
+  windows and the pending window stays bounded by the batch window rather than by the number of
+  failures. Covered by
+  `tests/MeetCap.Asr.Tests/AsrBatchBuilderTests.ABatchWindowThatCannotBeMaterializedDoesNotBlockLaterWindows`
+  and `...RepeatedMaterializationFailureLeavesThePendingWindowBounded`.
 - **A closed chunk cannot be announced before it is durable (section 5).**
   `RecordingSession.ChunkClosed` is raised after the header patch, flush, validation and rename,
   and a subscriber's failure is reported as an explicit `capture.discontinuity` event instead of
-  reaching the recording. Covered by the batch-builder and recording-session suites.
+  reaching the recording: the announcement runs outside the block whose failure is classified as
+  a storage failure. Covered by
+  `tests/MeetCap.AudioPipeline.Tests/ChunkClosedSubscriberTests.cs`
+  (`RunAsync_AThrowingSubscriberCannotFailTheRecording` and
+  `RunAsync_AThrowingSubscriberDoesNotStopLaterChunksFromBeingClosed`).
 - **Audio capture is structurally independent of the ASR path (section 1).**
   `MeetCap.AudioPipeline` still references no ASR, cloud, HTTP or speaker assembly: the new
   hand-off is a Core-owned `ClosedAudioChunk` event. The direction of the new
-  `MeetCap.Asr -> MeetCap.AudioPipeline` reference is asserted by the existing
+  `MeetCap.Asr -> MeetCap.AudioPipeline` reference is asserted from the `MeetCap.Asr` side by
+  `tests/MeetCap.Asr.Tests/MeetCap.Asr.Tests.csproj`'s declared references plus
+  `tests/MeetCap.Asr.Tests/BatchReferenceDirectionTests.cs`; the opposite direction (a cycle)
+  is asserted by
   `tests/MeetCap.AudioPipeline.Tests/CaptureIndependenceTests.cs`.
 
 Known limits of this milestone, stated rather than implied:
@@ -257,9 +273,10 @@ Known limits of this milestone, stated rather than implied:
 - **No soak test has been run.** The issue's required validation — a two-hour offline meeting with
   ongoing five-minute batches, and a thirty-minute outage inside it — is exercised in CI against
   a scripted capture source and a scripted provider transport, not against a real microphone,
-  a real network outage, or the real Volcengine service. `docs/M1_WINDOWS_VALIDATION.md` is still
-  not run, and it does not yet hold an M4 checklist. This is automated coverage, not real-world
-  validation (`docs/DEVELOPMENT.md` section 7).
+  a real network outage, or the real Volcengine service. `docs/M1_WINDOWS_VALIDATION.md` holds the
+  M4 checklist as section 12 and it has **not been run**: the 12.2–12.4 and 12.6 rows additionally
+  need a real credential, which this environment does not have. This is automated coverage, not
+  real-world validation (`docs/DEVELOPMENT.md` section 7).
 - **A ten-minute-plus poll still ends a command.** `poll_timeout_seconds` (default 900) bounds how
   long one invocation polls a single job. A batch whose provider task runs longer leaves the job
   in `polling` with its state persisted, and the next `meetcap asr resume` continues it.

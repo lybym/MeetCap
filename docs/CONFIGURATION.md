@@ -183,6 +183,12 @@ M4 gives three of these keys a live-recording meaning, and adds no key of its ow
   backoff schedule. `meetcap asr resume --force` is the explicit way to bypass that schedule when
   the outage is known to be over.
 
+A batch window that cannot be built needs no key of its own either. An unreadable capture chunk
+is handled inside the batch builder: the window is recorded as `asr.batch.failed`, the offending
+chunk is dropped from it, and the rest of the window is retried, so the track keeps transcribing.
+`meetcap start`'s stop summary names the unreadable chunk count and the milliseconds that were
+never transcribed (`docs/ARCHITECTURE.md` section 10.2).
+
 ## 7.1 Media toolchain
 
 ```toml

@@ -39,6 +39,56 @@ public sealed class SessionArtifactPaths
 
     public string AsrBatchesDirectory => Path.Combine(SessionDirectory, "asr", "batches");
 
+    /// <summary>
+    /// Sessions under a data root whose <c>asr/batches/</c> surface holds at least one entry,
+    /// ordered by session id.
+    /// </summary>
+    /// <remarks>
+    /// Read from the artifact tree rather than from the database on purpose: the state this
+    /// answers for is a batch that was finalized before its job row existed, which the database
+    /// cannot describe (<c>docs/ARCHITECTURE.md</c> section 10.1).
+    /// </remarks>
+    public static IReadOnlyList<string> EnumerateSessionsWithBatchArtifacts(string dataRoot)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(dataRoot);
+
+        var sessionsRoot = Path.Combine(Path.GetFullPath(dataRoot), "sessions");
+        if (!Directory.Exists(sessionsRoot))
+        {
+            return Array.Empty<string>();
+        }
+
+        var sessions = new List<string>();
+        foreach (var directory in Directory.EnumerateDirectories(sessionsRoot))
+        {
+            var batches = Path.Combine(directory, "asr", "batches");
+            if (Directory.Exists(batches) && Directory.EnumerateFileSystemEntries(batches).Any())
+            {
+                sessions.Add(Path.GetFileName(directory));
+            }
+        }
+
+        sessions.Sort(StringComparer.Ordinal);
+        return sessions;
+    }
+
+    /// <summary>
+    /// Batch WAV artifacts under this session, as session-relative paths ordered by source then
+    /// batch number.
+    /// </summary>
+    /// <remarks>
+    /// A batch is named <c>batch-NNNNNN.wav</c>, so its order within the track is part of its
+    /// name and the listing does not depend on directory enumeration order.
+    /// </remarks>
+    public IReadOnlyList<string> BatchArtifacts() =>
+        !Directory.Exists(AsrBatchesDirectory)
+            ? Array.Empty<string>()
+            : Directory
+                .EnumerateFiles(AsrBatchesDirectory, "*.wav", SearchOption.AllDirectories)
+                .OrderBy(path => path, StringComparer.Ordinal)
+                .Select(ToRelative)
+                .ToArray();
+
     public string TranscriptDirectory => Path.Combine(SessionDirectory, "transcript");
 
     /// <summary>Mandatory normalized transcript (<c>docs/CONFIGURATION.md</c> section 10).</summary>

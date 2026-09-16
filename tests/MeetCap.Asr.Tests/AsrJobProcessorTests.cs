@@ -514,6 +514,64 @@ public class AsrJobProcessorTests : IDisposable
     }
 
     [Fact]
+    public async Task OutOfOrderCompletion_StillProducesTheTranscriptInJobOrderWithoutDuplicates()
+    {
+        // A later window can finish before an earlier one (different provider latency, a retry).
+        // `raw.jsonl` is rebuilt from every job's artifact in job order, so the transcript is
+        // ordered by the session timeline rather than by completion time, and finishing the
+        // earlier job afterwards replaces its contribution instead of appending it.
+        var first = CreateJob(jobId: "job_1");
+        var second = CreateJob(jobId: "job_2");
+        _jobs.Update(second with { CreatedAt = s_now.AddMinutes(1), UpdatedAt = s_now.AddMinutes(1) });
+
+        _normalizer.OnNormalize = (_, context) => new AsrNormalizationResult
+        {
+            Segments = new[]
+            {
+                new TranscriptSegment
+                {
+                    SegmentId = "seg_" + context.JobId,
+                    SessionId = context.SessionId,
+                    Source = context.Source,
+                    StartMs = context.JobId == "job_1" ? 0 : 300_000,
+                    EndMs = context.JobId == "job_1" ? 1000 : 301_000,
+                    RawText = context.JobId,
+                    ProviderJobId = context.JobId,
+                },
+            },
+            SpeakerInfoReturned = false,
+        };
+
+        // The later job completes first.
+        _provider.EnqueuePoll(Completed());
+        var processedSecond = await CreateProcessor().ProcessAsync(_jobs.Get("job_2")!);
+        Assert.Equal(AsrJobOutcome.Succeeded, processedSecond.Outcome);
+
+        var afterSecond = _transcripts.ReadJsonl(Paths.RawTranscriptJsonl);
+        Assert.Equal(new[] { "seg_job_2" }, afterSecond.Select(s => s.SegmentId));
+
+        // Then the earlier one.
+        _provider.EnqueuePoll(Completed());
+        var processedFirst = await CreateProcessor().ProcessAsync(_jobs.Get("job_1")!);
+        Assert.Equal(AsrJobOutcome.Succeeded, processedFirst.Outcome);
+
+        var segments = _transcripts.ReadJsonl(Paths.RawTranscriptJsonl);
+
+        // Job order, not completion order, and no duplicated contribution.
+        Assert.Equal(new[] { "seg_job_1", "seg_job_2" }, segments.Select(s => s.SegmentId));
+        Assert.Equal(new long[] { 0, 300_000 }, segments.Select(s => s.StartMs));
+
+        // Re-completing the earlier job again cannot duplicate its segments either.
+        _jobs.Update(_jobs.Get("job_1")! with { Status = AsrJobStatus.Polling, CompletedAt = null });
+        _provider.EnqueuePoll(Completed());
+        await CreateProcessor().ProcessAsync(_jobs.Get("job_1")!);
+
+        Assert.Equal(
+            new[] { "seg_job_1", "seg_job_2" },
+            _transcripts.ReadJsonl(Paths.RawTranscriptJsonl).Select(s => s.SegmentId));
+    }
+
+    [Fact]
     public async Task TerminalJobs_AreLeftAlone()
     {
         var job = CreateJob(AsrJobStatus.Succeeded);

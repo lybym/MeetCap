@@ -6,6 +6,36 @@ using MeetCap.Core.Capture;
 using MeetCap.Core.Sessions;
 
 /// <summary>
+/// A batch window could not be materialized, naming the source chunk that caused it.
+/// </summary>
+/// <remarks>
+/// The caller needs the identity of the offending chunk, not only the fact of the failure:
+/// dropping that one chunk is what lets the window's remaining audio still reach the provider
+/// while an unreadable chunk cannot block the track forever
+/// (<c>docs/ARCHITECTURE.md</c> section 10.2).
+/// </remarks>
+public sealed class AsrBatchMaterializationException : InvalidOperationException
+{
+    public AsrBatchMaterializationException(
+        string chunkPath,
+        string message,
+        Exception? innerException = null)
+        : base(message, innerException)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(chunkPath);
+        ChunkPath = chunkPath;
+    }
+
+    /// <summary>Session-relative path of the capture chunk that could not be read.</summary>
+    /// <remarks>
+    /// Named <c>ChunkPath</c> rather than <c>Source</c> so it does not shadow
+    /// <see cref="Exception.Source"/>, which describes the failing assembly rather than the
+    /// failing artifact.
+    /// </remarks>
+    public string ChunkPath { get; }
+}
+
+/// <summary>
 /// Materializes one ASR batch file from an ordered list of durable capture chunks.
 /// </summary>
 /// <remarks>
@@ -99,21 +129,25 @@ public static class WavBatchConcatenator
         {
             info = new FileInfo(source.FilePath);
         }
-        catch (IOException ex)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            throw new InvalidOperationException(
-                $"Capture chunk '{source.FilePath}' could not be inspected for a batch: {ex.Message}", ex);
+            throw new AsrBatchMaterializationException(
+                source.RelativePath,
+                $"Capture chunk '{source.FilePath}' could not be inspected for a batch: {ex.Message}",
+                ex);
         }
 
         if (!info.Exists)
         {
-            throw new InvalidOperationException(
+            throw new AsrBatchMaterializationException(
+                source.RelativePath,
                 $"Capture chunk '{source.FilePath}' is missing, so it cannot be included in a batch.");
         }
 
         if (info.Length < WavHeader.Size)
         {
-            throw new InvalidOperationException(
+            throw new AsrBatchMaterializationException(
+                source.RelativePath,
                 $"Capture chunk '{source.FilePath}' is {info.Length} bytes, shorter than a WAV header.");
         }
 
@@ -131,7 +165,8 @@ public static class WavBatchConcatenator
         var parsed = WavHeader.Parse(header);
         if (!parsed.IsValid || parsed.Format is null)
         {
-            throw new InvalidOperationException(
+            throw new AsrBatchMaterializationException(
+                source.RelativePath,
                 $"Capture chunk '{source.FilePath}' is not a readable WAV file: {parsed.Error}");
         }
 
@@ -140,15 +175,33 @@ public static class WavBatchConcatenator
             parsed.Format.BitsPerSample != writer.Format.BitsPerSample ||
             parsed.Format.SampleFormat != writer.Format.SampleFormat)
         {
-            throw new InvalidOperationException(
+            throw new AsrBatchMaterializationException(
+                source.RelativePath,
                 $"Capture chunk '{source.FilePath}' is '{parsed.Format}' but the batch is being written as " +
                 $"'{writer.Format}'. Mixing formats in one batch would change how the audio is decoded.");
         }
 
         var buffer = new byte[64 * 1024];
         int read;
-        while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+        while (true)
         {
+            try
+            {
+                read = stream.Read(buffer, 0, buffer.Length);
+            }
+            catch (IOException ex)
+            {
+                throw new AsrBatchMaterializationException(
+                    source.RelativePath,
+                    $"Capture chunk '{source.FilePath}' could not be read: {ex.Message}",
+                    ex);
+            }
+
+            if (read <= 0)
+            {
+                break;
+            }
+
             if (writer.Append(buffer.AsSpan(0, read)) != read)
             {
                 throw new InvalidOperationException(

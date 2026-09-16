@@ -50,6 +50,17 @@ public static class SessionEvents
     /// </summary>
     public const string AsrBatchDiscarded = "asr.batch.discarded";
 
+    /// <summary>
+    /// A batch window could not be materialized, so its audio never reached the provider.
+    /// </summary>
+    /// <remarks>
+    /// The capture chunks stay durable under <c>audio/</c> and the recording is unaffected —
+    /// this is a transcript-degradation record, not an audio-loss record — but the window has
+    /// to be named explicitly, because the alternative is a silence in the transcript that
+    /// nothing explains (<c>docs/RELIABILITY.md</c> section 2).
+    /// </remarks>
+    public const string AsrBatchFailed = "asr.batch.failed";
+
     public const string AsrJobQueued = "asr.job.queued";
     public const string AsrJobSubmitted = "asr.job.submitted";
     public const string AsrJobRetryWait = "asr.job.retry_wait";
