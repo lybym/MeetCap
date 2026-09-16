@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <RootNamespace>MeetCap.AudioPipeline</RootNamespace>
+    <AssemblyName>MeetCap.AudioPipeline</AssemblyName>
+    <PackageId>MeetCap.AudioPipeline</PackageId>
+    <Description>Media inspection and normalization behind the MeetCap.Core media abstraction, implemented with FFprobe/FFmpeg via FFMpegCore.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MeetCap.Core\MeetCap.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- #5 / docs/ARCHITECTURE.md section 13: FFMpegCore is the preferred .NET wrapper
+         for FFprobe/FFmpeg inspection and normalization. It stays inside this project. -->
+    <PackageReference Include="FFMpegCore" Version="5.4.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="MeetCap.AudioPipeline.Tests" />
+  </ItemGroup>
+
+</Project>

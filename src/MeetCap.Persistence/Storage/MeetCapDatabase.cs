@@ -1,34 +1,43 @@
 namespace MeetCap.Persistence.Storage;
 
+using MeetCap.Core.Asr;
+using MeetCap.Core.Sessions;
 using Microsoft.Data.Sqlite;
 
 /// <summary>
 /// Facade over the MeetCap SQLite database (<c>meetcap.db</c> under the configured
-/// data root). M0 only needs to bootstrap schema and answer "is a session active?";
-/// richer repositories arrive with later milestones.
+/// data root). Bootstraps the schema and exposes the repositories that index
+/// session and ASR job state.
 /// </summary>
 public sealed class MeetCapDatabase
 {
-    private readonly string _dbPath;
-
     public MeetCapDatabase(string dbPath)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(dbPath);
-        _dbPath = dbPath;
+        DatabasePath = dbPath;
     }
+
+    /// <summary>Absolute path of the SQLite database file.</summary>
+    public string DatabasePath { get; }
+
+    /// <summary>Sessions indexed by <c>MeetCap.Persistence</c> (docs/DATA_MODEL.md section 1).</summary>
+    public ISessionStore Sessions => new SqliteSessionStore(DatabasePath);
+
+    /// <summary>The persistent ASR job queue (docs/ARCHITECTURE.md section 12).</summary>
+    public IAsrJobStore AsrJobs => new SqliteAsrJobStore(DatabasePath);
 
     /// <summary>True when the database file exists and has been migrated at least once.</summary>
     public bool IsInitialized()
     {
-        if (!File.Exists(_dbPath))
+        if (!File.Exists(DatabasePath))
         {
             return false;
         }
 
         try
         {
-            using var conn = Open();
-            return TableExists(conn, "schema_migrations");
+            using var conn = SqliteConnectionFactory.Open(DatabasePath);
+            return SqliteConnectionFactory.TableExists(conn, "schema_migrations");
         }
         catch (SqliteException)
         {
@@ -37,7 +46,19 @@ public sealed class MeetCapDatabase
     }
 
     /// <summary>Creates the database and applies all pending migrations.</summary>
-    public void EnsureMigrated() => new SqliteMigrator().Migrate(_dbPath);
+    public void EnsureMigrated()
+    {
+        var dataRoot = Path.GetDirectoryName(DatabasePath);
+        if (!string.IsNullOrEmpty(dataRoot))
+        {
+            // The data root holds recordings, transcripts, and voiceprints. Mark it as
+            // private local data wherever it is, so the repository .gitignore no longer has
+            // to guess.
+            DataRootMarker.EnsureSelfIgnoring(dataRoot);
+        }
+
+        new SqliteMigrator().Migrate(DatabasePath);
+    }
 
     /// <summary>Count of sessions in a non-terminal state. Zero before any session exists.</summary>
     public int CountActiveSessions()
@@ -47,8 +68,8 @@ public sealed class MeetCapDatabase
             return 0;
         }
 
-        using var conn = Open();
-        if (!TableExists(conn, "sessions"))
+        using var conn = SqliteConnectionFactory.Open(DatabasePath);
+        if (!SqliteConnectionFactory.TableExists(conn, "sessions"))
         {
             return 0;
         }
@@ -56,29 +77,11 @@ public sealed class MeetCapDatabase
         using var cmd = new SqliteCommand(
             "SELECT COUNT(*) FROM sessions WHERE status IN (@s1, @s2, @s3, @s4)",
             conn);
-        cmd.Parameters.AddWithValue("@s1", "CREATED");
-        cmd.Parameters.AddWithValue("@s2", "RECORDING");
-        cmd.Parameters.AddWithValue("@s3", "FINALIZING");
-        cmd.Parameters.AddWithValue("@s4", "PROCESSING");
+        cmd.Parameters.AddWithValue("@s1", SessionStatus.Created);
+        cmd.Parameters.AddWithValue("@s2", SessionStatus.Recording);
+        cmd.Parameters.AddWithValue("@s3", SessionStatus.Finalizing);
+        cmd.Parameters.AddWithValue("@s4", SessionStatus.Processing);
         var result = cmd.ExecuteScalar();
         return result is long l ? (int)l : 0;
-    }
-
-    private SqliteConnection Open()
-    {
-        var cs = new SqliteConnectionStringBuilder { DataSource = _dbPath, Pooling = false }.ToString();
-        var conn = new SqliteConnection(cs);
-        conn.Open();
-        return conn;
-    }
-
-    private static bool TableExists(SqliteConnection conn, string name)
-    {
-        using var cmd = new SqliteCommand(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = @name",
-            conn);
-        cmd.Parameters.AddWithValue("@name", name);
-        var result = cmd.ExecuteScalar();
-        return result is long l && l > 0;
     }
 }

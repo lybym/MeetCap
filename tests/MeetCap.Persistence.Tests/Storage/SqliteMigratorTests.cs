@@ -87,21 +87,155 @@ public class SqliteMigratorTests
     }
 
     [Fact]
-    public void Migrate_RecordsVersionOne()
+    public void Migrate_RecordsEveryEmbeddedVersion()
     {
         var db = NewDb();
         try
         {
             new SqliteMigrator().Migrate(db);
             using var c = Open(db);
-            Assert.Equal(1, Count(c, "SELECT COUNT(*) FROM schema_migrations"));
-            Assert.Equal(1, Count(c, "SELECT version FROM schema_migrations"));
+            var expected = ExpectedVersions();
+            Assert.Equal(expected.Count, Count(c, "SELECT COUNT(*) FROM schema_migrations"));
+
+            using var cmd = new SqliteCommand("SELECT version FROM schema_migrations ORDER BY version", c);
+            var applied = new List<int>();
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                applied.Add(reader.GetInt32(0));
+            }
+
+            Assert.Equal(expected, applied);
         }
         finally
         {
             Cleanup(db);
         }
     }
+
+    [Fact]
+    public void Migrations_ClaimDistinctVersionNumbers()
+    {
+        // Two scripts sharing a version would make the second one look already applied,
+        // so its tables would never be created at runtime. This asserts the embedded set
+        // is well formed. Version 0002 is deliberately free because the M1 capture
+        // migration (issue #3, PR #12) claims it.
+        var versions = new SqliteMigrator().GetMigrations().Select(m => m.Version).ToArray();
+
+        Assert.Equal(versions.Length, versions.Distinct().Count());
+        Assert.Contains(1, versions);
+        Assert.Contains(3, versions);
+        Assert.DoesNotContain(2, versions);
+    }
+
+    [Fact]
+    public void ParseMigrations_OrdersByVersionAndIgnoresNonMigrationResources()
+    {
+        var migrations = SqliteMigrator.ParseMigrations(new[]
+        {
+            "MeetCap.Persistence.Storage.StorageMarker",
+            "MeetCap.Persistence.Migrations.0003_asr_jobs.sql",
+            "MeetCap.Persistence.Migrations.0001_sessions.sql",
+            "MeetCap.Persistence.Migrations.readme.md",
+        });
+
+        Assert.Equal(new[] { 1, 3 }, migrations.Select(m => m.Version));
+        Assert.Equal(
+            new[]
+            {
+                "MeetCap.Persistence.Migrations.0001_sessions.sql",
+                "MeetCap.Persistence.Migrations.0003_asr_jobs.sql",
+            },
+            migrations.Select(m => m.ResourceName));
+    }
+
+    [Fact]
+    public void ParseMigrations_ThrowsForAnUnnumberedMigrationInsteadOfDroppingIt()
+    {
+        // The silent-drop hole: a migration whose name carries no version used to be filtered
+        // out of the list entirely, so it was never applied and no error was raised.
+        var ex = Assert.Throws<InvalidOperationException>(() => SqliteMigrator.ParseMigrations(new[]
+        {
+            "MeetCap.Persistence.Migrations.0001_sessions.sql",
+            "MeetCap.Persistence.Migrations.asr_jobs.sql",
+        }));
+
+        Assert.Contains("MeetCap.Persistence.Migrations.asr_jobs.sql", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("no parseable version", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ParseMigrations_ThrowsForANameWhoseVersionSegmentHasNoLeadingDigits()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() => SqliteMigrator.ParseMigrations(new[]
+        {
+            "MeetCap.Persistence.Migrations.v0004_asr_jobs.sql",
+        }));
+
+        Assert.Contains("v0004_asr_jobs.sql", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ParseMigrations_ThrowsForTwoScriptsClaimingOneVersion()
+    {
+        // Drives the guard's throwing path directly, which the shipped embedded set cannot do.
+        var ex = Assert.Throws<InvalidOperationException>(() => SqliteMigrator.ParseMigrations(new[]
+        {
+            "MeetCap.Persistence.Migrations.0002_audio_chunks.sql",
+            "MeetCap.Persistence.Migrations.0002_asr_jobs.sql",
+        }));
+
+        Assert.Contains("Migration version 2 is claimed by more than one script", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("0002_audio_chunks.sql", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("0002_asr_jobs.sql", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void GetMigrations_NeverDropsAnEmbeddedSqlScript()
+    {
+        // Belt and braces: every embedded *.sql resource under Migrations must appear in the
+        // applied set. If this ever fails, a migration is silently not running.
+        var assembly = typeof(SqliteMigrator).Assembly;
+        var embedded = assembly.GetManifestResourceNames()
+            .Where(n => n.EndsWith(".sql", StringComparison.Ordinal)
+                && n.Contains("Migrations", StringComparison.Ordinal))
+            .OrderBy(n => n, StringComparer.Ordinal)
+            .ToArray();
+
+        var resolved = new SqliteMigrator().GetMigrations()
+            .Select(m => m.ResourceName)
+            .OrderBy(n => n, StringComparer.Ordinal)
+            .ToArray();
+
+        Assert.Equal(embedded, resolved);
+    }
+
+    [Fact]
+    public void Migrate_CreatesAsrJobsTableWithStatusCheckConstraint()
+    {
+        var db = NewDb();
+        try
+        {
+            new SqliteMigrator().Migrate(db);
+            using var c = Open(db);
+            Assert.True(TableExists(c, "asr_jobs"));
+
+            using var cmd = new SqliteCommand(
+                "INSERT INTO asr_jobs (id, session_id, source, tier, provider, input_artifact, status, " +
+                "provider_request_id, created_at, updated_at) " +
+                "VALUES ('job_1', 'ses_1', 'import', 'standard', 'volcengine', 'audio/import/a.wav', " +
+                "'not_a_status', 'req', @now, @now)", c);
+            cmd.Parameters.AddWithValue("@now", "2026-09-15T00:00:00Z");
+            Assert.ThrowsAny<SqliteException>(() => cmd.ExecuteNonQuery());
+        }
+        finally
+        {
+            Cleanup(db);
+        }
+    }
+
+    private static IReadOnlyList<int> ExpectedVersions() =>
+        new SqliteMigrator().GetMigrations().Select(m => m.Version).OrderBy(v => v).ToArray();
 
     [Fact]
     public void Migrate_IsIdempotent()
@@ -113,7 +247,7 @@ public class SqliteMigratorTests
             migrator.Migrate(db);
             migrator.Migrate(db); // must not throw or duplicate
             using var c = Open(db);
-            Assert.Equal(1, Count(c, "SELECT COUNT(*) FROM schema_migrations"));
+            Assert.Equal(ExpectedVersions().Count, Count(c, "SELECT COUNT(*) FROM schema_migrations"));
         }
         finally
         {
@@ -179,8 +313,8 @@ public class SqliteMigratorTests
             Assert.Empty(failures);
             using var c = Open(db);
             Assert.True(TableExists(c, "sessions"));
-            Assert.Equal(1, Count(c, "SELECT COUNT(*) FROM schema_migrations"));
-            Assert.Equal(1, Count(c, "SELECT version FROM schema_migrations"));
+            Assert.True(TableExists(c, "asr_jobs"));
+            Assert.Equal(ExpectedVersions().Count, Count(c, "SELECT COUNT(*) FROM schema_migrations"));
         }
         finally
         {
@@ -198,11 +332,11 @@ public class SqliteMigratorTests
             migrator.Migrate(db);
 
             // A second run stands in for a later process start: it must observe the
-            // already-applied version instead of failing on the primary key.
+            // already-applied versions instead of failing on the primary key.
             new SqliteMigrator().Migrate(db);
 
             using var c = Open(db);
-            Assert.Equal(1, Count(c, "SELECT COUNT(*) FROM schema_migrations"));
+            Assert.Equal(ExpectedVersions().Count, Count(c, "SELECT COUNT(*) FROM schema_migrations"));
         }
         finally
         {

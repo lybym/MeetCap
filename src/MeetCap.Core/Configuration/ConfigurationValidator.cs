@@ -68,6 +68,7 @@ public static class ConfigurationValidator
 
         ValidateCapture(config, result);
         ValidateStorage(config, result);
+        ValidateMedia(config, result);
         ValidateAsr(config, result);
         ValidateSpeakers(config, result);
         ValidateLogging(config, result);
@@ -118,6 +119,37 @@ public static class ConfigurationValidator
         }
     }
 
+    private static void ValidateMedia(MeetCapConfiguration config, ValidationResult result)
+    {
+        // Both keys are optional overrides; empty means "auto-detect". An absolute
+        // path is required when set so a relative value cannot silently resolve
+        // against whatever working directory the CLI happened to start in.
+        RequireAbsoluteOrEmpty(result, "media.ffmpeg_binary_folder", config.Media.FfmpegBinaryFolder);
+        RequireAbsoluteOrEmpty(result, "media.ffmpeg_temporary_folder", config.Media.FfmpegTemporaryFolder);
+    }
+
+    private static void RequireAbsoluteOrEmpty(ValidationResult result, string key, string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return;
+        }
+
+        if (value.StartsWith(CredentialResolverPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            // env: references are resolved by the consumer, not by validation.
+            return;
+        }
+
+        if (!Path.IsPathFullyQualified(value))
+        {
+            result.AddError(
+                $"{key}='{value}' must be an absolute path (or empty for auto-detection).");
+        }
+    }
+
+    private const string CredentialResolverPrefix = "env:";
+
     private static void ValidateAsr(MeetCapConfiguration config, ValidationResult result)
     {
         var asr = config.Asr;
@@ -142,6 +174,17 @@ public static class ConfigurationValidator
                 "asr.streaming_enabled is true while asr.strategy is 'file'; " +
                 "streaming is non-default and must not auto-fallback for failed file ASR.");
         }
+
+        var volcengine = asr.Volcengine;
+        if (volcengine.CostPerHourCny < 0)
+        {
+            result.AddError(
+                $"asr.volcengine.cost_per_hour_cny={volcengine.CostPerHourCny} must not be negative.");
+        }
+
+        RequirePositive(result, "asr.volcengine.poll_interval_seconds", volcengine.PollIntervalSeconds);
+        RequirePositive(result, "asr.volcengine.poll_timeout_seconds", volcengine.PollTimeoutSeconds);
+        RequirePositive(result, "asr.volcengine.http_timeout_seconds", volcengine.HttpTimeoutSeconds);
     }
 
     private static void ValidateSpeakers(MeetCapConfiguration config, ValidationResult result)

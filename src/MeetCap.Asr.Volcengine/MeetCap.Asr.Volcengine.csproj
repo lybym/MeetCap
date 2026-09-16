@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <RootNamespace>MeetCap.Asr.Volcengine</RootNamespace>
+    <AssemblyName>MeetCap.Asr.Volcengine</AssemblyName>
+    <PackageId>MeetCap.Asr.Volcengine</PackageId>
+    <Description>MeetCap Volcengine (BigASR recording-file) adapter. Every provider-specific JSON shape, endpoint, resource id, header, and status code lives here.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MeetCap.Core\MeetCap.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- #5 / docs/ARCHITECTURE.md sections 2 and 11: Polly is used ONLY for transient
+         HTTP execution concerns inside this provider adapter. It is never the
+         persistent ASR job queue (see MeetCap.Asr). -->
+    <PackageReference Include="Polly.Core" Version="8.8.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="MeetCap.Asr.Volcengine.Tests" />
+  </ItemGroup>
+
+</Project>

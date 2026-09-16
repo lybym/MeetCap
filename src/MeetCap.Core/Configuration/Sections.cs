@@ -52,6 +52,24 @@ public sealed class StorageSection
     public double MinimumFreeSpaceGb { get; set; } = 5;
 }
 
+/// <summary>
+/// External media toolchain location. FFmpeg/FFprobe are an external runtime
+/// dependency (<c>docs/ARCHITECTURE.md</c> section 2), so MeetCap resolves them from
+/// explicit configuration first and only then falls back to well-known install
+/// locations and finally to <c>PATH</c>.
+/// </summary>
+public sealed class MediaSection
+{
+    /// <summary>
+    /// Directory holding <c>ffmpeg.exe</c> and <c>ffprobe.exe</c>. Empty means
+    /// "auto-detect". May use the <c>env:</c> reference scheme.
+    /// </summary>
+    public string FfmpegBinaryFolder { get; set; } = string.Empty;
+
+    /// <summary>Optional working directory for FFmpeg temporary files. Empty means "auto-detect".</summary>
+    public string FfmpegTemporaryFolder { get; set; } = string.Empty;
+}
+
 public sealed class AsrSection
 {
     public bool Enabled { get; set; } = true;
@@ -89,6 +107,24 @@ public sealed class VolcengineSection
     /// stay anonymous session/provider-scoped data, never persistent identities.
     /// </summary>
     public bool RequestSpeakerInfo { get; set; } = true;
+
+    /// <summary>
+    /// Hourly rate in CNY used only to estimate per-job cost for local accounting.
+    /// Provider pricing is configuration, not a product guarantee.
+    /// </summary>
+    public double CostPerHourCny { get; set; } = 0.8;
+
+    /// <summary>Seconds between provider result queries while a job is polling.</summary>
+    public int PollIntervalSeconds { get; set; } = 5;
+
+    /// <summary>
+    /// Wall-clock budget for polling one job in a single command invocation. When it
+    /// expires the job stays persisted and resumable instead of being lost.
+    /// </summary>
+    public int PollTimeoutSeconds { get; set; } = 900;
+
+    /// <summary>Per-request HTTP timeout in seconds inside the provider adapter.</summary>
+    public int HttpTimeoutSeconds { get; set; } = 30;
 }
 
 /// <summary>

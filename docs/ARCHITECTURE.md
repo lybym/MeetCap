@@ -66,6 +66,11 @@ MeetCap MUST NOT reimplement raw COM/WASAPI plumbing that NAudio already provide
 
 FFmpeg binaries remain an external/runtime dependency whose distribution licensing must be reviewed separately from FFMpegCore.
 
+Their location is resolved from configuration first (`[media] ffmpeg_binary_folder`), then from
+well-known install locations, and only then from `PATH`. Nothing falls back to a bare `ffmpeg`
+command name, so a missing toolchain is reported before any capture or transcription work
+starts.
+
 ### Provider resilience
 
 - Polly for transient HTTP retry/backoff/timeout/circuit-breaker behavior inside provider adapters
@@ -119,7 +124,10 @@ src/
 tests/
   MeetCap.Core.Tests/
   MeetCap.Persistence.Tests/
+  MeetCap.Cli.Tests/
   MeetCap.AudioPipeline.Tests/
+  MeetCap.Asr.Tests/
+  MeetCap.Asr.Volcengine.Tests/
   MeetCap.IntegrationTests/
 ```
 
@@ -394,26 +402,48 @@ At session stop, the remaining partial ASR window is submitted.
 
 ## 11. ASR provider interface
 
-Conceptual interface:
+Implemented interface (`MeetCap.Core.Asr`):
 
 ```csharp
 public interface IAsrProvider
 {
+    string Name { get; }
+
     Task<AsrSubmission> SubmitFileAsync(
         AsrFileRequest request,
-        CancellationToken cancellationToken);
+        CancellationToken cancellationToken = default);
 
-    Task<AsrResult> GetResultAsync(
+    Task<AsrPollResult> GetResultAsync(
         AsrSubmission submission,
-        CancellationToken cancellationToken);
+        AsrFileRequest request,
+        CancellationToken cancellationToken = default);
+}
+
+public interface IAsrResponseNormalizer
+{
+    AsrNormalizationResult Normalize(string rawResponseJson, AsrNormalizationContext context);
 }
 ```
 
+`AsrPollResult` is one of `Pending`, `Completed`, `TaskNotFound`, or `Failed` with a
+transient/permanent classification, so the durable state machine — not the transport — decides
+what happens next.
+
+Normalization is a separate contract from the HTTP poll for one reason: the raw provider
+response is written to disk **before** it is parsed, so a parser fix never requires re-billing
+the same audio (section 14).
+
 Provider-specific concepts such as endpoint URL, resource ID, request headers, hotword identifiers, and speaker-info flags must remain inside `MeetCap.Asr.Volcengine`.
 
-The Volcengine provider should request anonymous speaker information where supported. Domain code consumes normalized `TranscriptSegment` objects and never assumes provider speaker IDs are persistent identities.
+The provider request id is supplied by the caller — the persistent job — instead of being
+generated per HTTP attempt. The same id is the provider's task identifier, so a retry after a
+process restart addresses the same task rather than creating a second billable one.
 
-Polly policies live inside the provider execution layer. Persistent retry state lives in the ASR job store.
+The Volcengine provider requests anonymous speaker information where supported. Domain code consumes normalized `TranscriptSegment` objects and never assumes provider speaker IDs are persistent identities.
+
+Polly policies live inside the provider execution layer and cover only transient HTTP
+execution: bounded retry with exponential backoff and jitter, plus a per-request timeout.
+Persistent retry state lives in the ASR job store.
 
 ---
 
@@ -437,6 +467,21 @@ cancelled
 A process restart MUST resume incomplete jobs.
 
 Do not replace this domain state machine with Hangfire, Quartz, or Polly.
+
+Every state change is persisted before the next side effect, so a process killed at any point
+resumes from the stored row rather than from memory. Recovery rules:
+
+```text
+submitting  -> submitted   # the provider request id was persisted before the request, so the
+                           # submission is treated as accepted and recovery polls instead of
+                           # re-submitting (re-submitting would risk paying twice)
+polling     -> polling     # continue querying the same provider task
+retry_wait  -> submitting  # only once the durable next_retry_at has passed
+```
+
+If the provider reports the task as unknown, the job falls back to `retry_wait` and is
+submitted again. `meetcap asr resume` is the restart entry point and processes every job whose
+durable state still needs work.
 
 Network unavailable:
 
@@ -635,7 +680,7 @@ The canonical runtime configuration is:
 
 Configuration is loaded through one configuration service implemented with Tomlyn behind MeetCap-owned configuration types.
 
-No component may read ad-hoc environment variables directly except the configuration/secret resolver.
+No component may read ad-hoc environment variables directly except the configuration/secret resolver. Configuration values that name an environment variable do so explicitly through the `env:NAME` reference scheme, which the resolver expands.
 
 ---
 
@@ -651,6 +696,7 @@ No component may read ad-hoc environment variables directly except the configura
       audio/
         mic/
         loopback/
+        import/
       asr/
         jobs/
         batches/
@@ -705,9 +751,61 @@ If ASR or speaker matching fails but audio is safe, the session MUST remain reco
 
 ## 21. Import architecture
 
-`meetcap import` creates a normal MeetCap session with `source_type=import`, materializes or links the source under the session artifact directory, inspects/normalizes it using the media abstraction, and queues file ASR.
+`meetcap import <file> --title <title>` creates a normal MeetCap session with
+`source_type=import`, materializes or links the source under the session artifact directory,
+inspects/normalizes it using the media abstraction, and queues file ASR.
+
+Implemented order of operations (M3):
+
+```text
+load + validate config                    # invalid configuration stops here
+resolve provider (app id + credential)    # invalid credentials stop here
+resolve FFmpeg/FFprobe
+migrate database (creates the data root and its private-data marker)
+inspect source with FFprobe               # an unusable file stops here, state-free
+create the session row (mode=import, source_type=import, status=PROCESSING)
+write session.json                        # the durable record, before any risky media work
+emit session.created
+copy source into audio/import/            # original is never modified
+rewrite session.json with the original artifact mapping; emit session.source.imported
+normalize into audio/import/normalized.wav  # only when the source is not already
+                                            # 16 kHz mono 16-bit PCM WAV
+re-inspect the normalized artifact
+rewrite session.json with the normalized artifact; emit session.media.normalized
+create the ASR job row (status=pending, provider_request_id already allocated)
+emit asr.job.queued
+drive the job: submit -> poll -> retain raw response -> normalize -> write
+  asr/jobs/<job-id>/request.json        # sanitized, no credentials, no inline audio
+  asr/jobs/<job-id>/response.json       # raw provider response, retained first
+  asr/jobs/<job-id>/normalized.jsonl
+  transcript/raw.jsonl                  # rebuilt from every job's normalized.jsonl, so
+                                        # re-completing a job cannot duplicate segments
+  transcript/live.md                    # Markdown transcript
+mark the job succeeded, then emit asr.job.completed
+mark the session COMPLETED once every job succeeded
+```
+
+Failure guarantees, stated precisely:
+
+- Configuration, credential, tier, toolchain, and source-not-found failures happen before
+  anything is created, so they leave no session state behind at all.
+- A failure after `inspect` (copying or normalizing) leaves a **visible, recoverable** session:
+  the row exists, `session.json` exists and reflects the artifacts materialized so far, and the
+  session stays in `PROCESSING`. Nothing is orphaned or silently completed.
+- A failed or interrupted ASR job leaves the session in `PROCESSING` so the audio stays
+  recoverable and `meetcap asr resume` can continue it.
+
+The per-job artifacts, not `transcript/raw.jsonl`, are the durable transcript source:
+`raw.jsonl` is derived by concatenating each job's `normalized.jsonl` in job order. That keeps
+the session transcript write idempotent, which is what makes the crash-and-resume path safe
+when a process dies between writing the transcript and persisting the terminal job status.
 
 Imported and recorded sessions therefore share the same transcript and speaker-identity pipeline.
+
+Because the only supported input is a single provider file request, an import that exceeds the
+provider's single-request or inline-upload limit fails with an actionable message instead of
+being silently split; split mapping with preserved timestamps remains a later concern
+(`ASR_STRATEGY.md` section 12).
 
 ---
 
@@ -720,6 +818,13 @@ Local by default:
 - speaker/name mappings;
 - transcripts;
 - SQLite database.
+
+The repository `.gitignore` only ignores `/sessions/` at the repository root, because an
+unanchored `sessions/` pattern also swallowed the `src/MeetCap.Core/Sessions` source folder. To
+keep private data private wherever the data root actually is, MeetCap drops a self-ignoring
+`.gitignore` (`*`) into the data root the first time it creates it. It never overwrites an
+existing `.gitignore`, and the marker is best effort: a read-only data root must not fail a
+command.
 
 Only configured ASR audio/batches are sent to the ASR provider.
 

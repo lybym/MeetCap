@@ -112,6 +112,24 @@ Polly SHOULD handle transient request execution concerns such as exponential bac
 
 The persistent SQLite ASR job state machine remains authoritative across process restarts. Polly does not replace it.
 
+Implemented division of responsibility (M3):
+
+```text
+Polly (inside MeetCap.Asr.Volcengine)
+  bounded in-process retry with exponential backoff + jitter
+  per-request timeout
+  one provider request id across attempts, so a retry addresses the same task
+
+asr_jobs (MeetCap-owned SQLite state)
+  attempt_count, next_retry_at, status, provider_request_id, error_code/error_message
+  resume across process restart via `meetcap asr resume`
+```
+
+A job left in `submitting` by a killed process is treated as accepted and resumed by polling,
+because the provider request id was persisted before the request was sent. Re-submitting would
+risk paying twice for the same audio. If the provider reports the task as unknown, the job
+falls back to `retry_wait` and is submitted again.
+
 ## 7. No automatic streaming fallback
 
 Forbidden:
@@ -192,6 +210,24 @@ Imported media should prefer one provider file request when within provider limi
 
 Media inspection/normalization should be implemented through the `MeetCap.AudioPipeline` abstraction using FFprobe/FFmpeg, preferably via FFMpegCore in the .NET implementation.
 
+Implemented (M3):
+
+```text
+inspect  -> FFprobe via FFMpegCore (MeetCap.AudioPipeline.FFmpegMediaPipeline)
+plan     -> MeetCap.Core.Media.MediaNormalizationPlanner (pure policy, unit tested)
+normalize only when the source is not already 16 kHz mono 16-bit PCM WAV
+target   -> wav / pcm_s16le / 16000 Hz / 1 channel
+verify   -> the normalized artifact is re-inspected before it is submitted
+```
+
+The source file is copied into `audio/import/` and never modified in place; the original and
+normalized artifacts are both recorded in `session.json`. A source that is already in the
+target shape is submitted unchanged, so MeetCap never re-encodes audio it does not have to.
+
+The current implementation submits one provider file request per import and does not split
+oversized inputs: exceeding the provider's single-request or inline-upload limit fails with an
+actionable message. Split mapping with preserved original timestamps remains a later concern.
+
 ## 13. Observability
 
 For every ASR job record:
@@ -207,5 +243,11 @@ For every ASR job record:
 - whether speaker info was requested/returned;
 - estimated cost;
 - raw response path.
+
+Implemented columns in `asr_jobs` (M3): `provider`, `tier`, `source`, `duration_ms`,
+`submitted_at`, `completed_at`, `attempt_count`, `provider_request_id`, `error_code`,
+`error_message`, `speaker_info_requested`, `speaker_info_returned`, `estimated_cost_cny`,
+`raw_response_path`, `normalized_result_path`, `request_metadata_path`. A terminal job also
+emits an `asr.job.completed` or `asr.job.failed` record in `events.jsonl`.
 
 Never log credentials.

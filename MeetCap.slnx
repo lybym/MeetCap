@@ -1,12 +1,19 @@
 <Solution>
   <Folder Name="/src/">
+    <Project Path="src/MeetCap.Asr/MeetCap.Asr.csproj" />
+    <Project Path="src/MeetCap.Asr.Volcengine/MeetCap.Asr.Volcengine.csproj" />
+    <Project Path="src/MeetCap.AudioPipeline/MeetCap.AudioPipeline.csproj" />
     <Project Path="src/MeetCap.Cli/MeetCap.Cli.csproj" />
     <Project Path="src/MeetCap.Core/MeetCap.Core.csproj" />
     <Project Path="src/MeetCap.Persistence/MeetCap.Persistence.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/MeetCap.Asr.Tests/MeetCap.Asr.Tests.csproj" />
+    <Project Path="tests/MeetCap.Asr.Volcengine.Tests/MeetCap.Asr.Volcengine.Tests.csproj" />
+    <Project Path="tests/MeetCap.AudioPipeline.Tests/MeetCap.AudioPipeline.Tests.csproj" />
     <Project Path="tests/MeetCap.Cli.Tests/MeetCap.Cli.Tests.csproj" />
     <Project Path="tests/MeetCap.Core.Tests/MeetCap.Core.Tests.csproj" />
+    <Project Path="tests/MeetCap.IntegrationTests/MeetCap.IntegrationTests.csproj" />
     <Project Path="tests/MeetCap.Persistence.Tests/MeetCap.Persistence.Tests.csproj" />
   </Folder>
 </Solution>

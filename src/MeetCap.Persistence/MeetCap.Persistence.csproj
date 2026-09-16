@@ -22,4 +22,9 @@
     <PackageReference Include="Tomlyn" Version="2.10.1" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Lets the migration tests assert the embedded migration set directly. -->
+    <InternalsVisibleTo Include="MeetCap.Persistence.Tests" />
+  </ItemGroup>
+
 </Project>
