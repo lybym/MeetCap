@@ -21,7 +21,8 @@ internal static class CommandTree
         TextWriter output,
         TextWriter error,
         CliEnvironment? environment = null,
-        ICapturePlatformFactory? platformFactory = null)
+        ICapturePlatformFactory? platformFactory = null,
+        HttpMessageHandler? asrHttpHandler = null)
     {
         ArgumentNullException.ThrowIfNull(secrets);
         ArgumentNullException.ThrowIfNull(loggerFactory);
@@ -34,10 +35,10 @@ internal static class CommandTree
         root.Options.Add(GlobalOptions.DataRoot);
 
         var configCommand = new Command("config", "Inspect and initialize MeetCap configuration.");
-        configCommand.Subcommands.Add(BuildConfigInit(secrets, loggerFactory, storeFactory, output, error, environment, platformFactory));
-        configCommand.Subcommands.Add(BuildConfigPath(secrets, loggerFactory, storeFactory, output, error, environment, platformFactory));
-        configCommand.Subcommands.Add(BuildConfigValidate(secrets, loggerFactory, storeFactory, output, error, environment, platformFactory));
-        configCommand.Subcommands.Add(BuildConfigShow(secrets, loggerFactory, storeFactory, output, error, environment, platformFactory));
+        configCommand.Subcommands.Add(BuildConfigInit(secrets, loggerFactory, storeFactory, output, error, environment, platformFactory, asrHttpHandler));
+        configCommand.Subcommands.Add(BuildConfigPath(secrets, loggerFactory, storeFactory, output, error, environment, platformFactory, asrHttpHandler));
+        configCommand.Subcommands.Add(BuildConfigValidate(secrets, loggerFactory, storeFactory, output, error, environment, platformFactory, asrHttpHandler));
+        configCommand.Subcommands.Add(BuildConfigShow(secrets, loggerFactory, storeFactory, output, error, environment, platformFactory, asrHttpHandler));
 
         var statusCommand = new Command(
             "status",
@@ -62,9 +63,9 @@ internal static class CommandTree
 
         var stopCommand = new Command("stop", "Stop the recording session that is currently running.");
 
-        var importCommand = BuildImport(secrets, loggerFactory, storeFactory, output, error, environment);
-        var asrCommand = BuildAsr(secrets, loggerFactory, storeFactory, output, error, environment);
-        var sessionCommand = BuildSession(secrets, loggerFactory, storeFactory, output, error, environment, platformFactory);
+        var importCommand = BuildImport(secrets, loggerFactory, storeFactory, output, error, environment, asrHttpHandler);
+        var asrCommand = BuildAsr(secrets, loggerFactory, storeFactory, output, error, environment, asrHttpHandler);
+        var sessionCommand = BuildSession(secrets, loggerFactory, storeFactory, output, error, environment, platformFactory, asrHttpHandler);
 
         root.Subcommands.Add(configCommand);
         root.Subcommands.Add(statusCommand);
@@ -80,16 +81,16 @@ internal static class CommandTree
         asrCommand.SetAction(parseResult => RequireSubcommand(parseResult, asrCommand, error));
         sessionCommand.SetAction(parseResult => RequireSubcommand(parseResult, sessionCommand, error));
         statusCommand.SetAction((parseResult, _) =>
-            StatusCommand.Run(CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory)));
+            StatusCommand.Run(CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory, asrHttpHandler)));
         devicesCommand.SetAction((parseResult, _) =>
-            DevicesCommand.Run(CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory)));
+            DevicesCommand.Run(CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory, asrHttpHandler)));
         startCommand.SetAction((parseResult, _) =>
             StartCommand.Run(
-                CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory),
+                CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory, asrHttpHandler),
                 parseResult.GetValue(titleArgument),
                 parseResult.GetValue(modeOption)));
         stopCommand.SetAction((parseResult, _) =>
-            StopCommand.Run(CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory)));
+            StopCommand.Run(CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory, asrHttpHandler)));
 
         return root;
     }
@@ -103,7 +104,8 @@ internal static class CommandTree
         Func<string, IConfigurationStore> storeFactory,
         TextWriter output,
         TextWriter error,
-        CliEnvironment? environment)
+        CliEnvironment? environment,
+        HttpMessageHandler? asrHttpHandler)
     {
         var file = new Argument<string>("file")
         {
@@ -126,7 +128,16 @@ internal static class CommandTree
         command.Options.Add(tier);
         command.SetAction((parseResult, cancellationToken) =>
         {
-            var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment);
+            var context = CreateContext(
+                parseResult,
+                secrets,
+                loggerFactory,
+                storeFactory,
+                output,
+                error,
+                environment,
+                platformFactory: null,
+                asrHttpHandler);
             return ImportCommand.RunAsync(
                 context,
                 parseResult.GetValue(file) ?? string.Empty,
@@ -145,7 +156,8 @@ internal static class CommandTree
         Func<string, IConfigurationStore> storeFactory,
         TextWriter output,
         TextWriter error,
-        CliEnvironment? environment)
+        CliEnvironment? environment,
+        HttpMessageHandler? asrHttpHandler)
     {
         var session = new Option<string?>("--session", "-s")
         {
@@ -157,18 +169,36 @@ internal static class CommandTree
             Description = "Maximum number of jobs to process in this invocation (default 100).",
         };
 
+        var force = new Option<bool>("--force", "-f")
+        {
+            Description =
+                "Process jobs waiting out their durable retry backoff now, for when the reason for the " +
+                "backoff (for example a lost network) is known to be over.",
+        };
+
         var resume = new Command(
             "resume",
             "Resume pending/retry-wait ASR jobs, including work left behind by a killed process.");
         resume.Options.Add(session);
         resume.Options.Add(maxJobs);
+        resume.Options.Add(force);
         resume.SetAction((parseResult, cancellationToken) =>
         {
-            var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment);
+            var context = CreateContext(
+                parseResult,
+                secrets,
+                loggerFactory,
+                storeFactory,
+                output,
+                error,
+                environment,
+                platformFactory: null,
+                asrHttpHandler);
             return AsrCommand.ResumeAsync(
                 context,
                 parseResult.GetValue(session),
                 parseResult.GetValue(maxJobs) ?? 100,
+                parseResult.GetValue(force),
                 cancellationToken);
         });
 
@@ -185,7 +215,8 @@ internal static class CommandTree
         TextWriter output,
         TextWriter error,
         CliEnvironment? environment,
-        ICapturePlatformFactory? platformFactory)
+        ICapturePlatformFactory? platformFactory,
+        HttpMessageHandler? asrHttpHandler)
     {
         var session = new Option<string?>("--session", "-s")
         {
@@ -197,7 +228,7 @@ internal static class CommandTree
             "Repair and audit recording sessions left behind by a killed process.");
         repair.Options.Add(session);
         repair.SetAction((parseResult, _) => SessionCommand.RepairAsync(
-            CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory),
+            CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory, asrHttpHandler),
             parseResult.GetValue(session)));
 
         var command = new Command("session", "Repair and audit recorded sessions.");
@@ -212,7 +243,8 @@ internal static class CommandTree
         TextWriter output,
         TextWriter error,
         CliEnvironment? environment,
-        ICapturePlatformFactory? platformFactory)
+        ICapturePlatformFactory? platformFactory,
+        HttpMessageHandler? asrHttpHandler)
     {
         var force = new Option<bool>("--force", "-f")
         {
@@ -223,7 +255,7 @@ internal static class CommandTree
         command.Options.Add(force);
         command.SetAction(parseResult =>
         {
-            var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory);
+            var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory, asrHttpHandler);
             return ConfigCommand.Init(context, context.ConfigurationStore, parseResult.GetValue(force));
         });
         return command;
@@ -236,12 +268,13 @@ internal static class CommandTree
         TextWriter output,
         TextWriter error,
         CliEnvironment? environment,
-        ICapturePlatformFactory? platformFactory)
+        ICapturePlatformFactory? platformFactory,
+        HttpMessageHandler? asrHttpHandler)
     {
         var command = new Command("path", "Print the config.toml path.");
         command.SetAction(parseResult =>
         {
-            var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory);
+            var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory, asrHttpHandler);
             return ConfigCommand.PrintPath(context, context.ConfigurationStore);
         });
         return command;
@@ -254,12 +287,13 @@ internal static class CommandTree
         TextWriter output,
         TextWriter error,
         CliEnvironment? environment,
-        ICapturePlatformFactory? platformFactory)
+        ICapturePlatformFactory? platformFactory,
+        HttpMessageHandler? asrHttpHandler)
     {
         var command = new Command("validate", "Validate config.toml keys and values.");
         command.SetAction(parseResult =>
         {
-            var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory);
+            var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory, asrHttpHandler);
             return ConfigCommand.Validate(context, context.ConfigurationStore);
         });
         return command;
@@ -272,12 +306,13 @@ internal static class CommandTree
         TextWriter output,
         TextWriter error,
         CliEnvironment? environment,
-        ICapturePlatformFactory? platformFactory)
+        ICapturePlatformFactory? platformFactory,
+        HttpMessageHandler? asrHttpHandler)
     {
         var command = new Command("show", "Print the effective configuration with secrets redacted.");
         command.SetAction(parseResult =>
         {
-            var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory);
+            var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory, asrHttpHandler);
             return ConfigCommand.Show(context, context.ConfigurationStore);
         });
         return command;
@@ -291,8 +326,9 @@ internal static class CommandTree
         TextWriter output,
         TextWriter error,
         CliEnvironment? environment = null,
-        ICapturePlatformFactory? platformFactory = null)
-        => new(parseResult, output, error, storeFactory, secrets, loggerFactory, environment, platformFactory);
+        ICapturePlatformFactory? platformFactory = null,
+        HttpMessageHandler? asrHttpHandler = null)
+        => new(parseResult, output, error, storeFactory, secrets, loggerFactory, environment, platformFactory, asrHttpHandler);
 
     /// <summary>
     /// Error action for <c>meetcap</c> without a verb. Mirrors the documented usage

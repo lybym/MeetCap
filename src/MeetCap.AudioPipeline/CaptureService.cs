@@ -296,7 +296,7 @@ public sealed class CaptureService
             Thread.Sleep(StopPollInterval);
 
             var current = _database.Sessions.Find(active.SessionId);
-            if (current is null || !SessionStatus.IsActive(current.Status))
+            if (current is null || !SessionStatus.IsRecordingOwned(current.Status))
             {
                 return new StopRequestOutcome(true, active.SessionId, "recording stopped", true);
             }

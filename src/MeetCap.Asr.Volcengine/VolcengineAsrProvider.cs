@@ -220,9 +220,29 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
         int? sequence,
         CancellationToken cancellationToken)
     {
-        return await _pipeline.ExecuteAsync(
-            async token => await SendOnceAsync(path, body, requestId, sequence, token).ConfigureAwait(false),
-            cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await _pipeline.ExecuteAsync(
+                async token => await SendOnceAsync(path, body, requestId, sequence, token).ConfigureAwait(false),
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (
+            ex is (HttpRequestException or TimeoutRejectedException or TaskCanceledException)
+                && !cancellationToken.IsCancellationRequested)
+        {
+            // The Polly pipeline retries transport failures and then rethrows the original
+            // exception, which is an implementation detail of the HTTP stack. The domain side
+            // must see the adapter's own classification — "this request failed and may succeed
+            // later" — or a lost network would surface as an unhandled exception instead of a
+            // durable `retry_wait` job (docs/RELIABILITY.md section 9).
+            throw new AsrTransientException(
+                "http.unreachable",
+                Scrub(
+                    $"Provider '{Name}' could not be reached for {path} after " +
+                    $"{_options.MaxTransientAttempts} attempt(s): {ex.Message} " +
+                    "The job keeps its durable state and is retried when the provider is reachable."),
+                ex);
+        }
     }
 
     private async Task<VolcengineResponse> SendOnceAsync(

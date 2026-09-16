@@ -75,8 +75,40 @@ public sealed class VolcengineResponseNormalizer : IAsrResponseNormalizer
                 return Empty();
             }
 
-            return ReadResult(result, context);
+            return Offset(ReadResult(result, context), context);
         }
+    }
+
+    /// <summary>
+    /// Moves provider-relative timestamps onto the session timeline.
+    /// </summary>
+    /// <remarks>
+    /// The provider reports <c>start_time</c> / <c>end_time</c> relative to the audio it was
+    /// given. An imported file starts at zero, but a live ASR batch is one window of a
+    /// longer recording, so without this shift every batch after the first would place its
+    /// segments at the start of the meeting (<c>docs/DATA_MODEL.md</c> section 6). Only the
+    /// timestamps move: the raw response is already retained unchanged, and
+    /// <see cref="TranscriptSegment.RawText"/> is never rewritten.
+    /// </remarks>
+    private static AsrNormalizationResult Offset(AsrNormalizationResult result, AsrNormalizationContext context)
+    {
+        if (context.StartOffsetMs == 0 || result.Segments.Count == 0)
+        {
+            return result;
+        }
+
+        var offset = context.StartOffsetMs;
+        var shifted = new List<TranscriptSegment>(result.Segments.Count);
+        foreach (var segment in result.Segments)
+        {
+            shifted.Add(segment with
+            {
+                StartMs = segment.StartMs + offset,
+                EndMs = segment.EndMs + offset,
+            });
+        }
+
+        return result with { Segments = shifted };
     }
 
     private static AsrNormalizationResult ReadResult(JsonElement result, AsrNormalizationContext context)

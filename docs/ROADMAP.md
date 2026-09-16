@@ -272,6 +272,51 @@ A 2-hour offline meeting produces transcript updates during the meeting while al
 
 Disabling the network for 30 minutes does not affect audio capture and queued batches complete after recovery.
 
+## Implementation status
+
+Implemented (issue #6):
+
+- `MeetCap.Asr.Batching.AsrBatchBuilder`: groups durably closed capture chunks per source until
+  the window covers `asr.file_batch_seconds` (default 300 s, independent of
+  `capture.chunk_seconds`), materializes a real batch WAV plus its timeline manifest under
+  `asr/batches/<source>/`, and only then queues the persistent job. `FlushPendingBatches` closes
+  the remaining partial window at stop, and `RecoverFinalizedBatches` re-queues a finalized batch
+  whose job row is missing and discards an unfinished `.part`;
+- `MeetCap.Asr.LiveTranscription`: the background drain that submits and polls while the meeting
+  runs, plus the stop-time flush and drain, serialized against the background loop;
+- `RecordingSession.ChunkClosed` / `MeetCap.Core.Sessions.ClosedAudioChunk`: the durable-chunk
+  hand-off, raised on the recording consumer thread after the chunk is validated and renamed;
+- session-timeline offsets: a batch's provider timestamps are moved onto the session timeline by
+  the batch's stored start position (`AsrFileRequest.StartOffsetMs`,
+  `AsrNormalizationContext.StartOffsetMs`);
+- `meetcap start` wiring: the ASR stack is built before the session exists, live batching is
+  attached only when `asr.enabled = true`, the session goes `FINALIZING -> PROCESSING` on a clean
+  stop and `COMPLETED` when its queue is terminal;
+- `meetcap asr resume --force`: process jobs whose durable retry backoff has not come due yet,
+  for an operator who knows the outage is over;
+- `meetcap status`: `asr:`, `asr queue:` and `asr state: behind` lines, so queue depth and
+  degraded transcription state are visible without reading SQLite;
+- `transcript/raw.jsonl` and `transcript/live.md` advance during the meeting, rebuilt from each
+  job's retained `normalized.jsonl` so re-completing a job cannot duplicate segments;
+- the provider adapter classifies its own transport failures, so a lost network reaches the
+  durable job state machine as a retryable failure instead of an unhandled exception.
+
+No SQLite schema change: the batch is an artifact plus a manifest, and the M3 `asr_jobs` columns
+already carry the batch path and its timeline position.
+
+Not implemented in this milestone, and deliberately out of scope:
+
+- streaming ASR of any kind, and any automatic streaming fallback (see M8);
+- loopback capture and dual-track batching (M5);
+- speaker identity matching, and any second diarization engine (M6/#8);
+- LLM correction or summary (M9);
+- deleting the intermediate batch WAV after its job succeeds.
+
+Real-world validation has not been performed: the exit criteria above were exercised in CI
+against a scripted capture source and a scripted provider transport, so the two-hour meeting and
+the thirty-minute outage are automated coverage, not a measured soak. See
+`docs/RELIABILITY.md` section 15.
+
 ---
 
 # M5 - Online meeting dual-track capture

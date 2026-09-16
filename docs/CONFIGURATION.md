@@ -166,6 +166,23 @@ turbo      not implemented (the flash/single-shot endpoint is a different protoc
 Selecting `turbo` fails with an actionable error rather than being silently mapped onto the
 submit/query flow.
 
+M4 gives three of these keys a live-recording meaning, and adds no key of its own:
+
+- `asr.enabled = false` is the supported way to record without a transcript. `meetcap start`
+  skips the ASR stack entirely, so no provider or credential is needed; the recording, the chunk
+  spool, and recovery are unaffected. With `enabled = true` the provider is built *before* the
+  session exists, so an empty `app_id` or an unresolvable credential fails visibly and leaves no
+  half-written session behind;
+- `file_batch_seconds` is the live batch window (default 300 s). It is independent of
+  `capture.chunk_seconds`: chunks are the durability unit and batches are the provider context
+  unit. The window closes on captured audio time, so a batch that covers a device outage declares
+  a longer span than the audio inside it and its `batch-NNNNNN.json` manifest states where each
+  chunk really sits (`docs/DATA_MODEL.md` section 6.1);
+- the retry keys pace the queue. A job in `retry_wait` is only eligible once its own durable
+  `next_retry_at` has passed, so a network outage does not burn attempts: the queue resumes on the
+  backoff schedule. `meetcap asr resume --force` is the explicit way to bypass that schedule when
+  the outage is known to be over.
+
 ## 7.1 Media toolchain
 
 ```toml

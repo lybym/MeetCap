@@ -41,7 +41,8 @@ internal sealed class CliContext
         SecretRegistry secrets,
         ILoggerFactory loggerFactory,
         CliEnvironment? environment = null,
-        ICapturePlatformFactory? platformFactory = null)
+        ICapturePlatformFactory? platformFactory = null,
+        HttpMessageHandler? asrHttpHandler = null)
     {
         _parseResult = parseResult ?? throw new ArgumentNullException(nameof(parseResult));
         Out = output ?? throw new ArgumentNullException(nameof(output));
@@ -51,7 +52,19 @@ internal sealed class CliContext
         LoggerFactory = loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory));
         _environment = environment ?? CliEnvironment.Instance;
         _platformFactory = platformFactory ?? NAudioCapturePlatformFactory.Instance;
+        AsrHttpHandler = asrHttpHandler;
     }
+
+    /// <summary>
+    /// Optional HTTP handler for the ASR provider adapter.
+    /// </summary>
+    /// <remarks>
+    /// A test harness substitutes the provider's transport here, so the command composition,
+    /// the job queue, the transcript writer, and the Volcengine adapter all stay the shipped
+    /// ones and only the network boundary is replaced
+    /// (<c>docs/DEVELOPMENT.md</c> section 7). Production passes <c>null</c>.
+    /// </remarks>
+    public HttpMessageHandler? AsrHttpHandler { get; }
 
     /// <summary>Logger category used by every command handler.</summary>
     public const string LoggerCategory = "MeetCap";
@@ -119,6 +132,31 @@ internal sealed class CliContext
 
     /// <summary>The capture platform for this invocation.</summary>
     public CapturePlatform CreateCapturePlatform() => _platformFactory.Create();
+
+    /// <summary>
+    /// Builds the ASR stack for this invocation through <see cref="AsrHostFactory"/>.
+    /// </summary>
+    /// <remarks>
+    /// A test harness installs its own <see cref="AsrHostFactory"/> to substitute the
+    /// provider boundary, so the recording composition stays production code
+    /// (<c>docs/DEVELOPMENT.md</c> section 7).
+    /// </remarks>
+    public bool TryCreateAsrHost(
+        MeetCapConfiguration configuration,
+        string dataRoot,
+        out Commands.ILiveAsrHost? host,
+        out int exitCode)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+        ArgumentException.ThrowIfNullOrWhiteSpace(dataRoot);
+        return AsrHostFactory(this, configuration, dataRoot, out host, out exitCode);
+    }
+
+    /// <summary>
+    /// The ASR stack factory for this invocation. Defaults to the production
+    /// <see cref="Commands.AsrHostFactory.Create"/>.
+    /// </summary>
+    internal Commands.LiveAsrHostFactory AsrHostFactory { get; set; } = Commands.AsrHostFactory.Create;
 
     /// <summary>
     /// Creates the capture service for a session: it migrates the database first, so

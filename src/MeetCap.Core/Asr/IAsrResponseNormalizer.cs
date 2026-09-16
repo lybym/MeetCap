@@ -24,6 +24,17 @@ public sealed record AsrNormalizationContext
     public required string JobId { get; init; }
 
     public required string Source { get; init; }
+
+    /// <summary>
+    /// Session-relative position of the submitted audio's first frame, in milliseconds.
+    /// </summary>
+    /// <remarks>
+    /// Provider timestamps are relative to the submitted file. A live ASR batch is a window
+    /// into a longer session, so its segments are only in session coordinates once this
+    /// offset is applied. Zero for a whole-session artifact such as an import
+    /// (<c>docs/DATA_MODEL.md</c> section 6).
+    /// </remarks>
+    public long StartOffsetMs { get; init; }
 }
 
 /// <summary>Normalized segments plus what the provider actually returned.</summary>

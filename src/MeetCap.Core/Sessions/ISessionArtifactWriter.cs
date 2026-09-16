@@ -36,6 +36,20 @@ public static class SessionEvents
     public const string SessionCompleted = "session.completed";
     public const string SourceImported = "session.source.imported";
     public const string MediaNormalized = "session.media.normalized";
+
+    /// <summary>
+    /// A closed chunk was materialized into a durable ASR batch artifact
+    /// (<c>docs/ROADMAP.md</c> M4). Emitted before
+    /// <see cref="AsrJobQueued"/>, because the durable batch is what the job names.
+    /// </summary>
+    public const string AsrBatchClosed = "asr.batch.closed";
+
+    /// <summary>
+    /// An unfinished batch <c>.part</c> file was discarded during recovery. Its capture
+    /// chunks remain durable, so this is a lost batch window, not lost audio.
+    /// </summary>
+    public const string AsrBatchDiscarded = "asr.batch.discarded";
+
     public const string AsrJobQueued = "asr.job.queued";
     public const string AsrJobSubmitted = "asr.job.submitted";
     public const string AsrJobRetryWait = "asr.job.retry_wait";

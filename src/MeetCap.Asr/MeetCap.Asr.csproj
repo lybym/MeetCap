@@ -10,6 +10,11 @@
 
   <ItemGroup>
     <ProjectReference Include="..\MeetCap.Core\MeetCap.Core.csproj" />
+    <!-- M4 (docs/ARCHITECTURE.md section 10): live transcription batches durable capture
+         chunks, so this project consumes the recording artifact contract. The dependency
+         points this way only; MeetCap.AudioPipeline must never reach the ASR stack
+         (tests/MeetCap.AudioPipeline.Tests/CaptureIndependenceTests.cs). -->
+    <ProjectReference Include="..\MeetCap.AudioPipeline\MeetCap.AudioPipeline.csproj" />
   </ItemGroup>
 
   <ItemGroup>

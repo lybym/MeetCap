@@ -84,6 +84,13 @@ public sealed class AsrJobProcessor
     private const string NormalizationErrorCode = "asr.normalization_failed";
     private const string TaskNotFoundErrorCode = "provider.task_not_found";
 
+    /// <summary>
+    /// Upper bound on the submit/poll passes one drain performs for a single job. Reaching it
+    /// is impossible for a healthy provider (one pass submits, the next polls) and would only
+    /// mean a store that keeps reporting a non-terminal status for a job nothing can advance.
+    /// </summary>
+    private const int MaxPassesPerJob = 4;
+
     private static readonly UTF8Encoding s_utf8 = new(encoderShouldEmitUTF8Identifier: false);
 
     private readonly IAsrJobStore _jobs;
@@ -93,6 +100,12 @@ public sealed class AsrJobProcessor
     private readonly ISessionStore _sessions;
     private readonly ISessionArtifactWriter _artifacts;
     private readonly AsrJobProcessorOptions _options;
+
+    /// <summary>
+    /// Latched by <see cref="RunDueAsync"/> when a submit failed because the provider could not
+    /// be reached, and cleared as soon as a drain gets through again.
+    /// </summary>
+    private bool _providerUnreachable;
 
     public AsrJobProcessor(
         IAsrJobStore jobs,
@@ -116,6 +129,31 @@ public sealed class AsrJobProcessor
     /// <summary>The provider this processor serves; jobs for other providers are left alone.</summary>
     public string ProviderName => _provider.Name;
 
+    /// <summary>MeetCap data root this processor resolves session artifacts under.</summary>
+    public string DataRoot => _options.DataRoot;
+
+    /// <summary>Every job of a session, oldest first.</summary>
+    public IReadOnlyList<AsrJob> ListJobs(string sessionId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(sessionId);
+        return _jobs.ListBySession(sessionId);
+    }
+
+    /// <summary>
+    /// Jobs of a session that still need work, including a <c>pending</c> job whose retry
+    /// schedule has not come due yet.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately different from <see cref="RunDueAsync"/>'s due list: "does anything
+    /// remain" is the question a caller asks before declaring a session finished, and a job
+    /// waiting out its backoff still remains (<c>docs/RELIABILITY.md</c> section 9).
+    /// </remarks>
+    public int CountOutstanding(string sessionId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(sessionId);
+        return _jobs.ListBySession(sessionId).Count(job => AsrJobStatuses.IsResumable(job.Status));
+    }
+
     /// <summary>
     /// Resumes every job whose durable state still needs work, oldest first.
     /// </summary>
@@ -127,7 +165,8 @@ public sealed class AsrJobProcessor
     public async Task<IReadOnlyList<AsrJobProcessResult>> RunDueAsync(
         int maxJobs,
         string? sessionId = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool ignoreRetrySchedule = false)
     {
         if (maxJobs <= 0)
         {
@@ -135,10 +174,29 @@ public sealed class AsrJobProcessor
         }
 
         var due = _jobs.ListResumable(Now(), maxJobs, sessionId);
+
+        // `meetcap asr resume --force` is the operator's statement that the reason for the
+        // backoff is gone — the network is back — so a job waiting out its durable
+        // `next_retry_at` is processed anyway. The schedule is otherwise respected, which is
+        // what keeps repeated commands from creating a retry storm.
+        if (ignoreRetrySchedule)
+        {
+            var scheduled = _jobs
+                .ListResumable(DateTimeOffset.MaxValue, int.MaxValue, sessionId)
+                .Where(job => job.Status is AsrJobStatus.RetryWait)
+                .Where(job => due.All(candidate => !string.Equals(candidate.Id, job.Id, StringComparison.Ordinal)))
+                .OrderBy(job => job.NextRetryAt ?? DateTimeOffset.MinValue)
+                .ThenBy(job => job.Id, StringComparer.Ordinal)
+                .Take(maxJobs);
+
+            due = due.Concat(scheduled).ToList();
+        }
+
         var results = new List<AsrJobProcessResult>(due.Count);
         foreach (var job in due)
         {
             cancellationToken.ThrowIfCancellationRequested();
+
             if (!string.Equals(job.Provider, _provider.Name, StringComparison.Ordinal))
             {
                 results.Add(new AsrJobProcessResult(
@@ -149,10 +207,76 @@ public sealed class AsrJobProcessor
                 continue;
             }
 
-            results.Add(await ProcessAsync(job, cancellationToken).ConfigureAwait(false));
+            var result = await ProcessAsync(job, cancellationToken).ConfigureAwait(false);
+
+            // One pass advances a job by one step (submit, then poll), so a drain keeps passing
+            // over the same job until it reaches a state that is genuinely waiting on something
+            // — a terminal state, `retry_wait` with its durable backoff, or `polling` because the
+            // provider is still working. Stopping at a bare `submitted` would leave that job
+            // unattended even though its audio is ready and the provider is reachable.
+            var passes = 0;
+            while (result.Outcome == AsrJobOutcome.NoWork && ++passes < MaxPassesPerJob)
+            {
+                var current = _jobs.Get(result.Job.Id);
+                if (current is null || !AsrJobStatuses.IsResumable(current.Status))
+                {
+                    break;
+                }
+
+                result = await ProcessAsync(current, cancellationToken).ConfigureAwait(false);
+            }
+
+            results.Add(result);
+
+            // A transport failure means the provider is unreachable right now, so the rest of
+            // this drain would only repeat the same failure. The remaining jobs stay durable and
+            // due — the durable `next_retry_at` schedule, not this loop, is what paces them — and
+            // the next drain tries again (docs/RELIABILITY.md section 9).
+            if (result.Outcome == AsrJobOutcome.AwaitingRetry && IsTransportFailure(result.Job.ErrorCode))
+            {
+                _providerUnreachable = true;
+                break;
+            }
+        }
+
+        // A submit or poll that actually completed proves the provider is reachable again.
+        if (_providerUnreachable && results.Exists(r => r.Outcome != AsrJobOutcome.AwaitingRetry))
+        {
+            _providerUnreachable = false;
         }
 
         return results;
+    }
+
+    /// <summary>
+    /// True when the last drain stopped early because the provider could not be reached.
+    /// </summary>
+    /// <remarks>
+    /// Informational. Nothing is dropped: the untouched jobs keep their durable state and their
+    /// <c>next_retry_at</c> schedule, which is what paces them
+    /// (<c>docs/ARCHITECTURE.md</c> section 12).
+    /// </remarks>
+    public bool ProviderUnreachable => _providerUnreachable;
+
+    /// <summary>
+    /// True for a failure that says "the provider could not be reached", as opposed to a
+    /// provider-side rejection of the audio itself.
+    /// </summary>
+    private static bool IsTransportFailure(string? errorCode)
+    {
+        if (string.IsNullOrEmpty(errorCode))
+        {
+            return false;
+        }
+
+        if (string.Equals(errorCode, TaskNotFoundErrorCode, StringComparison.Ordinal))
+        {
+            // The provider answered, so it is reachable; the task itself is what is missing.
+            return false;
+        }
+
+        return errorCode.StartsWith("http.", StringComparison.Ordinal)
+            || string.Equals(errorCode, "audio.unreadable", StringComparison.Ordinal);
     }
 
     /// <summary>Advances one job by the smallest useful amount of work.</summary>
@@ -164,6 +288,7 @@ public sealed class AsrJobProcessor
         {
             return new AsrJobProcessResult(job, AsrJobOutcome.NoWork, 0, $"Job '{job.Id}' is already {job.Status}.");
         }
+
 
         var recovered = AsrJobTransitions.RecoverAfterRestart(job, Now());
         if (recovered.Status != job.Status)
@@ -348,6 +473,12 @@ public sealed class AsrJobProcessor
                     SessionId = job.SessionId,
                     JobId = job.Id,
                     Source = job.Source,
+                    // The provider's timestamps are relative to the artifact it was given.
+                    // For a live ASR batch that artifact is a window into the session, so the
+                    // batch's start position on the session timeline is the offset that puts
+                    // its segments where they were actually spoken (docs/DATA_MODEL.md
+                    // section 6).
+                    StartOffsetMs = job.StartMs,
                 });
         }
         catch (AsrNormalizationException ex)
@@ -535,6 +666,9 @@ public sealed class AsrJobProcessor
         Source = job.Source,
         InputArtifactPath = paths.ResolveRelative(job.InputArtifact),
         AudioFormat = Path.GetExtension(job.InputArtifact).TrimStart('.').ToLowerInvariant(),
+        // A live batch's artifact starts partway through the session; the job's stored
+        // start position is what maps provider timestamps back to the session timeline.
+        StartOffsetMs = job.StartMs,
         DurationMs = job.DurationMs,
         ProviderRequestId = job.ProviderRequestId,
         ServiceTier = job.Tier,

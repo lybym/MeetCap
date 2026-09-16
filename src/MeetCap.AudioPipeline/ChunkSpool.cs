@@ -81,6 +81,19 @@ public sealed class ChunkSpool : IDisposable
     /// <summary>Sequence number of the most recently opened chunk.</summary>
     public int Sequence => _sequence;
 
+    /// <summary>
+    /// The most recently closed durable chunk, described for downstream consumers, or
+    /// <c>null</c> when no chunk has been closed yet.
+    /// </summary>
+    /// <remarks>
+    /// Chunk rotation happens inside <see cref="Append"/>, so "which chunk was just
+    /// closed" cannot be derived by the caller from the result of its own
+    /// <see cref="CloseCurrentChunk"/> call. The spool therefore remembers it, and the
+    /// recording session announces it through
+    /// <c>RecordingSession.ChunkClosed</c>.
+    /// </remarks>
+    public ClosedAudioChunk? LastClosed { get; private set; }
+
     /// <summary>Exclusive session-relative end of the audio written so far.</summary>
     public long WrittenEndMs => _currentEndMs;
 
@@ -160,6 +173,20 @@ public sealed class ChunkSpool : IDisposable
 
         ClosedChunkCount++;
         ClosedDataBytes += result.DataBytes;
+
+        // Recorded after the rename, so LastClosed only ever describes durable audio.
+        LastClosed = new ClosedAudioChunk
+        {
+            SessionId = _paths.SessionId,
+            Source = _source.ToWireName(),
+            Sequence = writer.Sequence,
+            FilePath = result.FinalPath,
+            RelativePath = _paths.RelativeChunkPath(_source, writer.Sequence),
+            StartMs = _currentStartMs,
+            EndMs = _currentEndMs,
+            DataBytes = result.DataBytes,
+            Format = _format,
+        };
 
         _events.Write(new SessionEvent(SessionEventNames.ChunkClosed, _currentEndMs)
         {

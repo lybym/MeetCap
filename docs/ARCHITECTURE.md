@@ -154,7 +154,10 @@ Core                    domain types and abstractions only, no package reference
 Persistence             Tomlyn config store, SQLite migrations and repositories
 WindowsAudio            NAudio 3 endpoint enumeration and WASAPI capture
 AudioPipeline           bounded queue, chunk spool, session artifacts, recovery scan
-Cli                     composition root: config, status, devices, start, stop
+Asr                     live ASR batching, the persistent job state machine driver,
+                        transcript assembly, and recording import
+Asr.Volcengine          file-ASR adapter, provider JSON parsing, Polly inside HTTP
+Cli                     composition root: config, status, devices, start, stop, import, asr
 ```
 
 `MeetCap.AudioPipeline` sits above `Core` and `Persistence`: it owns the capture
@@ -162,6 +165,13 @@ lifecycle and writes the session artifacts and their index. It does not referenc
 `MeetCap.WindowsAudio`; the CLI composition root is the only place that joins a
 concrete audio platform to the pipeline, which is what keeps the pipeline testable
 without audio hardware.
+
+`MeetCap.Asr` depends on `Core` and `AudioPipeline` and consumes the recording artifact
+contract (the durable chunk, the WAV writers, the session event sink). The dependency points
+one way only: `MeetCap.AudioPipeline` still reaches no ASR, cloud, HTTP or speaker assembly, and
+the closed-chunk hand-off is a Core-owned event rather than a reference
+(`docs/ARCHITECTURE.md` section 9.3,
+`tests/MeetCap.AudioPipeline.Tests/CaptureIndependenceTests.cs`).
 
 ---
 
@@ -619,6 +629,36 @@ awaited, and the channel writer is completed only after that task has returned, 
 a slow consumer still holds are drained instead of racing a late capture callback against a
 closed channel.
 
+### 9.3 M4 implementation: the closed-chunk hand-off
+
+`RecordingSession.ChunkClosed` publishes one `ClosedAudioChunk` for every chunk the spool closes
+durably, on the recording consumer thread. It carries the session id, the track, the 1-based
+sequence, the durable path and its session-relative form, the chunk's own `start_ms` / `end_ms`,
+its audio byte count, and the track format — and nothing else. No provider, HTTP, or job type
+crosses it, which is what lets the recording assembly raise it while
+`tests/MeetCap.AudioPipeline.Tests/CaptureIndependenceTests.cs` continues to prove that
+`MeetCap.AudioPipeline` cannot reach the ASR stack.
+
+Two rules keep the guarantee intact:
+
+- **Only a durable chunk is announced.** The event is raised after the header has been patched,
+  flushed, validated, and renamed out of `.part`, and after the chunk index row says `closed`. A
+  subscriber can therefore read the file it is told about.
+- **A subscriber cannot fail the recording.** If a handler throws, the failure is written as an
+  explicit `capture.discontinuity` event naming the chunk and the consumer is skipped. The audio
+  is already durable and a transcript is optional (`docs/RELIABILITY.md` section 2).
+
+The session's own `ISessionEventSink` is exposed as `RecordingSession.Events`, so a consumer that
+appends to `events.jsonl` during the meeting shares the recorder's append lock. The sink is
+disposed when the session object is disposed, not when `RunAsync` returns, because M4's post-stop
+work (flushing the final batch and draining the queue) still writes session events; the recording
+liveness marker is released by `ReleaseRecordingLock` at the end of `RunAsync` as before.
+
+The chunk's identity is `LastClosed` on the spool rather than the caller's own close result:
+`ChunkSpool.Append` rotates a chunk internally at a capacity boundary, so "what was just closed"
+is something only the spool knows. The session remembers the last announced sequence number so a
+rotation followed by the teardown close cannot announce one chunk twice.
+
 ---
 
 ## 10. ASR batch builder
@@ -637,6 +677,52 @@ The batch builder groups closed chunks by source.
 Batch construction MUST run outside the capture path.
 
 At session stop, the remaining partial ASR window is submitted.
+
+### 10.1 M4 implementation
+
+`MeetCap.Asr.Batching.AsrBatchBuilder` is the batch builder. It is driven by
+`RecordingSession.ChunkClosed`, which `MeetCap.AudioPipeline` raises on the recording consumer
+thread for every chunk it has just closed durably — including a rotation the spool performs
+inside `Append`, not only an explicit close. The recording assembly announces durable audio and
+nothing else; it has no ASR, HTTP, or provider dependency
+(`tests/MeetCap.AudioPipeline.Tests/CaptureIndependenceTests.cs`).
+
+```text
+closed chunk (durable, indexed)
+  -> grouped per source until its span covers asr.file_batch_seconds
+  -> asr/batches/<source>/batch-NNNNNN.wav   (real WAV, header patched and validated)
+  -> asr/batches/<source>/batch-NNNNNN.json  (batch/source timeline mapping)
+  -> asr_jobs row (pending, provider_request_id already allocated)
+```
+
+Three properties of that ordering are deliberate:
+
+- **The audio artifact exists before anything references it.** The batch WAV is written through
+  a `.part` file, validated, renamed, and only then does the job row appear. A crash can
+  therefore leave an orphaned batch or an unfinished `.part`, but never a queued job whose audio
+  is missing (`docs/RELIABILITY.md` sections 5 and 6).
+- **The batch manifest is what preserves the source mapping.** It records the source, the batch
+  number, the batch's own span on the session timeline, and every capture chunk it was built
+  from with that chunk's own `start_ms` / `end_ms`. A batch therefore spans a hole in the
+  timeline without hiding it: the window closes on captured audio time, not on wall-clock span,
+  so a device outage produces a batch whose declared span is longer than the audio inside it,
+  and the manifest states where each chunk really sits.
+- **Recovery is idempotent.** The job id is derived from the batch artifact path
+  (`job_batch-NNNNNN`), so re-running recovery against a batch file that already has a job is a
+  no-op. `RecoverFinalizedBatches` re-queues a finalized batch whose job row is missing and
+  discards any `.part` left by an unfinished batch; the chunks it would have contained are still
+  durable and are picked up by the next window.
+
+Batch numbering is per track, starts above whatever a previous process already wrote, and skips
+a number whose file already exists, so a restarted recorder cannot overwrite a batch.
+
+Capture chunk duration and batch duration stay independent: `capture.chunk_seconds` is the
+durability unit and `asr.file_batch_seconds` is the provider context unit, and neither is
+derived from the other.
+
+The batch WAV is an intermediate artifact. The capture chunks, the provider's raw response, and
+the per-job `normalized.jsonl` are the durable record; `transcript/raw.jsonl` is derived from
+those (`docs/DATA_MODEL.md` sections 6 and 12).
 
 ---
 
@@ -679,7 +765,21 @@ The provider request id is supplied by the caller — the persistent job — ins
 generated per HTTP attempt. The same id is the provider's task identifier, so a retry after a
 process restart addresses the same task rather than creating a second billable one.
 
+The provider reports timestamps relative to the artifact it was given. `AsrFileRequest` and
+`AsrNormalizationContext` therefore carry `StartOffsetMs`, the artifact's own start position on
+the session timeline, and the normalizer adds it to every provider timestamp. It is zero for an
+import (the file *is* the session) and the batch's start position for a live batch, which is what
+keeps a segment from the third batch of a meeting from being written at the start of the meeting
+(`docs/DATA_MODEL.md` section 6). The raw response is retained unchanged, so the offset is applied
+at normalization time and can be re-applied by re-parsing it.
+
 The Volcengine provider requests anonymous speaker information where supported. Domain code consumes normalized `TranscriptSegment` objects and never assumes provider speaker IDs are persistent identities.
+
+The adapter also owns the transport classification: `VolcengineAsrProvider` wraps the exceptions
+its Polly pipeline rethrows (`HttpRequestException`, `TimeoutRejectedException`, a cancelled
+request) in `AsrTransientException`, so a lost network reaches the durable job state machine as a
+retryable failure instead of escaping as an unhandled exception
+(`docs/RELIABILITY.md` section 9).
 
 Polly policies live inside the provider execution layer and cover only transient HTTP
 execution: bounded retry with exponential backoff and jitter, plus a per-request timeout.
@@ -733,6 +833,36 @@ queue resumes
 ```
 
 Do not fall back to streaming ASR automatically.
+
+### 12.1 M4 implementation: the live queue
+
+`MeetCap.Asr.LiveTranscription` is what makes the queue move while a meeting is still running.
+It owns two behaviours:
+
+- a background drain that calls `AsrJobProcessor.RunDueAsync` every
+  `LiveTranscriptionOptions.PollInterval` (500 ms) for the live session, started by
+  `meetcap start` as its own task. It never runs on the capture callback, and a transport
+  failure simply ends that drain — the jobs keep their durable state and their `next_retry_at`
+  schedule, which is what paces them;
+- a stop-time pass: `Stop()` asks the loop to finish its current drain, the remaining partial
+  batch is flushed so the audio after the last full window still reaches the provider, and the
+  queue is drained once more.
+
+Drains are serialized by a gate, so the background loop and the stop-time drain can never
+observe one job in an intermediate state and leave it there. A drain also keeps advancing a
+single job through `submitted` to its result: one pass advances a job by one step, so stopping
+at a bare `submitted` would leave that job's audio submitted but never collected.
+
+`meetcap asr resume --force` processes jobs whose durable `next_retry_at` is still in the
+future. That is the operator's statement that the reason for the backoff is over — the network
+is back — and the schedule is otherwise respected, so repeated commands cannot create a retry
+storm.
+
+A transport failure is classified by the provider adapter, not leak out of it:
+`VolcengineAsrProvider` wraps the exceptions its Polly pipeline rethrows
+(`HttpRequestException`, `TimeoutRejectedException`, a cancelled request) in
+`AsrTransientException`. Without that, a lost network would surface as an unhandled exception
+instead of a durable `retry_wait` job.
 
 ---
 
@@ -942,8 +1072,7 @@ No component may read ad-hoc environment variables directly except the configura
       asr/
         jobs/
         batches/
-      transcript/
-        raw.jsonl
+      transcript/        raw.jsonl
         live.md
         final.jsonl
         final.md
@@ -996,6 +1125,24 @@ CREATED -> RECORDING -> FINALIZING -> COMPLETED     clean stop, every artifact c
 CREATED|RECORDING -> INTERRUPTED                    abandoned, never completed cleanly
 ```
 
+Since M4 a live session that owns post-capture work takes the documented post-capture edge
+instead of claiming to be finished:
+
+```text
+CREATED -> RECORDING -> FINALIZING -> PROCESSING -> COMPLETED
+```
+
+`meetcap start` declares that the session owns post-capture work when it wires live file-ASR
+batching, so a clean stop lands on `PROCESSING`, and the ASR job processor completes the session
+when its last job reaches a terminal state. A session that queued no batch at all is completed
+explicitly once the queue is known to be empty.
+
+`PROCESSING` is deliberately **not** recording-owned: `SessionStatus.RecordingOwned` — the list
+`meetcap stop` and startup recovery use to decide which session a recorder still owns — contains
+only `CREATED`, `RECORDING`, and `FINALIZING`. `PROCESSING` means capture is over and only the
+ASR queue is still moving, so no recording process owns it; treating it as recording-owned would
+make `meetcap stop` wait for a transcription queue.
+
 `INTERRUPTED` is terminal and is entered only when startup recovery finds a session that
 was never cleanly stopped, or when the recording process itself cannot finish (capture
 never started, or the last chunk could not be closed). It is never used for a degraded
@@ -1003,12 +1150,11 @@ but complete recording.
 
 A device loss that is recovered does **not** interrupt a session: the session still
 reaches `COMPLETED`, and the outage appears as a `degraded` flag plus explicit
-`capture.device_lost` / `capture.device_restored` / `capture.gap` events. `PROCESSING`
-arrives with the ASR milestones, when a completed recording can still own outstanding
-jobs.
+`capture.device_lost` / `capture.device_restored` / `capture.gap` events. A clean stop that
+still owns ASR work reaches `PROCESSING` first and `COMPLETED` when the queue is terminal
+(section 20, above).
 
 Degraded conditions are orthogonal flags/events, not necessarily terminal states.
-
 Examples:
 
 ```text
@@ -1080,6 +1226,43 @@ Because the only supported input is a single provider file request, an import th
 provider's single-request or inline-upload limit fails with an actionable message instead of
 being silently split; split mapping with preserved timestamps remains a later concern
 (`ASR_STRATEGY.md` section 12).
+
+### 21.1 Live recording (M4)
+
+A live offline session runs the same file-ASR pipeline, fed by the capture spool instead of by an
+imported file:
+
+```text
+load + validate config                    # invalid configuration stops here
+resolve provider (app id + credential)    # invalid credentials stop here, before any session
+startup recovery scan
+create the session row + session.json + recording.lock
+attach the ASR batch builder to RecordingSession.ChunkClosed
+re-queue finalised batches whose job row is missing
+recording loop (Ctrl+C, `meetcap stop`, or an unrecoverable capture/storage failure)
+  per durably closed chunk:  -> append to the batch window of its track
+  when a window closes:      -> asr/batches/<source>/batch-NNNNNN.wav (+ .json)
+                             -> asr_jobs row (pending)
+  background drain:          -> submit -> poll -> retain raw response -> normalize
+                             -> asr/jobs/<job-id>/{request.json,response.json,normalized.jsonl}
+                             -> transcript/raw.jsonl (rebuilt from every job's normalized.jsonl)
+                             -> transcript/live.md
+stop: final partial batch flushed, queue drained once, session PROCESSING
+mark the session COMPLETED once every job reached a terminal success
+```
+
+The differences from an import are the ones that matter for reliability:
+
+- the provider is resolved *before* the session exists, so a credential problem fails visibly and
+  leaves no session behind. `asr.enabled = false` is the supported way to record without a
+  transcript, and it skips the ASR stack entirely;
+- the session stays `PROCESSING` when it stops with work outstanding, so it is never presented as
+  finished while the queue still holds jobs;
+- a failed ASR job does not make the recording unclean. `meetcap start` reports it, names the
+  session event log, and still exits 0: the exit code is reserved for the recording
+  (`docs/RELIABILITY.md` section 1);
+- `meetcap status` reports the queue depth and whether transcription is behind, without treating a
+  backlog as a recording failure (section 12 and `docs/ASR_STRATEGY.md` section 13).
 
 ---
 

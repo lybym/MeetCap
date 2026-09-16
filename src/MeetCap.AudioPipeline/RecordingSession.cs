@@ -127,12 +127,14 @@ public sealed class RecordingSession : IDisposable
     private int _flushRequested;
     private int _overflowSignalled;
     private int _diskProbeFailureReported;
+    private int _announcedChunkSequence;
     private long _pendingGapMs;
     private long _stallObservedMs;
     private int _closedChunkCountAtLastStallCheck;
     private DateTimeOffset? _lastStallEventAt;
     private volatile bool _degraded;
     private volatile bool _captureStarted;
+    private volatile bool _postCaptureProcessingExpected;
     private string? _endReason;
     private Exception? _storageFailure;
     private DateTimeOffset? _lastLowDiskSpaceEventAt;
@@ -171,6 +173,56 @@ public sealed class RecordingSession : IDisposable
     public string SessionId => _paths.SessionId;
 
     public string SessionDirectory => _paths.SessionDirectory;
+
+    /// <summary>
+    /// This session's operational event sink, so a downstream consumer wired to
+    /// <see cref="ChunkClosed"/> can append to the same <c>events.jsonl</c>.
+    /// </summary>
+    /// <remarks>
+    /// The recorder holds that file open for append while it runs. Sharing the sink keeps
+    /// one append lock on the log, so a consumer's event cannot interleave with the
+    /// recorder's own line and the log stays one JSONL object per line
+    /// (<c>docs/DATA_MODEL.md</c> section 4).
+    /// </remarks>
+    public ISessionEventSink Events => _events;
+
+    /// <summary>
+    /// Raised on the recording consumer thread, after a capture chunk has been closed
+    /// durably. This is the hand-off point for optional downstream work such as ASR
+    /// batching (<c>docs/ARCHITECTURE.md</c> section 10).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The event is not the capture callback. It fires once per closed chunk on the same
+    /// thread that already writes chunks and updates the chunk index, so a subscriber may
+    /// use the filesystem there — but it must never perform HTTP or another unbounded
+    /// operation, because a subscriber that blocks would slow the consumer that
+    /// <c>docs/RELIABILITY.md</c> section 4 requires to stay bounded. The M4 subscriber
+    /// appends the chunk to a local batch file and queues a persistent job; submission
+    /// happens later and elsewhere.
+    /// </para>
+    /// <para>
+    /// A subscriber that throws cannot fail the recording: the audio is already durable and
+    /// a transcript is optional. The failure is recorded as an explicit
+    /// <c>capture.discontinuity</c> event so a degraded transcript is visible rather than
+    /// silent (<c>docs/RELIABILITY.md</c> section 2).
+    /// </para>
+    /// </remarks>
+    public event Action<ClosedAudioChunk>? ChunkClosed;
+
+    /// <summary>
+    /// Declares that this session owns post-capture work (live file-ASR batching), so a
+    /// clean stop lands on the documented <c>FINALIZING -&gt; PROCESSING</c> checkpoint
+    /// instead of <c>COMPLETED</c>.
+    /// </summary>
+    /// <remarks>
+    /// Set by the composition root before <see cref="RunAsync"/>, when the ASR batch
+    /// builder is actually wired. The session is then completed by the ASR job store when
+    /// every job reaches a terminal state, and a session with no jobs at all is completed
+    /// by the caller. Without the flag a session would be reported as finished while its
+    /// queue still held work (<c>docs/ARCHITECTURE.md</c> section 20).
+    /// </remarks>
+    public void BeginPostCaptureProcessing() => _postCaptureProcessingExpected = true;
 
     /// <summary>
     /// Records until a stop is requested, the process is cancelled, or capture and
@@ -278,13 +330,13 @@ public sealed class RecordingSession : IDisposable
         {
             _spool?.Dispose();
 
-            // The runner owns the event log: it must be closed and flushed before the
-            // command reports the session outcome.
-            (_events as IDisposable)?.Dispose();
-
-            // The marker is released only after Complete() has written the terminal status,
-            // so a scan can never see a finished session as an unowned work-in-progress.
-            Dispose();
+            // The liveness marker is released only after Complete() has written the terminal
+            // status, so a scan can never see a finished session as an unowned work-in-progress.
+            // The event log deliberately stays open: M4's post-stop work (flushing the final ASR
+            // batch and draining the queue) still appends session events, and closing the sink
+            // here would make those writes fail (docs/DATA_MODEL.md section 4). The caller that
+            // owns the session disposes it once that work is done.
+            ReleaseRecordingLock();
 
             _endCts?.Dispose();
             _endCts = null;
@@ -302,6 +354,22 @@ public sealed class RecordingSession : IDisposable
     /// already released the marker during its teardown.
     /// </remarks>
     public void Dispose()
+    {
+        ReleaseRecordingLock();
+
+        // The event log is closed here rather than at the end of RunAsync, so a consumer that
+        // is still appending to it — the M4 ASR batch builder during the post-stop flush —
+        // keeps working until the session object itself is released.
+        (_events as IDisposable)?.Dispose();
+    }
+
+    /// <summary>
+    /// Releases this session's exclusive liveness marker without closing its artifacts.
+    /// Idempotent. The operating system would release the handle anyway when the process
+    /// exits; releasing it explicitly is what tells a later scan the session is no longer
+    /// being recorded.
+    /// </summary>
+    private void ReleaseRecordingLock()
     {
         _recordingLock?.Dispose();
         _recordingLock = null;
@@ -687,10 +755,52 @@ public sealed class RecordingSession : IDisposable
             // The spool counts every chunk it closes, including the ones it rotates
             // internally at a chunk boundary.
             _spool!.CloseCurrentChunk();
+            AnnounceClosedChunk();
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             RegisterStorageFailure(ex);
+        }
+    }
+
+    /// <summary>
+    /// Announces the chunk the spool most recently closed durably, without letting a
+    /// subscriber's failure reach the recording (<see cref="ChunkClosed"/>).
+    /// </summary>
+    /// <remarks>
+    /// The spool rotates chunks inside <see cref="ChunkSpool.Append"/> as well as on an
+    /// explicit close, so "what was just closed" is read from the spool rather than from
+    /// the result of the caller's own close call. The announced sequence number is
+    /// remembered so a rotation followed by the teardown close cannot announce one chunk
+    /// twice.
+    /// </remarks>
+    private void AnnounceClosedChunk()
+    {
+        var handler = ChunkClosed;
+        var chunk = _spool?.LastClosed;
+        if (handler is null || chunk is null || chunk.Sequence == _announcedChunkSequence)
+        {
+            return;
+        }
+
+        _announcedChunkSequence = chunk.Sequence;
+
+        try
+        {
+            handler(chunk);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // The chunk is durable and the recording is healthy; only the downstream
+            // consumer of this chunk failed. Report it and keep recording.
+            _events.Write(new SessionEvent(SessionEventNames.CaptureDiscontinuity, CurrentTimelineMs())
+            {
+                Source = Track.ToWireName(),
+                Chunk = Path.GetFileName(chunk.FilePath),
+                Detail =
+                    "a downstream consumer of the closed chunk failed and was skipped: " + ex.Message +
+                    " The chunk itself is durable and the recording is unaffected.",
+            });
         }
     }
 
@@ -769,6 +879,10 @@ public sealed class RecordingSession : IDisposable
         }
 
         _spool!.Append(packet, timing);
+
+        // A packet that crosses the chunk boundary rotates the chunk inside Append, so
+        // the announcement happens here rather than only around an explicit close.
+        AnnounceClosedChunk();
 
         if (Interlocked.Exchange(ref _flushRequested, 0) == 1)
         {
@@ -1012,13 +1126,23 @@ public sealed class RecordingSession : IDisposable
         // A run where capture never started produced no audio and did not stop cleanly:
         // that is an interrupted session, not a completed one.
         var started = _captureStarted;
-        var status = started && _storageFailure is null ? SessionStatus.Completed : SessionStatus.Interrupted;
+        var status = !started || _storageFailure is not null
+            ? SessionStatus.Interrupted
+            // Post-capture work is wired (live file-ASR batching), so a clean stop lands on
+            // the documented FINALIZING -> PROCESSING checkpoint instead of claiming the
+            // session is finished while its ASR queue still holds work
+            // (docs/ARCHITECTURE.md section 20).
+            : _postCaptureProcessingExpected ? SessionStatus.Processing : SessionStatus.Completed;
 
         var endReason = !started
             ? "capture_start_failed"
             : _endReason ?? (_storageFailure is null ? "stop_requested" : "storage_error");
 
         var degraded = _degraded || _storageFailure is not null || !started;
+
+        DateTimeOffset? stoppedAt = status is SessionStatus.Completed or SessionStatus.Processing
+            ? _clock.UtcNow
+            : null;
 
         // The gap and bounded-buffer accounting is written into the session document, not
         // only into the event log, so "how much audio is missing and how close did the
@@ -1031,7 +1155,7 @@ public sealed class RecordingSession : IDisposable
         _manifest.Status = status;
         _manifest.Degraded = degraded;
         _manifest.EndReason = endReason;
-        _manifest.StoppedAt = status == SessionStatus.Completed ? _clock.UtcNow : null;
+        _manifest.StoppedAt = stoppedAt;
 
         SessionManifestStore.Save(_paths.ManifestPath, _manifest);
 
@@ -1039,7 +1163,7 @@ public sealed class RecordingSession : IDisposable
             _paths.SessionId,
             status,
             _clock.UtcNow,
-            _manifest.StoppedAt,
+            stoppedAt,
             durationMs);
 
         _stopSignal.Clear();

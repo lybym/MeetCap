@@ -22,6 +22,7 @@ internal static class AsrCommand
         CliContext context,
         string? sessionId,
         int maxJobs,
+        bool force,
         CancellationToken cancellationToken)
     {
         if (!CommandSupport.TryLoadConfiguration(context, out var configuration, out var dataRoot, out var failure))
@@ -36,7 +37,8 @@ internal static class AsrCommand
                 configuration.Asr.ServiceTier,
                 requireMedia: false,
                 out var stack,
-                out var stackFailure) || stack is null)
+                out var stackFailure,
+                context.AsrHttpHandler) || stack is null)
         {
             return stackFailure;
         }
@@ -44,7 +46,7 @@ internal static class AsrCommand
         using var ownedStack = stack;
 
         var results = await stack.Processor
-            .RunDueAsync(maxJobs, sessionId, cancellationToken)
+            .RunDueAsync(maxJobs, sessionId, cancellationToken, ignoreRetrySchedule: force)
             .ConfigureAwait(false);
 
         if (results.Count == 0)

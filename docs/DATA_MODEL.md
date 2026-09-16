@@ -75,7 +75,6 @@ sessions/<session-id>/
   asr/
     batches/
     jobs/
-
   transcript/
     raw.jsonl
     live.md
@@ -269,6 +268,19 @@ capture.consumer_stalled   the bounded queue stayed occupied for at least
                            capture.buffer_seconds while no chunk closed
 session.repair.incomplete  recovery could not make a session whole
 ```
+
+M4 adds the ASR batch vocabulary:
+
+```text
+asr.batch.closed           a batch window was materialized into a durable WAV plus its
+                           timeline manifest, immediately before its job is queued
+asr.batch.discarded        recovery discarded an unfinished batch .part; the capture
+                           chunks it would have held are still durable
+```
+
+`asr.batch.closed` is written before `asr.job.queued` because the durable batch artifact is what
+the job names (`docs/ARCHITECTURE.md` section 10.1). Both are written only when a job is actually
+created, so a recovery pass that finds an already-queued batch does not restate them.
 
 `session.repair.incomplete` is written by startup recovery and by `meetcap session repair`
 when the session's timeline still holds a provable gap after every repair that could be
@@ -473,6 +485,66 @@ Notes:
   between writing the transcript and persisting the terminal status) therefore replaces that
   job's contribution instead of duplicating its segments.
 
+### 6.1 Live ASR batch artifact (M4)
+
+A live session submits one provider request per ASR batch window, so the artifact each job
+names is a batch built from the session's own capture chunks:
+
+```text
+sessions/<session-id>/
+  asr/
+    batches/
+      mic/
+        batch-000001.wav
+        batch-000001.json
+```
+
+`batch-NNNNNN.wav` is a real, independently readable WAV: the capture chunks of the track are
+concatenated header-and-payload, the header is patched, validated and renamed out of `.part` by
+the same writer the capture spool uses. There is no re-encode and no resampler, because every
+chunk of one track carries the session's single native format
+(`docs/ARCHITECTURE.md` section 10.1).
+
+`batch-NNNNNN.json` is the batch/source timeline mapping, and it is what makes a batch auditable
+back to the audio it was built from:
+
+```json
+{
+  "session_id": "ses_20260915T140000Z_a1b2c3d4",
+  "source": "mic",
+  "batch": 1,
+  "artifact": "asr/batches/mic/batch-000001.wav",
+  "start_ms": 0,
+  "end_ms": 240000,
+  "duration_ms": 240000,
+  "data_bytes": 7680000,
+  "chunks": [
+    { "sequence": 1, "artifact": "audio/mic/000001.wav", "start_ms": 0, "end_ms": 60000, "data_bytes": 1920000 }
+  ]
+}
+```
+
+`start_ms` / `end_ms` are the batch's own span on the session timeline, and each entry's
+`start_ms` / `end_ms` is that capture chunk's own span. A window closes on captured audio time,
+so a batch that covers a device outage declares a span longer than the audio inside it while the
+per-chunk entries state where the audio really sits. A gap is therefore never hidden by shifting
+timestamps (`docs/RELIABILITY.md` section 7).
+
+`asr_jobs.input_artifact` stores the session-relative batch path, and the job's `start_ms` is the
+batch's start position: that is the offset the normalizer adds to every provider timestamp so the
+segments of the third batch land where they were spoken rather than at the start of the meeting
+(section 7). The job id is derived from the batch artifact path (`job_batch-NNNNNN`), so recovery
+can tell whether a durable batch already has a job without inventing a second billable task.
+
+The batch WAV is an intermediate artifact, not the durable record. Its capture chunks, the
+retained raw provider response and the job's `normalized.jsonl` are what the session keeps, and
+`transcript/raw.jsonl` is derived from the normalized artifacts (section 12). A `.part` left by an
+unfinished batch is discarded by recovery, because no job references it and its chunks are still
+durable: that is a lost batch window, never lost audio.
+
+This adds no SQLite table and no migration: the batch's own mapping lives in the artifact beside
+it, and the job row already has the columns to point at it.
+
 ## 7. Transcript segment
 
 ```json
@@ -493,6 +565,11 @@ Notes:
 ```
 
 `raw_text` is immutable.
+
+`start_ms` / `end_ms` are session-relative. The provider reports timestamps relative to the
+artifact it was given, and `start_ms` for a segment is always a position on the session's own
+timeline: for an import the artifact is the whole session, and for a live ASR batch the batch's
+start position is added during normalization (section 6.1).
 
 ## 8. Speaker
 
@@ -589,6 +666,10 @@ already-applied, and an unnumbered script is never considered at all.
   `session.json` and `events.jsonl` (sections 3 and 4), and the gap audit (section 5.1) reads
   the M1 `audio_chunks` index. No table, column or constraint changed, so the applied schema is
   identical before and after M2.
+- **M4** requires no new migration either. A live ASR batch is an audio artifact plus its
+  timeline manifest under `asr/batches/` (section 6.1), and the job that consumes it uses the M3
+  `asr_jobs` columns unchanged: `input_artifact` names the batch and `start_ms` carries its
+  position on the session timeline. No table, column or constraint changed.
 - Later milestones add `speakers`, `speaker_embeddings` and `speaker_assignments` as their features are implemented, each as a new numbered migration. No table is created ahead of its feature (section 11).
 
 Two scripts claiming one version would make the second look already applied and its tables would

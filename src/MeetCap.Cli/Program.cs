@@ -40,7 +40,8 @@ public static class Program
         IConfigurationStore? configurationStore = null,
         InvocationConfiguration? invocationConfiguration = null,
         ParserConfiguration? parserConfiguration = null,
-        ICapturePlatformFactory? platformFactory = null)
+        ICapturePlatformFactory? platformFactory = null,
+        HttpMessageHandler? asrHttpHandler = null)
     {
         ArgumentNullException.ThrowIfNull(args);
         environment ??= CliEnvironment.Instance;
@@ -69,7 +70,8 @@ public static class Program
             output,
             error,
             environment,
-            platformFactory);
+            platformFactory,
+            asrHttpHandler);
         var parseResult = CommandLineParser.Parse(root, args, parserConfiguration);
 
         if (parseResult.Errors.Count > 0)

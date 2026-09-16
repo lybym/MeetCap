@@ -18,7 +18,7 @@ using MeetCap.Persistence.Storage;
 /// so the domain layers never see Volcengine, FFMpegCore, Polly, or SQLite types
 /// (<c>docs/ARCHITECTURE.md</c> section 3).
 /// </summary>
-internal sealed class AsrStack : IDisposable
+internal sealed class AsrStack : ILiveAsrHost, IDisposable
 {
     private AsrStack(
         MeetCapDatabase database,
@@ -66,6 +66,10 @@ internal sealed class AsrStack : IDisposable
     /// The tier this invocation will actually use (a one-shot override wins over
     /// configuration), so an unsupported tier is rejected before any media work.
     /// </param>
+    /// <param name="httpHandler">
+    /// Optional transport for the provider adapter, supplied only by a test harness
+    /// (<c>docs/DEVELOPMENT.md</c> section 7). Production passes <c>null</c>.
+    /// </param>
     public static bool TryCreate(
         CliContext context,
         MeetCapConfiguration configuration,
@@ -73,7 +77,8 @@ internal sealed class AsrStack : IDisposable
         string effectiveTier,
         bool requireMedia,
         out AsrStack? stack,
-        out int exitCode)
+        out int exitCode,
+        HttpMessageHandler? httpHandler = null)
     {
         stack = null;
         exitCode = 1;
@@ -82,7 +87,7 @@ internal sealed class AsrStack : IDisposable
         try
         {
             VolcengineAsrProviderFactory.EnsureTierSupported(effectiveTier);
-            provider = VolcengineAsrProviderFactory.Create(configuration);
+            provider = VolcengineAsrProviderFactory.Create(configuration, httpHandler);
         }
         catch (AsrConfigurationException ex)
         {
