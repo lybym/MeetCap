@@ -96,13 +96,15 @@ process from `meetcap start`, so it signals the running recorder by writing this
 which the recording loop polls. It carries no session state and is removed when the
 session ends.
 
-`recording.lock` is a liveness marker, not an artifact: the recording process holds it
-open exclusively for as long as the session owns the recording surface, and the operating
-system releases the handle when that process exits for any reason. Recovery scans use it
-to tell a recording that is still in progress apart from a session abandoned by a killed
-process, so `meetcap status` can never rewrite a live session to `INTERRUPTED`
-(`docs/ARCHITECTURE.md` section 9.1). It is deleted at the end of a clean session; an
-undeletable leftover carries no meaning because it is not held.
+`recording.lock` is a liveness marker, not an artifact: it is claimed while the session is
+being prepared, before `session.json` and the `sessions` row become visible, and held open
+exclusively until the recording finishes or the prepared session is abandoned without
+running. The operating system releases the handle when that process exits for any reason.
+Recovery scans use it to tell a recording that is still in progress apart from a session
+abandoned by a killed process, so `meetcap status` can never rewrite a live session to
+`INTERRUPTED` — including in the window between the session being published and capture
+starting (`docs/ARCHITECTURE.md` section 9.1). It is deleted at the end of a clean session;
+an undeletable leftover carries no meaning because it is not held.
 
 `audio/import/` holds the materialized import source and, when normalization was required,
 the normalized derivative. `transcript/raw.jsonl` is the mandatory normalized transcript;

@@ -486,12 +486,16 @@ recoverable from session state and liveness, not from artifact presence alone:
   `duration_ms` even when recovery repairs a stray artifact it found next to the durable
   audio, because it *was* cleanly stopped.
 - a session whose liveness marker (`recording.lock`) is held by a running process is
-  skipped entirely. The recording process holds that marker exclusively for the lifetime
-  of the recording, and the operating system releases it when the process exits for any
-  reason, so a killed recorder is still recovered. Without it, `meetcap status` (a
-  different process) would rewrite a healthy live session to `INTERRUPTED`, stamp false
-  recovery events on its clean event log, and make `meetcap stop` — which only finds
-  `CREATED`/`RECORDING` sessions — unable to stop a recording that is still running.
+  skipped entirely. The session preparation step (`CaptureService.PrepareSession`) claims
+  that marker *before* it writes the manifest and the session row, so a session that is
+  visible to the scan is always already owned — there is no window in which a published
+  `CREATED` session looks abandoned. The marker is released when the recording finishes,
+  or if the caller abandons the prepared session without running it. The operating system
+  releases the handle when the process exits for any reason, so a killed recorder is still
+  recovered. Without it, `meetcap status` (a different process) would rewrite a healthy
+  live session to `INTERRUPTED`, stamp false recovery events on its clean event log, and
+  make `meetcap stop` — which only finds `CREATED`/`RECORDING` sessions — unable to stop a
+  recording that is still running.
 
 Previously closed chunks are never reopened or rewritten, which is what makes a forced
 kill unable to damage them.
@@ -835,11 +839,13 @@ process from `meetcap start`, so it signals the running recorder by writing this
 which the recording loop polls. It carries no session state and is removed when the
 session ends. See `docs/DATA_MODEL.md` section 2.
 
-`recording.lock` is a liveness marker, not an artifact: the recording process holds it
-open exclusively while the session owns the recording surface, and the operating system
-releases it when that process exits for any reason. It is what lets `meetcap status` run
-the startup recovery scan without ever touching a recording that is still in progress.
-See section 9.1 and `docs/DATA_MODEL.md` section 2.
+`recording.lock` is a liveness marker, not an artifact: it is claimed while the session is
+being prepared, before `session.json` and the `sessions` row are published, and held open
+exclusively until the recording finishes or the prepared session is abandoned without
+running. The operating system releases it when that process exits for any reason. It is
+what lets `meetcap status` run the startup recovery scan without ever touching a recording
+that is still in progress, and without mistaking a just-prepared session for an abandoned
+one. See section 9.1 and `docs/DATA_MODEL.md` section 2.
 
 Speaker embeddings and name mappings remain local by default and are treated as sensitive identity-related data.
 
