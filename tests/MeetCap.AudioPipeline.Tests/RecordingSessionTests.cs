@@ -135,6 +135,42 @@ public class RecordingSessionTests
     }
 
     [Fact]
+    public async Task RunAsync_DeviceGap_PublishesTheGapsOwnInterval()
+    {
+        using var harness = new SessionHarness(chunkSeconds: 60, bufferSeconds: 30);
+        var source = new FakeCaptureSource(Format, harness.Device);
+        harness.Sources.Enqueue(source);
+
+        var session = harness.Service.PrepareSession("Gap interval");
+        var paths = Paths(harness, session);
+
+        using var cancellation = new CancellationTokenSource();
+        var run = session.RunAsync(cancellation.Token);
+        Assert.True(await Wait.UntilAsync(() => source.StartCount == 1));
+
+        TestAudio.EmitSeconds(source, Format, 0, milliseconds: 1_000);
+
+        // The device skipped 2 s and carried on.
+        var skipFrames = 2 * Format.SampleRate + TestAudio.Frames(Format, 1_000);
+        source.Emit(TestAudio.Packet(Format, skipFrames, TestAudio.Frames(Format, 1_000)));
+        cancellation.Cancel();
+        await Finish(run);
+
+        var gap = Assert.Single(ReadEvents(paths), e => Name(e) == SessionEventNames.CaptureGap);
+
+        // The event names the hole itself (audio stopped at 1000 ms, resumed at 3000 ms) and
+        // not only the position of the buffer that follows it. Recovery re-derives the same
+        // hole from the chunk index, so without this the two records of one hole cannot be
+        // recognised as the same one (docs/RELIABILITY.md section 7).
+        Assert.Equal(1_000, gap.GetProperty("gap_start_ms").GetInt64());
+        Assert.Equal(3_000, gap.GetProperty("gap_end_ms").GetInt64());
+        Assert.Equal(2_000, gap.GetProperty("gap_ms").GetInt64());
+
+        // `at_ms` stays the resume position, which is what the timeline places the event at.
+        Assert.Equal(3_000, gap.GetProperty("at_ms").GetInt64());
+    }
+
+    [Fact]
     public async Task RunAsync_DeviceFlags_RecordsADiscontinuityEvent()
     {
         using var harness = new SessionHarness();
@@ -710,6 +746,255 @@ public class RecordingSessionTests
         // Capture itself was never blocked: the loop exited through cancellation, not a
         // stuck callback.
         Assert.True(outcome.DurationMs > 0);
+    }
+
+    [Fact]
+    public async Task RunAsync_StalledConsumer_ReportsBackpressureAndKeepsTheQueueBounded()
+    {
+        // docs/RELIABILITY.md section 4: when downstream work cannot keep up, recording to
+        // disk has priority, optional work is delayed, a degraded event is emitted, and RAM
+        // must not grow without bound. A real slow disk cannot be produced on demand, so the
+        // consumer itself is slowed through the harness seam; the queue is a real bounded
+        // channel either way.
+        using var harness = new SessionHarness(chunkSeconds: 60, bufferSeconds: 1);
+        var source = new FakeCaptureSource(Format, harness.Device);
+        source.OnStart = s =>
+        {
+            // 200 s of audio in 100 ms buffers, produced in one burst on the capture thread.
+            TestAudio.EmitSeconds(s, Format, 0, milliseconds: 200_000);
+        };
+        harness.Sources.Enqueue(source);
+
+        var session = harness.Service.PrepareSession(
+            "Stalled",
+            afterPacketWritten: () => Thread.Sleep(20));
+        var paths = Paths(harness, session);
+
+        using var cancellation = new CancellationTokenSource();
+        var run = session.RunAsync(cancellation.Token);
+        Assert.True(await Wait.UntilAsync(() => source.StartCount == 1));
+
+        // The stall is measured against capture.buffer_seconds, so a one-second buffer is
+        // reported after four housekeeping ticks.
+        Assert.True(
+            await Wait.UntilAsync(
+                () => CountEvents(ReadEvents(paths), SessionEventNames.CaptureConsumerStalled) > 0,
+                timeoutMs: 30_000),
+            "the stalled consumer was never reported");
+
+        cancellation.Cancel();
+        var outcome = await Finish(run);
+
+        Assert.True(outcome.Degraded);
+
+        // Memory stayed bounded: the backlog never exceeded the configured bound, and the
+        // accounting says so with the bound it actually used.
+        Assert.Equal(QueueCapacityFor(harness.Settings), outcome.CaptureHealth.CapacityPackets);
+        Assert.True(outcome.CaptureHealth.PeakQueuedPackets <= outcome.CaptureHealth.CapacityPackets);
+        Assert.True(outcome.CaptureHealth.StallEvents > 0);
+        Assert.True(outcome.CaptureHealth.LongestStallMs >= 1_000);
+
+        var stalled = ReadEvents(paths).First(e => Name(e) == SessionEventNames.CaptureConsumerStalled);
+        Assert.Equal("mic", stalled.GetProperty("source").GetString());
+        Assert.True(stalled.GetProperty("count").GetInt32() > 0);
+
+        // A stalled consumer is a bounded-buffer condition, not a capture failure: the
+        // session still reaches a described terminal state with its terminal event.
+        Assert.Equal(SessionStatus.Completed, outcome.Status);
+        Assert.Equal(1, CountEvents(ReadEvents(paths), SessionEventNames.SessionStopped));
+    }
+
+    [Fact]
+    public async Task RunAsync_CleanSession_ReportsAnUnusedBufferAndNoGaps()
+    {
+        using var harness = new SessionHarness(chunkSeconds: 60, bufferSeconds: 30);
+        var source = new FakeCaptureSource(Format, harness.Device);
+        harness.Sources.Enqueue(source);
+
+        var session = harness.Service.PrepareSession("Quiet");
+        var paths = Paths(harness, session);
+
+        using var cancellation = new CancellationTokenSource();
+        var run = session.RunAsync(cancellation.Token);
+        Assert.True(await Wait.UntilAsync(() => source.StartCount == 1));
+        TestAudio.EmitSeconds(source, Format, 0, milliseconds: 5_000);
+        cancellation.Cancel();
+
+        var outcome = await Finish(run);
+
+        Assert.True(outcome.IsClean);
+        Assert.Equal(0, outcome.GapCount);
+        Assert.Equal(0, outcome.GapTotalMs);
+        Assert.Equal(0, outcome.CaptureHealth.DroppedPackets);
+        Assert.Equal(0, outcome.CaptureHealth.StallEvents);
+        Assert.Equal(QueueCapacityFor(harness.Settings), outcome.CaptureHealth.CapacityPackets);
+
+        // The bounded-buffer accounting is part of the durable session document, not only
+        // of the returned result.
+        var manifest = ReadManifest(paths);
+        Assert.NotNull(manifest.CaptureHealth);
+        Assert.Equal(outcome.CaptureHealth.CapacityPackets, manifest.CaptureHealth!.CapacityPackets);
+        Assert.Equal(0, manifest.GapTotalMs);
+        Assert.Equal(0, manifest.GapCount);
+        Assert.False(manifest.GapsRemain);
+    }
+
+    [Fact]
+    public async Task RunAsync_DeviceGap_IsPersistedAsMissingAudioInTheSessionDocument()
+    {
+        using var harness = new SessionHarness(chunkSeconds: 60, bufferSeconds: 30);
+        var source = new FakeCaptureSource(Format, harness.Device);
+        harness.Sources.Enqueue(source);
+
+        var session = harness.Service.PrepareSession("Gap Accounting");
+        var paths = Paths(harness, session);
+
+        using var cancellation = new CancellationTokenSource();
+        var run = session.RunAsync(cancellation.Token);
+        Assert.True(await Wait.UntilAsync(() => source.StartCount == 1));
+
+        TestAudio.EmitSeconds(source, Format, 0, milliseconds: 1_000);
+        var skipFrames = 2 * Format.SampleRate + TestAudio.Frames(Format, 1_000);
+        source.Emit(TestAudio.Packet(Format, skipFrames, TestAudio.Frames(Format, 1_000)));
+        cancellation.Cancel();
+
+        var outcome = await Finish(run);
+
+        // The discontinuity the device reported is quantified on the result and written to
+        // session.json, so "how much audio is missing" survives as a durable fact rather
+        // than being recoverable only from the log.
+        Assert.Equal(1, outcome.GapCount);
+        Assert.Equal(2_000, outcome.GapTotalMs);
+
+        var manifest = ReadManifest(paths);
+        Assert.Equal(1, manifest.GapCount);
+        Assert.Equal(2_000, manifest.GapTotalMs);
+        Assert.True(manifest.Degraded);
+        Assert.NotNull(manifest.CaptureHealth);
+        Assert.Equal(2_000, manifest.CaptureHealth!.GapTotalMs);
+    }
+
+    [Fact]
+    public async Task RunAsync_QueueOverflow_IsCountedInTheSessionBufferAccounting()
+    {
+        using var harness = new SessionHarness(chunkSeconds: 60, bufferSeconds: 1);
+        var source = new FakeCaptureSource(Format, harness.Device);
+        source.OnStart = s =>
+        {
+            for (var i = 0; i < 20_000; i++)
+            {
+                s.Emit(TestAudio.Packet(Format, i * 4_800L, 4_800));
+            }
+        };
+        harness.Sources.Enqueue(source);
+
+        var session = harness.Service.PrepareSession("Overflow Accounting");
+        var paths = Paths(harness, session);
+
+        using var cancellation = new CancellationTokenSource();
+        var run = session.RunAsync(cancellation.Token);
+        Assert.True(await Wait.UntilAsync(() => source.StartCount == 1));
+        Assert.True(
+            await Wait.UntilAsync(() => CountEvents(ReadEvents(paths), SessionEventNames.CaptureBufferOverflow) > 0),
+            "overflow was not reported");
+
+        cancellation.Cancel();
+        var outcome = await Finish(run);
+
+        Assert.True(outcome.CaptureHealth.DroppedPackets > 0);
+        Assert.True(outcome.CaptureHealth.OverflowEvents > 0);
+        Assert.Equal(QueueCapacityFor(harness.Settings), outcome.CaptureHealth.CapacityPackets);
+        Assert.True(outcome.CaptureHealth.PeakQueuedPackets <= outcome.CaptureHealth.CapacityPackets);
+
+        // The overflow event reports the running drop total instead of a per-event delta, so
+        // an operator can see how much audio the bound cost without adding up events.
+        var overflow = ReadEvents(paths).First(e => Name(e) == SessionEventNames.CaptureBufferOverflow);
+        Assert.True(overflow.GetProperty("count").GetInt32() > 0);
+
+        var manifest = ReadManifest(paths);
+        Assert.NotNull(manifest.CaptureHealth);
+        Assert.True(manifest.CaptureHealth!.DroppedPackets > 0);
+    }
+
+    private static int QueueCapacityFor(MeetCap.Core.Capture.CaptureSettings settings)
+        => Math.Max(8, settings.BufferSeconds * 100);
+
+    [Fact]
+    public void SessionManifest_SerializesTheCaptureHealthAndGapFieldsUnderTheirDocumentedNames()
+    {
+        // docs/DATA_MODEL.md section 3 documents the exact JSON keys of session.json, and
+        // `meetcap session repair` / `meetcap status` are read by humans and scripts. The
+        // wire names come from SessionManifestStore's snake_case policy, so they are pinned
+        // here rather than only in prose: a rename of the C# property would otherwise change
+        // the artifact contract silently.
+        var manifest = new SessionManifest
+        {
+            SessionId = "ses_20260915T140000Z_0000000f",
+            Title = "Wire names",
+            Mode = SessionModes.Offline,
+            SourceType = SessionSourceTypes.Live,
+            Status = SessionStatus.Completed,
+            ConfigVersion = 1,
+            Tracks = new[] { AudioSources.Mic },
+            ChunkSeconds = 60,
+            GapCount = 2,
+            GapTotalMs = 3_000,
+            GapsRemain = true,
+            GapDetails = new[] { "mic 0..3000 ms (3000 ms, chunk 000001, not_captured): no durable chunk." },
+            CaptureHealth = new AudioBufferHealth
+            {
+                CapacityPackets = 500,
+                PeakQueuedPackets = 37,
+                DroppedPackets = 4,
+                OverflowEvents = 2,
+                LongestStallMs = 1_250,
+                StallEvents = 1,
+                GapTotalMs = 3_000,
+                GapCount = 2,
+            },
+        };
+
+        var json = SessionManifestStore.Serialize(manifest);
+
+        foreach (var key in new[]
+                 {
+                     "\"gap_count\"",
+                     "\"gap_total_ms\"",
+                     "\"gaps_remain\"",
+                     "\"gap_details\"",
+                     "\"capture_health\"",
+                     "\"capacity_packets\"",
+                     "\"peak_queued_packets\"",
+                     "\"dropped_packets\"",
+                     "\"overflow_events\"",
+                     "\"longest_stall_ms\"",
+                     "\"stall_events\"",
+                     "\"is_degraded\"",
+                 })
+        {
+            Assert.Contains(key, json, StringComparison.Ordinal);
+        }
+
+        Assert.Contains("\"capacity_packets\": 500", json, StringComparison.Ordinal);
+        Assert.Contains("\"is_degraded\": true", json, StringComparison.Ordinal);
+
+        // Round-trips through the same store the recording writes with.
+        var path = Path.Combine(Path.GetTempPath(), "meetcap-manifest-" + Guid.NewGuid().ToString("N") + ".json");
+        try
+        {
+            SessionManifestStore.Save(path, manifest);
+            Assert.True(SessionManifestStore.TryLoad(path, out var loaded, out var error), error);
+            Assert.Equal(500, loaded!.CaptureHealth!.CapacityPackets);
+            Assert.True(loaded.CaptureHealth.IsDegraded);
+            Assert.Equal(2, loaded.GapCount);
+            Assert.Equal(3_000, loaded.GapTotalMs);
+            Assert.True(loaded.GapsRemain);
+            Assert.Single(loaded.GapDetails);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
     }
 
     [Fact]

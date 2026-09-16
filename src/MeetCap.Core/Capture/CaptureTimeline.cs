@@ -24,6 +24,33 @@ public readonly record struct PacketTiming(
     /// before an outage is durable even if the outage was shorter than a chunk.
     /// </summary>
     public bool IsNewSegment => SegmentRestart;
+
+    /// <summary>
+    /// Where the missing audio starts, in session-relative milliseconds, or <c>null</c>
+    /// when nothing is missing.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Together with <see cref="GapEndMs"/> this is the gap's own interval — audio stopped
+    /// at <see cref="GapStartMs"/> and resumed at <see cref="GapEndMs"/>. It is deliberately
+    /// separate from <see cref="StartMs"/>, which is where <em>this buffer</em> begins.
+    /// </para>
+    /// <para>
+    /// The separation matters because a gap has two independent observers. The live timeline
+    /// measures it while recording; the recovery gap audit
+    /// (<c>MeetCap.AudioPipeline.SessionGapAuditor</c>) re-derives it from the chunk index
+    /// afterwards. Both must be able to name the same hole the same way, or the record of
+    /// what was lost says one thing to a listener and another to a reader
+    /// (docs/RELIABILITY.md section 7).
+    /// </para>
+    /// </remarks>
+    public long? GapStartMs { get; init; }
+
+    /// <summary>
+    /// Where the missing audio ends and captured audio resumes, in session-relative
+    /// milliseconds, or <c>null</c> when nothing is missing.
+    /// </summary>
+    public long? GapEndMs { get; init; }
 }
 
 /// <summary>
@@ -70,6 +97,21 @@ public sealed class CaptureTimeline
 
     /// <summary>Exclusive end of the session timeline in milliseconds.</summary>
     public long LastEndMs => _lastEndMs;
+
+    /// <summary>
+    /// Total audio time this timeline knows is missing, in milliseconds.
+    /// </summary>
+    /// <remarks>
+    /// Every gap is counted here exactly once, at the moment it is placed on the
+    /// timeline. Recording-level gap accounting reads this property instead of
+    /// re-deriving it, so a discontinuity cannot be counted twice (once from the
+    /// device position and once from the measured outage) and cannot be silently
+    /// smoothed away (docs/RELIABILITY.md section 7).
+    /// </remarks>
+    public long GapTotalMs { get; private set; }
+
+    /// <summary>How many discontinuities produced <see cref="GapTotalMs"/>.</summary>
+    public int GapCount { get; private set; }
 
     /// <summary>
     /// Records that capture was interrupted for <paramref name="downtimeMs"/> and
@@ -120,16 +162,31 @@ public sealed class CaptureTimeline
             _pendingGapMs = 0;
             _pendingSegmentRestart = false;
 
-            var targetMs = _lastEndMs + gap;
+            // Audio stopped where the last placed buffer ended, and resumes where the new
+            // stream is placed. Captured before _lastEndMs moves.
+            var gapStartMs = _lastEndMs;
+            var targetMs = gapStartMs + gap;
             _originFrames = packet.DevicePositionFrames - _format.MillisecondsToFrames(targetMs);
             _nextExpectedFrames = packet.DevicePositionFrames + frames;
             _lastEndMs = targetMs + durationMs;
-            return new PacketTiming(targetMs, _lastEndMs, gap, flagged, false, SegmentRestart: true);
+
+            if (gap > 0)
+            {
+                GapTotalMs += gap;
+                GapCount++;
+            }
+
+            return new PacketTiming(targetMs, _lastEndMs, gap, flagged, false, SegmentRestart: true)
+            {
+                GapStartMs = gap > 0 ? gapStartMs : null,
+                GapEndMs = gap > 0 ? targetMs : null,
+            };
         }
 
         var skippedFrames = packet.DevicePositionFrames - _nextExpectedFrames;
         var anomaly = false;
         long gapMs = 0;
+        long? skippedGapStartMs = null;
         long startMs;
 
         if (skippedFrames >= 0)
@@ -138,6 +195,10 @@ public sealed class CaptureTimeline
             if (skippedFrames > 0)
             {
                 gapMs = _format.FramesToMilliseconds(skippedFrames);
+
+                // The device skipped this span: audio is missing from where the last placed
+                // buffer ended up to where this one begins.
+                skippedGapStartMs = _lastEndMs;
             }
         }
         else
@@ -157,7 +218,17 @@ public sealed class CaptureTimeline
         _nextExpectedFrames = packet.DevicePositionFrames + frames;
         _lastEndMs = endMs;
 
-        return new PacketTiming(startMs, endMs, gapMs, flagged, anomaly);
+        if (gapMs > 0)
+        {
+            GapTotalMs += gapMs;
+            GapCount++;
+        }
+
+        return new PacketTiming(startMs, endMs, gapMs, flagged, anomaly)
+        {
+            GapStartMs = skippedGapStartMs,
+            GapEndMs = skippedGapStartMs is null ? null : startMs,
+        };
     }
 
     /// <summary>

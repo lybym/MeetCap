@@ -24,10 +24,19 @@ public static class SessionEventNames
     public const string CaptureDeviceLostFatal = "capture.device_lost_fatal";
     public const string CaptureFormatChanged = "capture.format_changed";
     public const string CaptureBufferOverflow = "capture.buffer_overflow";
+    public const string CaptureConsumerStalled = "capture.consumer_stalled";
 
     public const string StorageLowDiskSpace = "storage.low_disk_space";
     public const string StorageDiskExhausted = "storage.disk_exhausted";
     public const string StorageProbeFailed = "storage.probe_failed";
+
+    /// <summary>
+    /// Written by startup recovery or <c>meetcap session repair</c> when the session's
+    /// timeline still has a provable hole. docs/RELIABILITY.md section 6 forbids
+    /// claiming success while a known gap remains, so this event is the durable
+    /// statement of that failure.
+    /// </summary>
+    public const string SessionRepairIncomplete = "session.repair.incomplete";
 }
 
 /// <summary>
@@ -44,6 +53,26 @@ public sealed record SessionEvent(string Name, long AtMs)
 
     public long? EndMs { get; init; }
 
+    /// <summary>
+    /// Where a <c>capture.gap</c> starts, in session-relative milliseconds: the position at
+    /// which audio stopped.
+    /// </summary>
+    /// <remarks>
+    /// The live recording and the recovery gap audit are two independent observers of the
+    /// same hole, and <see cref="StartMs"/> means different things to each of them — the live
+    /// writer sets it to the position this buffer begins at, which is where audio
+    /// <em>resumes</em>. Publishing the gap's own interval on both records is what lets a
+    /// reader — and recovery itself — tell that two events describe one hole rather than two
+    /// (docs/RELIABILITY.md section 7).
+    /// </remarks>
+    public long? GapStartMs { get; init; }
+
+    /// <summary>
+    /// Where a <c>capture.gap</c> ends, in session-relative milliseconds: the position at
+    /// which captured audio resumes.
+    /// </summary>
+    public long? GapEndMs { get; init; }
+
     public long? GapMs { get; init; }
 
     public long? DevicePositionFrames { get; init; }
@@ -51,6 +80,14 @@ public sealed record SessionEvent(string Name, long AtMs)
     public long? QpcPositionTicks { get; init; }
 
     public long? FreeBytes { get; init; }
+
+    /// <summary>
+    /// Machine-readable classification of the event, used by <c>capture.gap</c> to state
+    /// <em>why</em> audio is missing (docs/DATA_MODEL.md section 4). The event name alone
+    /// would make "the device skipped it" indistinguishable from "a chunk could not be
+    /// repaired".
+    /// </summary>
+    public string? Reason { get; init; }
 
     public int? Count { get; init; }
 

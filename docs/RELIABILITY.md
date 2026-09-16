@@ -133,3 +133,85 @@ Measure dropped/gap duration, buffer backlog, memory growth, handles/threads, ch
 If fixing a rare failure would require a new distributed transaction protocol, external message broker, complex journal, or large recovery state machine, first verify that the required reliability property belongs to the current milestone.
 
 Prefer simple durable files plus SQLite for this local, single-user system.
+
+---
+
+## 14. M2 status
+
+This section records implementation status. It adds no requirement and weakens none of the
+sections above.
+
+Implemented, and covered by the automated suite that runs in CI (`.github/workflows/ci.yml`,
+`dotnet test` on `windows-latest`):
+
+- **Bounded memory (section 4).** The packet queue keeps its M1 bound
+  (`max(8, capture.buffer_seconds × 100)` packets), and that bound is now accounted for:
+  `CaptureBacklogMonitor` records accepted, drained and refused packets, the peak backlog and
+  the stalled-consumer observations, and `RecordingSession` persists the `AudioBufferHealth`
+  snapshot as `capture_health` in `session.json`. Backpressure is visible three ways:
+  `capture.buffer_overflow` when the bound refuses a packet, `capture.consumer_stalled` when the
+  queue stays occupied for `capture.buffer_seconds` without a chunk closing, and the
+  `capture buffer:` line every `meetcap start` prints. Recording has priority in all three
+  cases; capture is never throttled.
+  Covered by `tests/MeetCap.Core.Tests/Capture/CaptureBacklogMonitorTests.cs` and by the queue
+  overflow, stalled-consumer and unused-buffer cases in
+  `tests/MeetCap.AudioPipeline.Tests/RecordingSessionTests.cs`.
+- **Crash recovery and gap honesty (sections 6 and 7).** Recovery repairs `.part` chunks as
+  before, then audits the repaired session's chunk index with `SessionGapAuditor`, writes an
+  explicit `capture.gap` for every hole the live recording never saw (idempotently), and writes
+  `session.repair.incomplete` whenever a gap remains. A repaired session with a known hole is
+  therefore never presented as whole. The live timeline counts each discontinuity exactly once
+  (`CaptureTimeline.GapTotalMs` / `GapCount`) and persists it with the session, so missing audio
+  is a fact in the durable record rather than a shifted timestamp.
+  Covered by `tests/MeetCap.Core.Tests/Capture/CaptureTimelineTests.cs`,
+  `tests/MeetCap.AudioPipeline.Tests/SessionGapAuditorTests.cs` and
+  `tests/MeetCap.AudioPipeline.Tests/SessionRecoveryScannerTests.cs`.
+- **`meetcap session repair` (section 6).** The same recovery pass is exposed as an operator
+  action that exits non-zero when a known gap remains or the requested session was not found,
+  and prints where the audio is missing. `meetcap status` deliberately still exits 0 in every
+  case — it describes state, including a broken one — which is why the acting command is the one
+  that carries the exit code. Covered by
+  `tests/MeetCap.Cli.Tests/CaptureCommandTests.cs`.
+- **One gap, one record (section 7).** A gap has two observers — the live timeline and the
+  recovery audit — so `capture.gap` carries the hole's own interval (`gap_start_ms` /
+  `gap_end_ms`) and recovery recognises its own finding against the recording's by a bounded
+  coverage test rather than by a single position: a recorded gap accounts for an audit gap only
+  when it covers that span to within 50 ms. Recovering an already-reported hole therefore does not
+  report it a second time, a hole the recording's shorter gap merely overlaps is still reported,
+  and a *different* hole that shares only a boundary position is not merged into it. Both weaker
+  rules fail: a position key duplicates one hole, an unbounded intersection hides the uncovered
+  part of the loss from the event log. `session.repair.incomplete` is likewise written once per
+  verdict rather than once per pass. Covered by
+  `tests/MeetCap.AudioPipeline.Tests/SessionRecoveryScannerTests.cs`,
+  `tests/MeetCap.AudioPipeline.Tests/RecordingSessionTests.cs` and
+  `tests/MeetCap.Core.Tests/Capture/CaptureTimelineTests.cs`.
+- **Recording independence (section 1).** `MeetCap.AudioPipeline` references no ASR, cloud,
+  HTTP or speaker assembly and exposes no provider type, so the M2 exit criterion is enforced
+  structurally and not only behaviourally. Covered by
+  `tests/MeetCap.AudioPipeline.Tests/CaptureIndependenceTests.cs`.
+
+Known coverage limits of the gap audit, stated rather than implied:
+
+- `SessionGapAuditor.Audit(sessionId)`'s failure path — a `SqliteException` while reading the
+  index, which turns into `SessionAudit.Problems` and therefore into an incomplete repair — is
+  **not covered by a test**. Provoking it needs an unreadable or schema-less database, which a
+  healthy run cannot produce, and the exit-code contract it feeds *is* covered through the
+  `gaps_remain` path. It must not be read as verified.
+- The audit reads spans from the chunk index, so it sees a hole *between* durable chunks. A
+  device skip inside a single chunk's span is invisible to it and is reported only by the live
+  timeline. This is a real limit of the audit's evidence, not a bug in it
+  (`docs/DATA_MODEL.md` section 5.1).
+
+Still not verified on real hardware:
+
+- the section 11 process-termination test and the section 8 device scenarios are exercised in
+  CI against a scripted capture source and a hand-built "not cleanly stopped" session, not
+  against a real microphone or a real forced kill;
+- the section 12 two-hour soak has not been run. `docs/M1_WINDOWS_VALIDATION.md` is still
+  **not yet run**: it holds M1's scenarios and, in section 10, M2's own checklist (buffer
+  accounting, a slow consumer, explicit gaps, and `meetcap session repair`);
+- the slow-consumer behaviour is produced with an injected consumer delay, not with a genuinely
+  slow disk.
+
+M2 is therefore **implemented and automatically covered**, not verified end to end
+(`docs/DEVELOPMENT.md` section 7).

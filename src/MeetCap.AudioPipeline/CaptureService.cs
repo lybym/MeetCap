@@ -21,6 +21,39 @@ public sealed record StopRequestOutcome(
     bool ConfirmedStopped);
 
 /// <summary>
+/// What <c>meetcap session repair</c> achieved for one session (or for every session when
+/// no session was named).
+/// </summary>
+/// <remarks>
+/// <see cref="RecoveryIncomplete"/> exists so the CLI can return a non-zero exit code
+/// while a known gap remains. docs/RELIABILITY.md section 6 forbids claiming success in
+/// that case, and an operator scripting a repair has to be able to see the difference.
+/// </remarks>
+public sealed record SessionRepairOutcome(string? RequestedSessionId, RecoveryReport Report)
+{
+    /// <summary>True when the requested session was found and processed.</summary>
+    public bool Found
+        => RequestedSessionId is null || Report.Sessions.Count > 0;
+
+    /// <summary>True when a known gap remains, or the requested session does not exist.</summary>
+    public bool RecoveryIncomplete => !Found || Report.RecoveryIncomplete;
+
+    /// <summary>Missing audio across the repaired sessions, in milliseconds.</summary>
+    public long RemainingGapMs => Report.RemainingGapMs;
+
+    /// <summary>A one-line summary for the CLI.</summary>
+    public string Describe()
+    {
+        if (!Found)
+        {
+            return $"session '{RequestedSessionId}' was not found under the data root";
+        }
+
+        return Report.Describe();
+    }
+}
+
+/// <summary>
 /// The recording operations the CLI drives: device listing, session preparation,
 /// running a session, requesting a stop, and the startup recovery scan.
 /// </summary>
@@ -91,6 +124,23 @@ public sealed class CaptureService
         return new SessionRecoveryScanner(_database, _platform.Clock).Scan(_settings.DataRoot);
     }
 
+    /// <summary>
+    /// Repairs one session, or every session when <paramref name="sessionId"/> is null,
+    /// and audits the result (docs/RELIABILITY.md section 6).
+    /// </summary>
+    /// <remarks>
+    /// This is the entry point behind <c>meetcap session repair</c>. It runs the same
+    /// scanner the startup path runs, so an operator-triggered repair cannot classify an
+    /// artifact differently from an automatic one.
+    /// </remarks>
+    public SessionRepairOutcome RepairSession(string? sessionId)
+    {
+        _database.EnsureMigrated();
+        var scanner = new SessionRecoveryScanner(_database, _platform.Clock);
+        var report = scanner.Scan(_settings.DataRoot, sessionId);
+        return new SessionRepairOutcome(sessionId, report);
+    }
+
     /// <summary>The newest session that still holds the recording surface, if any.</summary>
     public ActiveSessionInfo? FindActiveSession()
     {
@@ -123,10 +173,15 @@ public sealed class CaptureService
     /// session without running it releases the marker, so an abandoned session is left
     /// recoverable (docs/ARCHITECTURE.md section 9.1).
     /// </remarks>
+    /// <param name="title">Session title recorded in the manifest and the index row.</param>
+    /// <param name="afterPacketWritten">
+    /// Test seam forwarded to the recording session, so a test can make the consumer slow
+    /// and observe bounded-buffer behaviour. Production callers omit it.
+    /// </param>
     /// <exception cref="DeviceUnavailableException">No usable microphone.</exception>
     /// <exception cref="InsufficientDiskSpaceException">Not enough free space to record.</exception>
     /// <exception cref="MeetCapException">Another process already owns this session's marker.</exception>
-    public RecordingSession PrepareSession(string title)
+    public RecordingSession PrepareSession(string title, Action? afterPacketWritten = null)
     {
         var device = ResolveDevice();
 
@@ -182,7 +237,8 @@ public sealed class CaptureService
                 _platform.Clock,
                 manifest,
                 _maxDeviceRecoveryAttempts,
-                recordingLock);
+                recordingLock,
+                afterPacketWritten);
 
             recordingLock = null;
             return session;

@@ -109,6 +109,59 @@ A forced process termination does not invalidate previously closed chunks.
 
 Prove "record first" invariants.
 
+## Status
+
+Implemented (issue #4).
+
+What landed:
+
+- bounded-buffer accounting: `CaptureBacklogMonitor` and `AudioBufferHealth` record the
+  packets the queue accepted, dropped and drained, the peak backlog and the stall
+  observations, and the snapshot is persisted as `capture_health` in `session.json`;
+- stalled-downstream-consumer reporting: a queue that stays occupied for
+  `capture.buffer_seconds` without a chunk closing marks the session degraded and writes
+  `capture.consumer_stalled`; capture is never throttled;
+- explicit gap accounting: `CaptureTimeline.GapTotalMs` / `GapCount` count every
+  discontinuity exactly once, and `gap_count`, `gap_total_ms` and `gap_ms` are persisted;
+- a durable gap audit: `SessionGapAuditor` and `SessionAudit` derive the missing stretches of
+  a session timeline from the `audio_chunks` index with an explicit reason
+  (`not_captured`, `chunk_unreadable`, `chunk_missing`), and mutate nothing;
+- recovery honesty: startup recovery audits after repairing, writes idempotent `capture.gap`
+  events for holes the live recording never saw, and writes `session.repair.incomplete`
+  whenever a gap remains instead of claiming success;
+- `meetcap session repair [--session <id>]`, which exits non-zero when a known gap remains or
+  the requested session was not found;
+- CLI reporting: `meetcap start` prints
+  `capture buffer: peak N/M packets, dropped N, stalled N time(s) (longest N ms)` and
+  `audio gaps: N (M ms missing)`, and `meetcap status` prints the `timeline:` / `gap:` lines
+  for a recovered session that still has a gap;
+- no new configuration key: the queue bound and the stall threshold both reuse
+  `capture.buffer_seconds` (`docs/CONFIGURATION.md` section 6);
+- no new SQLite table or migration (`docs/DATA_MODEL.md` section 14).
+
+Automated coverage:
+
+```text
+tests/MeetCap.Core.Tests/Capture/CaptureTimelineTests.cs
+tests/MeetCap.Core.Tests/Capture/CaptureBacklogMonitorTests.cs
+tests/MeetCap.AudioPipeline.Tests/SessionGapAuditorTests.cs
+tests/MeetCap.AudioPipeline.Tests/SessionRecoveryScannerTests.cs
+tests/MeetCap.AudioPipeline.Tests/RecordingSessionTests.cs
+tests/MeetCap.AudioPipeline.Tests/CaptureIndependenceTests.cs
+tests/MeetCap.Cli.Tests/CaptureCommandTests.cs
+```
+
+`CaptureIndependenceTests` pins the milestone exit criterion structurally: the recording
+assembly may not reference the ASR, cloud, HTTP or speaker stack, so recording keeps working
+with every downstream module disabled.
+
+What still requires a real Windows run: the 2-hour soak, a real microphone unplug/replug, a real
+forced process kill, and a genuinely slow disk. M2's share of the manual checklist is
+`docs/M1_WINDOWS_VALIDATION.md` section 10, and it has **not** been run yet. The suite drives a
+scripted capture source and an injected consumer delay, so M2 is **implemented and automatically
+covered**, not verified end to end (`docs/DEVELOPMENT.md` section 7,
+`docs/RELIABILITY.md` section 14).
+
 ## Deliverables
 
 - bounded capture buffers

@@ -29,13 +29,15 @@ meetcap import .\meeting.m4a --title "Project Review"
 
 ## Implemented so far
 
-M0 (skeleton), M1 (offline microphone capture), and M3 (recording import + file ASR) are implemented:
+M0 (skeleton), M1 (offline microphone capture), M2 (durable spool and recovery hardening),
+and M3 (recording import + file ASR) are implemented:
 
 ```powershell
 meetcap devices                  # active capture endpoints, default and configured
 meetcap start "Weekly Meeting" --mode offline
 meetcap stop                     # signals the running recording to finish
 meetcap status                   # config, data root, database, incomplete sessions
+meetcap session repair           # repair/audit sessions a killed process left behind
 meetcap config init
 meetcap config path
 meetcap config validate
@@ -45,7 +47,11 @@ meetcap asr resume                                     # continue queued/retried
 ```
 
 Offline capture (M1) writes recoverable WAV chunks, indexes them in `audio_chunks`, and
-crash-recovers unfinished sessions on the next start. An import (M3):
+crash-recovers unfinished sessions on the next start. M2 makes that reliability auditable:
+the capture queue reports its bound, its peak backlog, the audio it had to drop and any
+stalled downstream consumer; discontinuities are quantified in `session.json` rather than
+only logged; and `meetcap session repair` re-repairs and audits a session, exiting non-zero
+when the timeline still has a known gap instead of claiming success. An import (M3):
 
 1. inspects the file with FFprobe and normalizes it with FFmpeg only when required;
 2. copies the source into `sessions/<id>/audio/import/` (the original file is never modified);
@@ -56,9 +62,9 @@ Provider speaker labels are preserved exactly as anonymous, session-scoped data.
 treated as persistent human identities.
 
 Real Volcengine transcription is not verified by CI: no credentials are available there, so the
-provider boundary is mocked in tests. M1's hardware-dependent acceptance tests are still open
-and are tracked as a manual checklist in `docs/M1_WINDOWS_VALIDATION.md`; nothing here claims M1
-is verified end to end on real audio hardware yet.
+provider boundary is mocked in tests. M1's and M2's hardware-dependent acceptance tests are
+still open and are tracked as a manual checklist in `docs/M1_WINDOWS_VALIDATION.md`; nothing
+here claims M1 or M2 is verified end to end on real audio hardware yet.
 
 ## Planned CLI
 

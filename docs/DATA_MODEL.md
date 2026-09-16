@@ -150,9 +150,60 @@ written atomically (write to `session.json.tmp`, then replace), so a truncated m
 never overwrites a good one.
 
 `degraded` is true when the session saw an audio discontinuity, a device loss, a queue
-overflow or a storage problem. `end_reason` names why the session ended
-(`stop_requested`, `device_lost`, `disk_exhausted`, `storage_error`,
+overflow, a stalled downstream consumer or a storage problem. `end_reason` names why the
+session ended (`stop_requested`, `device_lost`, `disk_exhausted`, `storage_error`,
 `capture_start_failed`, `interrupted`).
+
+M2 adds the session's own gap and bounded-buffer accounting to the same document. The fields
+are additive: a reader that does not know them still reads the manifest, and a manifest written
+before M2 — or by a recording that never reached its teardown — simply lacks `capture_health`,
+`gaps_remain` and `gap_details`. Their absence means "not recorded", never "no problems".
+
+```json
+{
+  "gap_count": 1,
+  "gap_total_ms": 1250,
+  "capture_health": {
+    "capacity_packets": 500,
+    "peak_queued_packets": 37,
+    "dropped_packets": 0,
+    "overflow_events": 0,
+    "longest_stall_ms": 0,
+    "stall_events": 0,
+    "gap_total_ms": 1250,
+    "gap_count": 1,
+    "is_degraded": true
+  },
+  "gaps_remain": false,
+  "gap_details": []
+}
+```
+
+- `gap_count` and `gap_total_ms` are what the capture timeline observed while it was alive:
+  one count per discontinuity — a device-position skip or a measured device outage — and the
+  milliseconds they add up to (`docs/ARCHITECTURE.md` section 8.1). The `session.stopped`
+  event carries the same total as `gap_ms`.
+- `capture_health` is the `AudioBufferHealth` record: the queue bound this session actually
+  used (`capacity_packets`, `AudioBufferHealth.CapacityPackets` in C#), the deepest backlog it
+  reached (`peak_queued_packets`), the packets the bound refused (`dropped_packets` and the
+  `overflow_events` that produced them), the stalled-consumer observations (`stall_events`,
+  `longest_stall_ms`), the same gap totals again, and the `is_degraded` verdict, which is
+  computed from those counts and written anyway so a reader does not have to re-derive it. The
+  record's property names are the on-disk names, because the manifest serializer writes the
+  record directly and there is no second hand-written JSON form to drift from them. It is
+  written when the recording session writes its final manifest.
+- `gaps_remain` and `gap_details` are always present, defaulting to `false` and `[]`; startup
+  recovery and `meetcap session repair` set them after auditing the session: `gaps_remain` is
+  true while the timeline still holds a provable gap after every repair that could be
+  attempted, and `gap_details` holds one `SessionAudit.DescribeGaps()` line per gap
+  (`docs/RELIABILITY.md` section 6).
+- Recovery does **not** rewrite `gap_count` / `gap_total_ms`. Those fields mean "what the live
+  capture timeline measured while recording", and the audit's finding is a different fact, kept
+  in `gaps_remain` / `gap_details`. Overwriting one with the other would change what the field
+  means and can produce a self-contradictory pair — `gaps_remain: true` next to a
+  `gap_total_ms` of `0`, which an unreadable chunk with no recorded position legitimately
+  produces. A reader that wants "is anything missing" reads `gaps_remain`; a reader that wants
+  "what did the recorder itself measure" reads `gap_total_ms`.
 
 Import sessions add the source artifact mapping (M3), which is what preserves provenance
 without ever mutating the user's original file:
@@ -186,6 +237,10 @@ Append-only operational events, one JSON object per line.
 {"event":"audio.chunk.closed","source":"mic","chunk":"000001.wav","start_ms":0,"end_ms":60000}
 {"event":"asr.job.queued","job_id":"job_01","source":"mic","start_ms":0,"end_ms":300000}
 {"event":"capture.device_lost","source":"loopback","at_ms":934522}
+{"event":"capture.consumer_stalled","at_ms":120000,"source":"mic","count":480,"detail":"the recording consumer has not drained the queue for 5000 ms while 480 of 500 packet slots are still occupied; audio capture is unaffected and the backlog stays inside its configured bound."}
+{"event":"capture.gap","at_ms":300000,"source":"mic","gap_start_ms":240000,"gap_end_ms":300000,"gap_ms":60000,"reason":"chunk_unreadable","count":1,"detail":"chunk(s) 000005=corrupt are not durable audio, so this stretch of the track timeline has no readable bytes."}
+{"event":"capture.gap","at_ms":125000,"source":"mic","gap_start_ms":120000,"gap_end_ms":125000,"gap_ms":5000,"device_position_frames":5760000,"qpc_position_ticks":1200000000,"detail":"the device skipped audio between buffers."}
+{"event":"session.repair.incomplete","at_ms":300000,"gap_ms":60000,"count":1,"reason":"gap_detected","detail":"recovery could not make this session whole; 1 gap(s), 60000 ms of audio missing (1 from unreadable artifacts). The audio that is missing has no durable chunk and was not invented."}
 ```
 
 `at_ms` is the session-relative position on the capture timeline, never a wall-clock
@@ -206,6 +261,61 @@ capture.format_changed     capture.buffer_overflow
 
 storage.low_disk_space     storage.disk_exhausted    storage.probe_failed
 ```
+
+M2 adds two events to the same vocabulary:
+
+```text
+capture.consumer_stalled   the bounded queue stayed occupied for at least
+                           capture.buffer_seconds while no chunk closed
+session.repair.incomplete  recovery could not make a session whole
+```
+
+`session.repair.incomplete` is written by startup recovery and by `meetcap session repair`
+when the session's timeline still holds a provable gap after every repair that could be
+attempted — including for a session that had already stopped cleanly and merely held a stray
+artifact. Its `reason` is `gap_detected`, or `audit_failed` when the chunk index itself could
+not be read. It is the durable statement that recovery did not make the session whole, so no
+consumer of the event log has to infer that from a missing chunk. It is written once per
+verdict, not once per pass: recovery re-runs on every command, so the event is only appended
+when the reason, the gap count and the missing milliseconds differ from a copy already in the
+log. A new event therefore means the picture actually changed.
+
+The event object also gained an optional `reason` field: a machine-readable classification for
+events whose name alone is not specific enough. `capture.gap` uses it for the gap reason
+(`not_captured`, `chunk_unreadable` or `chunk_missing`, section 5.1) and `session.recovered`
+sets `reason=incomplete` when the session still has a known gap.
+
+### 4.1 `capture.gap` has two producers, and they must name the same hole
+
+A gap is observed twice: the live recording measures it while it is running, and recovery
+re-derives it from the chunk index afterwards (section 5.1). The event therefore carries the
+gap's own interval in `gap_start_ms` / `gap_end_ms` — where audio stopped and where it resumed
+— and `at_ms` remains the position on the timeline the event is placed at, which for the live
+writer is the resume position.
+
+Those are deliberately not the same coordinate. The live writer's `start_ms`, when it sets it
+at all, is the position of the *buffer* it is writing (where audio resumes), while the audit's
+span runs from the end of the last durable chunk to the start of the next one.
+
+Recovering a session must be able to tell that its own gap and the live recording's gap are one
+hole rather than two, so recovery compares the two intervals under a **bounded** rule: a recorded
+gap accounts for an audit gap only when it **covers** the audit's span, boundary for boundary,
+within a small quantisation tolerance (50 ms, `SessionRecoveryScanner.GapMatchToleranceMs`). A
+device-position skip is bounded by the gap in device positions the recording actually observed, so
+it cannot cover a stretch the chunk index shows holds no readable bytes — which is why an
+unreadable or missing chunk is always reported even when an unrelated live gap starts inside it.
+
+Two weaker rules were tried and rejected, and the reasons are worth keeping:
+
+- matching on a single position (`(start_ms, source)`, or the recorded resume position) misses the
+  hole when the two producers place it differently, so one hole is reported twice;
+- matching on any intersection suppresses an audit gap that a *shorter* live gap merely overlaps.
+  That drops the only durable record of the rest of the loss from the event log and leaves the log
+  contradicting the session's own `gaps_remain`, which is worse than the duplicate it prevents.
+
+Boundary equality within the tolerance also covers the case where both producers agree exactly,
+which is what a real recording produces: the audit's boundaries come from the same chunk
+`start_ms` / `end_ms` values the live timeline wrote.
 
 A degraded condition always produces at least one of these events; nothing about lost
 audio is inferred from a missing chunk.
@@ -249,6 +359,60 @@ actual length, and content hashing is deferred until a milestone needs end-to-en
 verification.
 
 `sequence` is 1-based within a track, and `(session_id, source, sequence)` is unique.
+
+### 5.1 Gap audit (M2)
+
+The durable answer to "which stretches of this session hold no audio" is derived from the
+index above by `SessionGapAuditor`: the audit reads the session's `audio_chunks` rows, states
+what is provably not there, and mutates nothing. It is deliberately a different mechanism from
+the live timeline's gap accounting (`CaptureTimeline`, whose persisted form is `gap_count` /
+`gap_total_ms` in section 3; the mechanism is `docs/ARCHITECTURE.md` section 8.1): the live
+counter measures discontinuities as they happen, the audit reconstructs the same question from
+the artifacts that survived, and recovery uses the one that does not depend on the process
+having stayed alive.
+
+An audit returns a `SessionAudit`: the gaps, plus any problem that stopped the audit from being
+honest. Each gap is an `AudioGap` with `Sequence` (the chunk the gap is attached to), `Source`,
+`StartMs` / `EndMs` (`GapMs` is their difference), `Reason`, `Detail` and `MissingSequences`.
+`RecoveryIncomplete` is true when there is a gap or an audit problem, and that is the flag a
+repair must never report past (`docs/RELIABILITY.md` section 6).
+
+`Reason` is one of exactly three values:
+
+```text
+not_captured       the audio was never captured: the device skipped it, the session was
+                   interrupted, or the bounded queue had to drop it
+chunk_unreadable   a chunk exists for this position but is not durable audio
+chunk_missing      the index knows a chunk at this position, but no file is on disk
+```
+
+Only `closed` and `recovered` chunks are durable. The rules that produce those values:
+
+- a run of non-durable chunks plus any adjacent timeline hole is **one** gap, spanning from the
+  end of the last durable chunk to the start of the next durable one, rather than several
+  overlapping gaps that would misstate how much audio is missing;
+- the reason is `chunk_unreadable` or `chunk_missing` when a non-durable chunk caused the
+  stretch, and `not_captured` otherwise. `chunk_missing` is used only when **every**
+  non-durable chunk in the run is `missing`;
+- a chunk number the track skipped while its timeline stayed contiguous is still reported: a
+  zero-length gap (`start_ms` = `end_ms`) whose `MissingSequences` names the skipped numbers,
+  because a chunk number that never reached disk is exactly the loss that must not be hidden;
+- `MissingSequences` lists the chunk numbers inside the gap with no durable audio — the
+  sequences of the non-durable index entries plus any sequence number the track skipped — and
+  `capture.gap` carries that count as `count`;
+- an index that cannot be read at all is a problem, not "no gaps", so an unreadable
+  `meetcap.db` can never be mistaken for a healthy session.
+
+Gaps are always one event with an explicit reason, never a shifted timestamp. M2 adds **no**
+SQLite table and no migration for any of this (sections 11 and 14).
+
+One limitation is worth stating, because the audit is easy to over-trust. The audit reads spans
+from the chunk index, so it can only see a hole that falls *between* durable chunks. A device
+skip that happens inside the audio one chunk holds is invisible to it: the chunk's `start_ms` /
+`end_ms` describe the timeline span it covers, not the continuity of the frames inside it. That
+case is still reported — by the live timeline, while the recording runs, as `capture.gap` — and
+the audit stays silent about it because the audio it would otherwise re-derive was never lost
+between chunks. The two mechanisms cover different holes; neither replaces the other.
 
 ## 6. ASR job
 
@@ -421,6 +585,10 @@ already-applied, and an unnumbered script is never considered at all.
 - **0001_sessions** (M0): creates `schema_migrations` and the `sessions` table (section 1) with `CHECK` constraints on `mode` (`offline`/`online`/`import`) and `source_type` (`live`/`import`), plus convenience indexes on `status` and `started_at`.
 - **0002_audio_chunks** (M1): creates the `audio_chunks` table (section 5) with `CHECK` constraints on `source` (`mic`/`loopback`), `sample_format` (`pcm`/`ieee_float`) and `status`, a unique key on `(session_id, source, sequence)`, a `REFERENCES sessions (id) ON DELETE CASCADE` clause, and indexes on `(session_id, source, sequence)` and `status`. Foreign keys are enabled per connection, so a chunk row cannot exist without its session.
 - **0003_asr_jobs** (M3): creates the `asr_jobs` table (section 6) with a `CHECK` constraint on `status` and indexes on `status`, `session_id`, and `next_retry_at`.
+- **M2** requires no new migration. The bounded-buffer accounting and the gap totals live in
+  `session.json` and `events.jsonl` (sections 3 and 4), and the gap audit (section 5.1) reads
+  the M1 `audio_chunks` index. No table, column or constraint changed, so the applied schema is
+  identical before and after M2.
 - Later milestones add `speakers`, `speaker_embeddings` and `speaker_assignments` as their features are implemented, each as a new numbered migration. No table is created ahead of its feature (section 11).
 
 Two scripts claiming one version would make the second look already applied and its tables would

@@ -66,6 +66,18 @@ internal static class StatusCommand
         {
             context.Out.WriteLine($"  {session.SessionId}: {session.Status} — {session.Detail}");
             context.Out.WriteLine($"      directory: {session.SessionDirectory}");
+
+            // A repaired session that still has a hole in its timeline must say so here,
+            // not only in the event log: docs/RELIABILITY.md section 6 forbids presenting
+            // such a session as recovered.
+            if (session.Audit.HasGap)
+            {
+                context.Out.WriteLine($"      timeline:  {session.Audit.Describe()}");
+                foreach (var gap in session.Audit.DescribeGaps())
+                {
+                    context.Out.WriteLine($"      gap:       {gap}");
+                }
+            }
         }
 
         foreach (var problem in report.Problems)
@@ -76,11 +88,13 @@ internal static class StatusCommand
         context.LoggerFactory
             .CreateLogger(CliContext.LoggerCategory)
             .LogInformation(
-                "status: dataRoot={DataRoot} dbInitialized={DbInit} activeSessions={Active} recovered={Recovered}",
+                "status: dataRoot={DataRoot} dbInitialized={DbInit} activeSessions={Active} recovered={Recovered} " +
+                "gapsRemain={GapsRemain}",
                 dataRoot,
                 dbInitialized,
                 activeSessions,
-                report.RecoveredSessions);
+                report.RecoveredSessions,
+                report.RecoveryIncomplete);
 
         return Task.FromResult(0);
     }
@@ -89,6 +103,15 @@ internal static class StatusCommand
     /// Runs the startup scan. Recovery problems are reported as warnings rather than
     /// failing <c>status</c>, because the command's job is to describe state.
     /// </summary>
+    /// <remarks>
+    /// <c>status</c> therefore exits 0 even when the scan leaves a known gap, and that is a
+    /// decision rather than an omission: it exits 0 in every case, so its exit code never has
+    /// to be interpreted, and it stays usable in a check that must describe a broken data root
+    /// instead of failing on it. The gap is still reported in its output and in the session's
+    /// own artifacts, and the command that acts on a gap — <c>meetcap session repair</c> — is
+    /// the one that exits non-zero while recovery is incomplete
+    /// (<c>docs/DEVELOPMENT.md</c> section 8, <c>docs/RELIABILITY.md</c> section 6).
+    /// </remarks>
     private static RecoveryReport? RunStartupRecovery(
         CliContext context,
         MeetCapConfiguration configuration,

@@ -64,6 +64,7 @@ internal static class CommandTree
 
         var importCommand = BuildImport(secrets, loggerFactory, storeFactory, output, error, environment);
         var asrCommand = BuildAsr(secrets, loggerFactory, storeFactory, output, error, environment);
+        var sessionCommand = BuildSession(secrets, loggerFactory, storeFactory, output, error, environment, platformFactory);
 
         root.Subcommands.Add(configCommand);
         root.Subcommands.Add(statusCommand);
@@ -72,10 +73,12 @@ internal static class CommandTree
         root.Subcommands.Add(stopCommand);
         root.Subcommands.Add(importCommand);
         root.Subcommands.Add(asrCommand);
+        root.Subcommands.Add(sessionCommand);
 
         root.SetAction(parseResult => RequireVerb(parseResult, root, error));
         configCommand.SetAction(parseResult => RequireSubcommand(parseResult, configCommand, error));
         asrCommand.SetAction(parseResult => RequireSubcommand(parseResult, asrCommand, error));
+        sessionCommand.SetAction(parseResult => RequireSubcommand(parseResult, sessionCommand, error));
         statusCommand.SetAction((parseResult, _) =>
             StatusCommand.Run(CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory)));
         devicesCommand.SetAction((parseResult, _) =>
@@ -171,6 +174,34 @@ internal static class CommandTree
 
         var command = new Command("asr", "Inspect and resume the persistent ASR job queue.");
         command.Subcommands.Add(resume);
+        return command;
+    }
+
+    /// <summary>Builds the <c>meetcap session</c> command family.</summary>
+    private static Command BuildSession(
+        SecretRegistry secrets,
+        ILoggerFactory loggerFactory,
+        Func<string, IConfigurationStore> storeFactory,
+        TextWriter output,
+        TextWriter error,
+        CliEnvironment? environment,
+        ICapturePlatformFactory? platformFactory)
+    {
+        var session = new Option<string?>("--session", "-s")
+        {
+            Description = "Only repair this session id. Defaults to every session under the data root.",
+        };
+
+        var repair = new Command(
+            "repair",
+            "Repair and audit recording sessions left behind by a killed process.");
+        repair.Options.Add(session);
+        repair.SetAction((parseResult, _) => SessionCommand.RepairAsync(
+            CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory),
+            parseResult.GetValue(session)));
+
+        var command = new Command("session", "Repair and audit recorded sessions.");
+        command.Subcommands.Add(repair);
         return command;
     }
 

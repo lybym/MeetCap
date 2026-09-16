@@ -325,6 +325,132 @@ public class CaptureCommandTests
         Assert.Contains("devices", result.Error);
         Assert.Contains("start", result.Error);
         Assert.Contains("stop", result.Error);
+        Assert.Contains("session", result.Error);
+    }
+
+    [Fact]
+    public void SessionRepair_OnACleanDataRoot_SucceedsWithNothingToDo()
+    {
+        using var harness = CliHarness.Create();
+        harness.WriteCaptureConfig();
+
+        // First pass creates the database.
+        Assert.Equal(0, harness.Run("status").ExitCode);
+
+        var result = harness.Run("session", "repair");
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.Contains("no incomplete sessions found", result.Output);
+    }
+
+    [Fact]
+    public void SessionRepair_RepairsASessionThatWasNotCleanlyStoppedAndExitsZeroWhenNothingIsMissing()
+    {
+        using var harness = CliHarness.Create();
+        harness.WriteCaptureConfig();
+
+        Assert.Equal(0, harness.Run("status").ExitCode);
+
+        var sessionId = SeedKilledSession(harness, dataBytes: 48_000);
+
+        var result = harness.Run("session", "repair", "--session", sessionId);
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.Contains(sessionId, result.Output);
+        Assert.Contains("1 chunk(s) recovered", result.Output);
+        Assert.Contains("timeline: no gaps", result.Output);
+
+        // The active chunk became durable and the session stopped claiming to be recording.
+        var paths = new SessionPaths(harness.DataRoot, sessionId);
+        Assert.False(File.Exists(paths.ChunkPartPath(AudioSource.Mic, 1)));
+        Assert.True(File.Exists(paths.ChunkFinalPath(AudioSource.Mic, 1)));
+
+        var database = new MeetCapDatabase(Path.Combine(harness.DataRoot, "meetcap.db"));
+        Assert.Equal(SessionStatus.Interrupted, database.Sessions.Find(sessionId)!.Status);
+    }
+
+    [Fact]
+    public void SessionRepair_WithAnUnrecoverableChunk_ExitsNonZeroAndStatesWhereTheAudioIsMissing()
+    {
+        using var harness = CliHarness.Create();
+        harness.WriteCaptureConfig();
+
+        Assert.Equal(0, harness.Run("status").ExitCode);
+
+        var sessionId = SeedKilledSession(harness, dataBytes: 48_000);
+
+        // Replace the recoverable active chunk with bytes that are not a WAV at all, so
+        // recovery can classify it but cannot repair it. docs/RELIABILITY.md section 6
+        // forbids reporting success while a known gap remains, so this must exit non-zero.
+        var paths = new SessionPaths(harness.DataRoot, sessionId);
+        File.WriteAllBytes(
+            paths.ChunkPartPath(AudioSource.Mic, 1),
+            Enumerable.Range(0, 512).Select(i => (byte)i).ToArray());
+
+        var result = harness.Run("session", "repair", "--session", sessionId);
+
+        Assert.Equal(1, result.ExitCode);
+        Assert.Contains("1 chunk(s) unreadable", result.Output);
+        Assert.Contains("still have a known gap", result.Output);
+        Assert.Contains("gap:", result.Output);
+        Assert.Contains("recovery is incomplete", result.Error);
+
+        // The unreadable bytes are retained for inspection, never deleted.
+        Assert.True(File.Exists(paths.ChunkPartPath(AudioSource.Mic, 1)));
+
+        var events = File.ReadAllText(Path.Combine(paths.SessionDirectory, "events.jsonl"));
+        Assert.Contains("\"session.repair.incomplete\"", events, StringComparison.Ordinal);
+        Assert.Contains("\"capture.gap\"", events, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void SessionRepair_ForAnUnknownSession_ExitsNonZeroWithAnActionableMessage()
+    {
+        using var harness = CliHarness.Create();
+        harness.WriteCaptureConfig();
+
+        Assert.Equal(0, harness.Run("status").ExitCode);
+
+        var result = harness.Run("session", "repair", "--session", "ses_20990101T000000Z_ffffffff");
+
+        Assert.Equal(1, result.ExitCode);
+        Assert.Contains("was not found", result.Output);
+        Assert.Contains("meetcap status", result.Error);
+    }
+
+    /// <summary>
+    /// Creates the artifacts a killed recording leaves behind: a RECORDING session row and
+    /// an active <c>.part</c> chunk with real audio in it.
+    /// </summary>
+    private static string SeedKilledSession(CliHarness harness, int dataBytes)
+    {
+        const string sessionId = "ses_20260915T150000Z_0000000e";
+        var database = new MeetCapDatabase(Path.Combine(harness.DataRoot, "meetcap.db"));
+        database.Sessions.Insert(new SessionRecord
+        {
+            Id = sessionId,
+            Title = "Killed Session",
+            Mode = SessionModes.Offline,
+            SourceType = SessionSourceTypes.Live,
+            Status = SessionStatus.Recording,
+            ConfigVersion = 1,
+            Tracks = new[] { AudioSources.Mic },
+            CreatedAt = new DateTimeOffset(2026, 9, 15, 15, 0, 0, TimeSpan.Zero),
+            UpdatedAt = new DateTimeOffset(2026, 9, 15, 15, 0, 0, TimeSpan.Zero),
+        });
+
+        var paths = new SessionPaths(harness.DataRoot, sessionId);
+        paths.CreateDirectories();
+        var writer = new WaveChunkWriter(
+            paths.ChunkPartPath(AudioSource.Mic, 1),
+            paths.ChunkFinalPath(AudioSource.Mic, 1),
+            new AudioFormat(48_000, 1, 16, AudioSampleFormat.Pcm),
+            capacityBytes: 96_000,
+            sequence: 1);
+        writer.Append(new byte[dataBytes]);
+        writer.Dispose();
+
+        return sessionId;
     }
 
     private static async Task<CliResult> AwaitBounded(Task<CliResult> task, TimeSpan timeout, string description)
