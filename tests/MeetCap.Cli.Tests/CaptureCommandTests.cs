@@ -203,7 +203,13 @@ public class CaptureCommandTests
         var startTask = Task.Run(() => harness.Run("start", "Live Status"));
         var sessionDirectory = WaitForSessionDirectory(harness.DataRoot);
         Assert.NotNull(sessionDirectory);
-        WaitForActiveSession(harness.DataRoot);
+        var sessionId = Path.GetFileName(sessionDirectory!);
+
+        // The session row exists before capture starts, so wait for the state that
+        // actually means "a recording is in progress". The recording claims its liveness
+        // marker at the very start of the run, before this transition, so observing
+        // RECORDING guarantees the marker is held.
+        WaitForSessionStatus(harness.DataRoot, sessionId, SessionStatus.Recording);
 
         // `meetcap status` runs the startup recovery scan from a different process. The
         // live recording holds its liveness marker, so the scan must leave it alone:
@@ -215,11 +221,11 @@ public class CaptureCommandTests
         Assert.Contains("recovery: no incomplete sessions found", status.Output);
         Assert.Contains("sessions: 1 active", status.Output);
 
-        // The scan must not have touched the recording: it is still active, its event log
-        // gained no false recovery event, and it is still stoppable.
+        // The scan must not have touched the recording: it is still recording, its event
+        // log gained no false recovery event, and it is still stoppable.
         var database = new MeetCapDatabase(Path.Combine(harness.DataRoot, "meetcap.db"));
         Assert.NotNull(database.Sessions.FindActiveSession());
-        Assert.Equal(SessionStatus.Recording, database.Sessions.Find(Path.GetFileName(sessionDirectory!))!.Status);
+        Assert.Equal(SessionStatus.Recording, database.Sessions.Find(sessionId)!.Status);
 
         using (var stream = new FileStream(
             Path.Combine(sessionDirectory!, "events.jsonl"),
@@ -370,5 +376,29 @@ public class CaptureCommandTests
         }
 
         throw new TimeoutException("meetcap start did not create an active session row in time.");
+    }
+
+    /// <summary>
+    /// Waits until the session reaches <paramref name="status"/> in the database. The row
+    /// exists before capture starts, so a test that needs a recording to actually be live
+    /// has to wait for the status transition rather than for the row.
+    /// </summary>
+    private static void WaitForSessionStatus(string dataRoot, string sessionId, string status)
+    {
+        var database = new MeetCapDatabase(Path.Combine(dataRoot, "meetcap.db"));
+        var deadline = Environment.TickCount64 + 30_000;
+
+        while (Environment.TickCount64 < deadline)
+        {
+            if (database.IsInitialized() &&
+                string.Equals(database.Sessions.Find(sessionId)?.Status, status, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            Thread.Sleep(50);
+        }
+
+        throw new TimeoutException($"meetcap start did not reach status {status} in time.");
     }
 }
