@@ -90,6 +90,15 @@ public sealed class RecoveryReport
 /// </remarks>
 public sealed class SessionRecoveryScanner
 {
+    /// <summary>
+    /// Suffix appended to a <c>.part</c> that collided with an existing final
+    /// <c>.wav</c> during recovery. The artifact is retained on disk for inspection
+    /// but is not re-enumerated as a <c>.part</c> (it does not end in
+    /// <c>.part</c>) nor as a final <c>.wav</c> by a future scan, so recovery stays
+    /// idempotent.
+    /// </summary>
+    public const string CollidedSuffix = ".collided";
+
     private readonly MeetCapDatabase _database;
     private readonly IClock _clock;
 
@@ -339,7 +348,38 @@ public sealed class SessionRecoveryScanner
         }
 
         var finalPath = paths.ChunkFinalPath(source, sequence.Value);
-        File.Move(partPath, finalPath, overwrite: true);
+
+        // Recovery must never overwrite a durable final WAV (docs/RELIABILITY.md:42;
+        // docs/ARCHITECTURE.md:464). A .part alongside a same-sequence .wav is a stale
+        // or duplicate artifact from an abnormal shutdown; overwriting the .wav would
+        // irreversibly destroy previously closed audio. Retain both artifacts — the
+        // .part is renamed to .collided so it survives for inspection but is not
+        // re-enumerated as a .part on the next scan — and report the collision as
+        // corrupt so the ambiguity is visible, not silently resolved. The existing
+        // .wav and its index row are left untouched here; ReconcileFinalWav promotes
+        // the .wav to durable if its row is still open or missing.
+        if (File.Exists(finalPath))
+        {
+            var collidedPath = partPath + CollidedSuffix;
+            File.Move(partPath, collidedPath, overwrite: true);
+
+            events.Write(new SessionEvent(SessionEventNames.ChunkCorrupt, atMs)
+            {
+                Source = source.ToWireName(),
+                Chunk = fileName,
+                Detail = "a final WAV already exists for this sequence; the .part was retained as .collided to avoid overwriting closed audio.",
+            });
+
+            return new RecoveredChunk(
+                sequence.Value,
+                source.ToWireName(),
+                collidedPath,
+                ChunkStates.Corrupt,
+                dataBytes,
+                "a final WAV already exists for this sequence; the .part was retained to avoid overwriting closed audio");
+        }
+
+        File.Move(partPath, finalPath, overwrite: false);
 
         var durationMs = format.FramesToMilliseconds(format.BytesToFrames(dataBytes));
         UpsertChunk(

@@ -458,6 +458,7 @@ Startup recovery runs before a new recording starts and from `meetcap status`:
 .part with audio             -> patch header, validate, rename, mark recovered
 .part without audio          -> discard it (it holds nothing), report audio.chunk.corrupt
 .part that is not a WAV      -> leave the bytes in place, mark corrupt, report the reason
+.part alongside a closed .wav -> never overwrite the WAV; retain the .part as .collided, mark corrupt
 session not cleanly stopped  -> status INTERRUPTED, manifest records recovered_at
 ```
 

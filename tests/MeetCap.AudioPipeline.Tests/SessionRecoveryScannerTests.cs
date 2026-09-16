@@ -250,6 +250,118 @@ public class SessionRecoveryScannerTests
     }
 
     [Fact]
+    public void Scan_NeverOverwritesAClosedWavWhenASameSequencePartCollides()
+    {
+        using var workspace = new TempWorkspace(sessionStatus: SessionStatus.Recording);
+        var paths = workspace.Paths;
+
+        // A valid, durably-closed chunk (sequence 1) whose index row is CLOSED.
+        WriteChunk(paths, sequence: 1, dataBytes: 2 * SecondBytes, close: true);
+        workspace.Database.Chunks.Upsert(new AudioChunkRecord
+        {
+            Id = AudioChunkRecord.BuildId(paths.SessionId, AudioSource.Mic, 1),
+            SessionId = paths.SessionId,
+            Source = AudioSource.Mic,
+            Sequence = 1,
+            RelativePath = paths.RelativeChunkPath(AudioSource.Mic, 1),
+            StartMs = 0,
+            EndMs = 2_000,
+            Format = Format,
+            ByteLength = 2 * SecondBytes,
+            Status = ChunkStates.Closed,
+            CreatedAt = DateTimeOffset.UnixEpoch,
+            ClosedAt = DateTimeOffset.UnixEpoch,
+        });
+        WriteManifest(paths, SessionStatus.Recording);
+
+        var closedHashBefore = HashFile(paths.ChunkFinalPath(AudioSource.Mic, 1));
+
+        // A stale/duplicate .part for the SAME sequence with DIFFERENT content.
+        // Without the collision guard, recovery would File.Move(..., overwrite: true)
+        // and irreversibly replace the closed WAV.
+        WritePartWithData(paths, sequence: 1, dataBytes: 3 * SecondBytes);
+
+        Assert.True(File.Exists(paths.ChunkPartPath(AudioSource.Mic, 1)));
+        Assert.True(File.Exists(paths.ChunkFinalPath(AudioSource.Mic, 1)));
+
+        var report = new SessionRecoveryScanner(workspace.Database, new FakeClock()).Scan(workspace.DataRoot);
+
+        var session = Assert.Single(report.Sessions);
+
+        // The closed WAV is byte-identical: recovery never overwrote it.
+        Assert.Equal(closedHashBefore, HashFile(paths.ChunkFinalPath(AudioSource.Mic, 1)));
+
+        // Its index row is still durably CLOSED, not downgraded by the collision.
+        var row = workspace.Database.Chunks.Find(workspace.SessionId, AudioSource.Mic, 1)!;
+        Assert.Equal(ChunkStates.Closed, row.Status);
+        Assert.Equal(2 * SecondBytes, row.ByteLength);
+
+        // The collision is visible as a corrupt chunk, not silently resolved.
+        Assert.Equal(1, session.CorruptChunks);
+        Assert.Equal(0, session.RepairedChunks);
+
+        // The stale .part is retained on disk as .collided, not deleted and not
+        // renamed over the WAV.
+        Assert.False(File.Exists(paths.ChunkPartPath(AudioSource.Mic, 1)));
+        var collided = paths.ChunkPartPath(AudioSource.Mic, 1)
+            + SessionRecoveryScanner.CollidedSuffix;
+        Assert.True(File.Exists(collided));
+
+        // One corrupt event for the collision; no recovery event for the .part.
+        var events = ReadEvents(paths);
+        Assert.Equal(1, CountEvents(events, SessionEventNames.ChunkCorrupt));
+        Assert.Equal(0, CountEvents(events, SessionEventNames.ChunkRecovered));
+
+        // A second scan is idempotent: the .collided artifact is not re-enumerated as
+        // a .part, and the session is already INTERRUPTED, so there is nothing to do.
+        var second = new SessionRecoveryScanner(workspace.Database, new FakeClock()).Scan(workspace.DataRoot);
+        Assert.Equal(0, second.RecoveredSessions);
+    }
+
+    [Fact]
+    public void Scan_RetainsTheCollidingPartAndReconcilesTheFinalWavWhenItsRowIsOpen()
+    {
+        using var workspace = new TempWorkspace(sessionStatus: SessionStatus.Recording);
+
+        // The crash window between the atomic rename and the closed-index upsert left
+        // a durable .wav whose row is still 'open'. A stale .part for the same
+        // sequence also exists, so recovery must not overwrite the .wav.
+        WriteFinalWavWithOpenRow(workspace.Paths, workspace.Database, sequence: 1, dataBytes: 2 * SecondBytes);
+        WriteManifest(workspace.Paths, SessionStatus.Recording);
+
+        var wavHashBefore = HashFile(workspace.Paths.ChunkFinalPath(AudioSource.Mic, 1));
+
+        // A stale .part with different content for the same sequence.
+        WritePartWithData(workspace.Paths, sequence: 1, dataBytes: 3 * SecondBytes);
+
+        var report = new SessionRecoveryScanner(workspace.Database, new FakeClock()).Scan(workspace.DataRoot);
+
+        var session = Assert.Single(report.Sessions);
+
+        // The final WAV is byte-identical: the .part never overwrote it.
+        Assert.Equal(wavHashBefore, HashFile(workspace.Paths.ChunkFinalPath(AudioSource.Mic, 1)));
+
+        // The .part collision is reported as corrupt...
+        Assert.Equal(1, session.CorruptChunks);
+
+        // ...and the .wav's open row is reconciled to durable by the final-WAV pass.
+        var row = workspace.Database.Chunks.Find(workspace.SessionId, AudioSource.Mic, 1)!;
+        Assert.Equal(ChunkStates.Recovered, row.Status);
+        Assert.Equal(2 * SecondBytes, row.ByteLength);
+        Assert.Equal(1, session.RepairedChunks);
+
+        // Both the corrupt collision event and the recovered-WAV event are present.
+        var events = ReadEvents(workspace.Paths);
+        Assert.Equal(1, CountEvents(events, SessionEventNames.ChunkCorrupt));
+        Assert.Equal(1, CountEvents(events, SessionEventNames.ChunkRecovered));
+
+        // The stale .part was retained as .collided, not renamed over the WAV.
+        Assert.False(File.Exists(workspace.Paths.ChunkPartPath(AudioSource.Mic, 1)));
+        Assert.True(File.Exists(
+            workspace.Paths.ChunkPartPath(AudioSource.Mic, 1) + SessionRecoveryScanner.CollidedSuffix));
+    }
+
+    [Fact]
     public void Scan_AdoptsAnOrphanDirectoryThatHasAudioButNoSessionRow()
     {
         const string orphanId = "ses_20260915T150000Z_0000000a";
