@@ -84,6 +84,7 @@ public class SessionRecoveryScannerTests
         var stored = workspace.Database.Sessions.Find(workspace.SessionId)!;
         Assert.Equal(SessionStatus.Interrupted, stored.Status);
         Assert.Null(stored.StoppedAt);
+        Assert.Equal(137_000, stored.DurationMs);
 
         SessionManifestStore.TryLoad(paths.ManifestPath, out var manifest, out _);
         Assert.Equal(SessionStatus.Interrupted, manifest!.Status);
@@ -93,6 +94,8 @@ public class SessionRecoveryScannerTests
         var events = ReadEvents(paths);
         Assert.Equal(1, CountEvents(events, SessionEventNames.SessionRecovered));
         Assert.Equal(1, CountEvents(events, SessionEventNames.ChunkRecovered));
+        var sessionRecovered = Assert.Single(events, e => Name(e) == SessionEventNames.SessionRecovered);
+        Assert.Equal(137_000, sessionRecovered.GetProperty("at_ms").GetInt64());
     }
 
     private static AudioPacket Packet(long devicePositionFrames, int dataBytes)
@@ -239,7 +242,11 @@ public class SessionRecoveryScannerTests
         Assert.Equal(1, CountEvents(events, SessionEventNames.ChunkRecovered));
         Assert.Equal(1, CountEvents(events, SessionEventNames.SessionRecovered));
 
-        Assert.Equal(SessionStatus.Interrupted, workspace.Database.Sessions.Find(workspace.SessionId)!.Status);
+        var stored = workspace.Database.Sessions.Find(workspace.SessionId)!;
+        Assert.Equal(SessionStatus.Interrupted, stored.Status);
+        Assert.Equal(2_000, stored.DurationMs);
+        var sessionRecovered = Assert.Single(events, e => Name(e) == SessionEventNames.SessionRecovered);
+        Assert.Equal(2_000, sessionRecovered.GetProperty("at_ms").GetInt64());
     }
 
     [Fact]

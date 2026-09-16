@@ -160,12 +160,15 @@ public sealed class SessionRecoveryScanner
         }
 
         using var events = new JsonlSessionEventSink(paths.EventsPath);
-        var atMs = SessionEndMs(paths.SessionId);
+        // Use the pre-recovery end only to place individual repair events after the
+        // already-indexed audio. Recovery can promote an open/missing index row to a
+        // chunk with a later end, so the session-level end is calculated again below.
+        var recoveryStartMs = SessionEndMs(paths.SessionId);
         var recoveredChunks = new List<RecoveredChunk>();
 
         foreach (var partFile in partFiles)
         {
-            var chunk = RecoverPartFile(paths, partFile, events, atMs);
+            var chunk = RecoverPartFile(paths, partFile, events, recoveryStartMs);
             if (chunk is not null)
             {
                 recoveredChunks.Add(chunk);
@@ -180,7 +183,7 @@ public sealed class SessionRecoveryScanner
         // would skip them. Reconcile them the same way a repaired .part is reconciled.
         foreach (var wavPath in EnumerateFinalWavFiles(paths))
         {
-            var chunk = ReconcileFinalWav(paths, wavPath, events, atMs);
+            var chunk = ReconcileFinalWav(paths, wavPath, events, recoveryStartMs);
             if (chunk is not null)
             {
                 recoveredChunks.Add(chunk);
@@ -189,8 +192,13 @@ public sealed class SessionRecoveryScanner
 
         var degraded = true;
         var detail = BuildDetail(recoveredChunks);
+        // Reconciliation above can create or extend a chunk row (notably when a
+        // process died after the atomic rename but before the index upsert). Session
+        // metadata must reflect that durable audio rather than the stale pre-recovery
+        // maximum.
+        var sessionEndMs = SessionEndMs(paths.SessionId);
 
-        events.Write(new SessionEvent(SessionEventNames.SessionRecovered, atMs)
+        events.Write(new SessionEvent(SessionEventNames.SessionRecovered, sessionEndMs)
         {
             Count = recoveredChunks.Count,
             Detail = "this session was not cleanly stopped; " + detail,
@@ -212,7 +220,7 @@ public sealed class SessionRecoveryScanner
             SessionStatus.Interrupted,
             interruptedAt,
             stoppedAt: null,
-            durationMs: atMs);
+            durationMs: sessionEndMs);
 
         return new RecoveredSession(
             paths.SessionId,
