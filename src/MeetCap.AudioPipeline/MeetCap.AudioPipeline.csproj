@@ -5,12 +5,18 @@
     <RootNamespace>MeetCap.AudioPipeline</RootNamespace>
     <AssemblyName>MeetCap.AudioPipeline</AssemblyName>
     <PackageId>MeetCap.AudioPipeline</PackageId>
-    <Description>MeetCap durable audio spool: recoverable WAV chunk lifecycle, session artifacts, disk-space policy and startup recovery.</Description>
+    <Description>MeetCap audio pipeline: durable, recoverable WAV chunk lifecycle, session artifacts, disk-space policy and startup recovery (M1), plus media inspection and normalization via FFprobe/FFmpeg using FFMpegCore (M3).</Description>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\MeetCap.Core\MeetCap.Core.csproj" />
     <ProjectReference Include="..\MeetCap.Persistence\MeetCap.Persistence.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- #5 / docs/ARCHITECTURE.md section 13: FFMpegCore is the preferred .NET wrapper
+         for FFprobe/FFmpeg inspection and normalization. It stays inside this project. -->
+    <PackageReference Include="FFMpegCore" Version="5.4.0" />
   </ItemGroup>
 
   <ItemGroup>

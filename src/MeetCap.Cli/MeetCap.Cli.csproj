@@ -16,6 +16,8 @@
     <!-- Composition root only: no command handler may use NAudio types directly
          (docs/ARCHITECTURE.md section 3, docs/DEVELOPMENT.md section 4). -->
     <ProjectReference Include="..\MeetCap.WindowsAudio\MeetCap.WindowsAudio.csproj" />
+    <ProjectReference Include="..\MeetCap.Asr\MeetCap.Asr.csproj" />
+    <ProjectReference Include="..\MeetCap.Asr.Volcengine\MeetCap.Asr.Volcengine.csproj" />
   </ItemGroup>
 
   <ItemGroup>

@@ -71,16 +71,73 @@ public sealed class SqliteMigrator
     }
 
     /// <summary>The migration resources bundled with this assembly, ordered by version.</summary>
-    internal IReadOnlyList<(int Version, string ResourceName)> GetMigrations()
+    internal IReadOnlyList<(int Version, string ResourceName)> GetMigrations() =>
+        ParseMigrations(_assembly.GetManifestResourceNames());
+
+    /// <summary>
+    /// Resolves the numbered migration scripts from a set of embedded resource names.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Every embedded <c>*.sql</c> resource under <c>Migrations</c> must carry a parseable
+    /// version, and no two may claim the same one. Both violations are rejected loudly
+    /// rather than filtered away, because either one makes a migration silently not run:
+    /// versions are keyed in <c>schema_migrations(version INTEGER PRIMARY KEY)</c>, so a
+    /// duplicate would look already-applied, and an unnumbered script would never be
+    /// considered at all. A silently missing table is exactly the schema corruption this
+    /// guard exists to prevent.
+    /// </para>
+    /// <para>
+    /// This is a pure function over resource names so the throwing paths are directly
+    /// testable without shipping a deliberately broken assembly.
+    /// </para>
+    /// </remarks>
+    internal static IReadOnlyList<(int Version, string ResourceName)> ParseMigrations(
+        IEnumerable<string> resourceNames)
     {
-        var names = _assembly.GetManifestResourceNames()
-            .Where(n => n.EndsWith(".sql", StringComparison.Ordinal) && n.Contains("Migrations", StringComparison.Ordinal))
-            .Select(n => (Version: TryParseVersion(n), ResourceName: n))
-            .Where(t => t.Version.HasValue)
-            .Select(t => (t.Version!.Value, t.ResourceName))
-            .OrderBy(t => t.Value)
-            .ToList();
-        return names;
+        ArgumentNullException.ThrowIfNull(resourceNames);
+
+        var migrations = new List<(int Version, string ResourceName)>();
+        foreach (var name in resourceNames)
+        {
+            if (!name.EndsWith(".sql", StringComparison.Ordinal)
+                || !name.Contains("Migrations", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            var version = TryParseVersion(name);
+            if (version is null)
+            {
+                throw new InvalidOperationException(
+                    $"Embedded migration '{name}' has no parseable version. Migration resource names " +
+                    "must contain 'Migrations.<number>' (for example '0003_asr_jobs.sql'), otherwise the " +
+                    "script would never be applied and its tables would never be created.");
+            }
+
+            migrations.Add((version.Value, name));
+        }
+
+        migrations.Sort((left, right) =>
+        {
+            var byVersion = left.Version.CompareTo(right.Version);
+            return byVersion != 0
+                ? byVersion
+                : string.CompareOrdinal(left.ResourceName, right.ResourceName);
+        });
+
+        var duplicate = migrations
+            .GroupBy(t => t.Version)
+            .FirstOrDefault(group => group.Count() > 1);
+        if (duplicate is not null)
+        {
+            throw new InvalidOperationException(
+                $"Migration version {duplicate.Key} is claimed by more than one script: " +
+                string.Join(", ", duplicate.Select(t => t.ResourceName)) +
+                ". Rename one of them to the next free version so that every migration is applied.");
+        }
+
+        return migrations;
     }
 
     /// <summary>

@@ -9,6 +9,8 @@ namespace MeetCap.Core.Sessions;
 /// <see cref="Finalizing"/> to <see cref="Completed"/> for a clean offline session,
 /// and <see cref="Interrupted"/> for a session that startup recovery found was never
 /// cleanly stopped. <see cref="Processing"/> arrives with the ASR milestones.
+/// Degraded conditions (ASR offline, device lost, low disk) are orthogonal
+/// flags/events, never terminal states.
 /// </remarks>
 public static class SessionStatus
 {
@@ -57,4 +59,29 @@ public static class SessionStatus
     public static bool IsActive(string? status) => status is not null && Active.Contains(status);
 
     public static bool NeedsRecovery(string? status) => status is not null && Recoverable.Contains(status);
+}
+
+/// <summary>How a session's audio was obtained (<c>docs/DATA_MODEL.md</c> section 1).</summary>
+public static class SessionSourceType
+{
+    public const string Live = "live";
+    public const string Import = "import";
+}
+
+/// <summary>Session mode. <c>import</c> is command-driven and never a capture default.</summary>
+public static class SessionMode
+{
+    public const string Offline = "offline";
+    public const string Online = "online";
+    public const string Import = "import";
+}
+
+/// <summary>Audio track names used across sessions, chunks, ASR jobs, and transcripts.</summary>
+public static class AudioTrackName
+{
+    public const string Mic = "mic";
+    public const string Loopback = "loopback";
+
+    /// <summary>The single logical track produced by an imported file.</summary>
+    public const string Import = "import";
 }

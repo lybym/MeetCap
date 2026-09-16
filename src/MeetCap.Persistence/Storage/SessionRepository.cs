@@ -12,7 +12,7 @@ using Microsoft.Data.Sqlite;
 /// keeps this layer thin (docs/DEVELOPMENT.md section 3), and manual mapping keeps
 /// the stored schema visible next to the SQL that produces it.
 /// </remarks>
-public sealed class SessionRepository
+public sealed class SessionRepository : ISessionStore
 {
     private const string Columns =
         "id, title, mode, source_type, status, started_at, stopped_at, duration_ms, " +
@@ -134,6 +134,101 @@ public sealed class SessionRepository
 
         return ids;
     }
+
+    /// <summary>
+    /// Creates a session row from the M3 <see cref="Session"/> abstraction. M3 (import
+    /// + file ASR) drives session creation through the same <c>sessions</c> table and
+    /// the same mapping as M1 capture, so an import session is indistinguishable from a
+    /// captured one at the persistence layer.
+    /// </summary>
+    public void Create(Session session)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        Insert(ToRecord(session));
+    }
+
+    /// <summary>Returns the session, or <c>null</c> when no such id exists.</summary>
+    public Session? Get(string sessionId)
+        => Find(sessionId) is { } record ? ToSession(record) : null;
+
+    /// <summary>
+    /// Full-row update (not <see cref="UpdateLifecycle"/>): an import advances the whole
+    /// session, and a missing row is a real error, never a silent no-op.
+    /// </summary>
+    public void Update(Session session)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+
+        using var conn = _database.Open();
+        using var cmd = new SqliteCommand(
+            "UPDATE sessions SET title = @title, mode = @mode, source_type = @source_type, " +
+            "status = @status, started_at = @started_at, stopped_at = @stopped_at, " +
+            "duration_ms = @duration_ms, config_snapshot = @config_snapshot, " +
+            "config_version = @config_version, tracks = @tracks, updated_at = @updated_at " +
+            "WHERE id = @id",
+            conn);
+        Bind(cmd, ToRecord(session));
+        if (cmd.ExecuteNonQuery() == 0)
+        {
+            throw new InvalidOperationException(
+                $"Session '{session.Id}' does not exist and cannot be updated.");
+        }
+    }
+
+    /// <summary>Count of sessions in a non-terminal state.</summary>
+    public int CountActive()
+    {
+        if (!_database.IsInitialized())
+        {
+            return 0;
+        }
+
+        using var conn = _database.Open();
+        if (!MeetCapDatabase.TableExists(conn, "sessions"))
+        {
+            return 0;
+        }
+
+        using var cmd = new SqliteCommand(
+            $"SELECT COUNT(*) FROM sessions WHERE status IN ({SqlList.Placeholders(SessionStatus.Active.Count)})",
+            conn);
+        SqlListParameters.Add(cmd, SessionStatus.Active);
+        return cmd.ExecuteScalar() is long l ? (int)l : 0;
+    }
+
+    private static SessionRecord ToRecord(Session session) => new()
+    {
+        Id = session.Id,
+        Title = session.Title,
+        Mode = session.Mode,
+        SourceType = session.SourceType,
+        Status = session.Status,
+        StartedAt = session.StartedAt,
+        StoppedAt = session.StoppedAt,
+        DurationMs = session.DurationMs,
+        ConfigSnapshot = session.ConfigSnapshotJson,
+        ConfigVersion = session.ConfigVersion,
+        Tracks = session.Tracks,
+        CreatedAt = session.CreatedAt,
+        UpdatedAt = session.UpdatedAt,
+    };
+
+    private static Session ToSession(SessionRecord record) => new()
+    {
+        Id = record.Id,
+        Title = record.Title,
+        Mode = record.Mode,
+        SourceType = record.SourceType,
+        Status = record.Status,
+        StartedAt = record.StartedAt,
+        StoppedAt = record.StoppedAt,
+        DurationMs = record.DurationMs,
+        ConfigSnapshotJson = record.ConfigSnapshot,
+        ConfigVersion = record.ConfigVersion,
+        Tracks = record.Tracks,
+        CreatedAt = record.CreatedAt,
+        UpdatedAt = record.UpdatedAt,
+    };
 
     private IReadOnlyList<SessionRecord> ListByStatuses(IReadOnlyList<string> statuses)
     {

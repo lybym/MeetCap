@@ -158,6 +158,40 @@ Existing recordings can be converted to final transcript artifacts without any l
 
 This milestone is the first end-to-end ASR proof and the first proof that provider diarization labels can be preserved in the normalized transcript model.
 
+## Implementation status
+
+Implemented (issue #5):
+
+- `meetcap import <file> [--title <title>] [--tier standard|idle]`;
+- `meetcap asr resume [--session <id>] [--max-jobs <n>]`, the restart entry point for the
+  persistent job queue;
+- `MeetCap.AudioPipeline` (FFprobe inspection, FFmpeg normalization only when required) with
+  explicit toolchain location from `[media] ffmpeg_binary_folder`;
+- `MeetCap.Asr` (persistent job state machine driver, transcript assembly, import
+  orchestration) and `MeetCap.Asr.Volcengine` (submit/query adapter, Polly inside the HTTP
+  layer, provider JSON parsing);
+- `asr_jobs` migration `0003_asr_jobs` (version 0002 is claimed by the M1 capture migration);
+- sanitized `request.json`, retained `response.json`, `normalized.jsonl`,
+  `transcript/raw.jsonl`, `transcript/live.md`, and the `session.json` source artifact mapping
+  (original + normalized, with SHA-256);
+- source duration and `estimated_cost_cny` recorded per job.
+
+Not implemented in this milestone, and deliberately out of scope:
+
+- static credential resolution through `credman:` (fails with an actionable message; use
+  `env:NAME` or a literal value);
+- the `turbo` (flash/single-shot) service tier, which is a different protocol and is rejected
+  rather than silently mapped;
+- splitting an import that exceeds the provider's single-request or inline-upload limit;
+- hotword tables (M7);
+- any live-capture ASR batching (M4), loopback capture (M5), identity matching (M6),
+  streaming ASR (M8), or LLM post-processing (M9).
+
+Real Volcengine transcription has not been verified in CI: the environment has no
+`VOLCENGINE_APP_ID` and no access token, so the provider boundary is mocked in tests
+(`docs/DEVELOPMENT.md` section 7). A manual Windows run with real credentials is still required
+before this milestone is validated end to end.
+
 ---
 
 # M4 - File-first transcription during live recording

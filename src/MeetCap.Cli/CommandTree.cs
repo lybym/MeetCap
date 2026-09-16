@@ -62,14 +62,20 @@ internal static class CommandTree
 
         var stopCommand = new Command("stop", "Stop the recording session that is currently running.");
 
+        var importCommand = BuildImport(secrets, loggerFactory, storeFactory, output, error, environment);
+        var asrCommand = BuildAsr(secrets, loggerFactory, storeFactory, output, error, environment);
+
         root.Subcommands.Add(configCommand);
         root.Subcommands.Add(statusCommand);
         root.Subcommands.Add(devicesCommand);
         root.Subcommands.Add(startCommand);
         root.Subcommands.Add(stopCommand);
+        root.Subcommands.Add(importCommand);
+        root.Subcommands.Add(asrCommand);
 
         root.SetAction(parseResult => RequireVerb(parseResult, root, error));
         configCommand.SetAction(parseResult => RequireSubcommand(parseResult, configCommand, error));
+        asrCommand.SetAction(parseResult => RequireSubcommand(parseResult, asrCommand, error));
         statusCommand.SetAction((parseResult, _) =>
             StatusCommand.Run(CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory)));
         devicesCommand.SetAction((parseResult, _) =>
@@ -83,6 +89,89 @@ internal static class CommandTree
             StopCommand.Run(CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory)));
 
         return root;
+    }
+
+    /// <summary>
+    /// Builds <c>meetcap import &lt;file&gt; [--title &lt;title&gt;] [--tier &lt;tier&gt;]</c>.
+    /// </summary>
+    private static Command BuildImport(
+        SecretRegistry secrets,
+        ILoggerFactory loggerFactory,
+        Func<string, IConfigurationStore> storeFactory,
+        TextWriter output,
+        TextWriter error,
+        CliEnvironment? environment)
+    {
+        var file = new Argument<string>("file")
+        {
+            Description = "Path to the recording to import (mp3, m4a, mp4, wav, ...).",
+        };
+
+        var title = new Option<string?>("--title", "-t")
+        {
+            Description = "Session title. Defaults to the file name without its extension.",
+        };
+
+        var tier = new Option<string?>("--tier")
+        {
+            Description = "One-shot ASR service tier override (standard | idle). Does not rewrite config.toml.",
+        };
+
+        var command = new Command("import", "Import an existing recording and transcribe it with file ASR.");
+        command.Arguments.Add(file);
+        command.Options.Add(title);
+        command.Options.Add(tier);
+        command.SetAction((parseResult, cancellationToken) =>
+        {
+            var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment);
+            return ImportCommand.RunAsync(
+                context,
+                parseResult.GetValue(file) ?? string.Empty,
+                parseResult.GetValue(title),
+                parseResult.GetValue(tier),
+                cancellationToken);
+        });
+
+        return command;
+    }
+
+    /// <summary>Builds the <c>meetcap asr</c> command family.</summary>
+    private static Command BuildAsr(
+        SecretRegistry secrets,
+        ILoggerFactory loggerFactory,
+        Func<string, IConfigurationStore> storeFactory,
+        TextWriter output,
+        TextWriter error,
+        CliEnvironment? environment)
+    {
+        var session = new Option<string?>("--session", "-s")
+        {
+            Description = "Only resume ASR jobs belonging to this session id.",
+        };
+
+        var maxJobs = new Option<int?>("--max-jobs")
+        {
+            Description = "Maximum number of jobs to process in this invocation (default 100).",
+        };
+
+        var resume = new Command(
+            "resume",
+            "Resume pending/retry-wait ASR jobs, including work left behind by a killed process.");
+        resume.Options.Add(session);
+        resume.Options.Add(maxJobs);
+        resume.SetAction((parseResult, cancellationToken) =>
+        {
+            var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment);
+            return AsrCommand.ResumeAsync(
+                context,
+                parseResult.GetValue(session),
+                parseResult.GetValue(maxJobs) ?? 100,
+                cancellationToken);
+        });
+
+        var command = new Command("asr", "Inspect and resume the persistent ASR job queue.");
+        command.Subcommands.Add(resume);
+        return command;
     }
 
     private static Command BuildConfigInit(
@@ -170,8 +259,8 @@ internal static class CommandTree
         Func<string, IConfigurationStore> storeFactory,
         TextWriter output,
         TextWriter error,
-        CliEnvironment? environment,
-        ICapturePlatformFactory? platformFactory)
+        CliEnvironment? environment = null,
+        ICapturePlatformFactory? platformFactory = null)
         => new(parseResult, output, error, storeFactory, secrets, loggerFactory, environment, platformFactory);
 
     /// <summary>
@@ -186,11 +275,12 @@ internal static class CommandTree
         return 2;
     }
 
-    /// <summary>Error action for <c>meetcap config</c> without a subcommand.</summary>
+    /// <summary>Error action for a verb that requires a subcommand.</summary>
     private static int RequireSubcommand(ParseResult parseResult, Command command, TextWriter error)
     {
         WriteUnmatchedTokenError(error, parseResult);
-        error.WriteLine($"meetcap {command.Name}: missing subcommand. Expected: init, path, validate, show.");
+        var expected = string.Join(", ", command.Subcommands.Select(child => child.Name));
+        error.WriteLine($"meetcap {command.Name}: missing subcommand. Expected: {expected}.");
         WriteUsage(error, command);
         return 2;
     }

@@ -23,6 +23,13 @@ process_name = ""
 data_root = "%LOCALAPPDATA%\\MeetCap"
 minimum_free_space_gb = 5
 
+[media]
+# Directory containing ffmpeg.exe and ffprobe.exe. Empty auto-detects (well-known
+# install locations first, then PATH). May use an "env:NAME" reference.
+ffmpeg_binary_folder = ""
+# Optional working directory for FFmpeg temporary files. Empty auto-detects.
+ffmpeg_temporary_folder = ""
+
 [asr]
 enabled = true
 strategy = "file"
@@ -40,6 +47,12 @@ credential = "env:MEETCAP_VOLCENGINE_ACCESS_TOKEN"
 resource_id = "volc.bigasr.auc"
 hotword_table_id = ""
 request_speaker_info = true
+# Estimate-only hourly rate in CNY; provider pricing is not a product guarantee.
+cost_per_hour_cny = 0.8
+poll_interval_seconds = 5
+# Wall-clock budget for polling one job in a single command invocation.
+poll_timeout_seconds = 900
+http_timeout_seconds = 30
 
 [speakers]
 enabled = true

@@ -11,9 +11,10 @@ TestResults/
 *.user
 *.suo
 
-# Local runtime data. Anchored to the repository root: an unanchored `sessions/`
-# also matches source and test folders named Sessions/, which would silently drop
-# them from a commit.
+# Local runtime data, anchored to the repository root so a source or test folder
+# named `Sessions/` or `data/` elsewhere is never silently dropped from a commit.
+# Private data placed outside the repo root is protected by the self-ignoring
+# marker MeetCap writes into the data root (src/MeetCap.Persistence/Storage/DataRootMarker.cs).
 /data/
 /sessions/
 *.db

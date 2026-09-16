@@ -45,6 +45,7 @@ built-in defaults
 [capture.offline]
 [capture.online]
 [storage]
+[media]
 [asr]
 [asr.volcengine]
 [speakers]
@@ -137,6 +138,39 @@ The app MUST NOT silently switch to streaming when file ASR fails.
 
 Retry configuration defines provider-execution resilience. Persistent retry/job state remains stored in the ASR job queue.
 
+`meetcap import --tier <tier>` is a one-shot override of `service_tier` for that command only; it never rewrites `config.toml`.
+
+Tier support in the import/file-ASR path:
+
+```text
+standard   submit/query file ASR (default)
+idle       submit/query file ASR against the idle endpoints
+turbo      not implemented (the flash/single-shot endpoint is a different protocol)
+```
+
+Selecting `turbo` fails with an actionable error rather than being silently mapped onto the
+submit/query flow.
+
+## 7.1 Media toolchain
+
+```toml
+[media]
+ffmpeg_binary_folder = ""
+ffmpeg_temporary_folder = ""
+```
+
+`ffmpeg_binary_folder` is the directory holding `ffmpeg.exe` and `ffprobe.exe`. Empty means
+auto-detect, in this order: well-known install locations (`%ProgramFiles%\ffmpeg\bin`,
+`%ProgramFiles(x86)%\ffmpeg\bin`, `%LOCALAPPDATA%\ffmpeg\bin`, `%ProgramData%\chocolatey\bin`),
+then `PATH`.
+
+Both values may use the `env:NAME` reference scheme, which keeps environment access inside the
+configuration resolver. A non-empty value must be an absolute path; validation rejects a
+relative value so a directory cannot silently resolve against the CLI's working directory.
+
+When the toolchain cannot be located, an import fails with a message naming
+`media.ffmpeg_binary_folder` and every location that was searched.
+
 ## 8. Volcengine
 
 ```toml
@@ -146,9 +180,26 @@ credential = "env:MEETCAP_VOLCENGINE_ACCESS_TOKEN"
 resource_id = "volc.bigasr.auc"
 hotword_table_id = ""
 request_speaker_info = true
+cost_per_hour_cny = 0.8
+poll_interval_seconds = 5
+poll_timeout_seconds = 900
+http_timeout_seconds = 30
 ```
 
 Credential references may include `env:` and `credman:` schemes.
+
+`env:` is resolved through the configuration/secret resolver. `credman:` is a documented
+scheme that is not implemented yet; it fails with an actionable message instead of sending an
+empty credential. A literal value is accepted for deployments that cannot use environment
+variables.
+
+`cost_per_hour_cny` is used only to fill the per-job `estimated_cost_cny` field for local
+accounting. Provider pricing is configuration, not a product guarantee.
+
+`poll_interval_seconds` is the delay between provider result queries. `poll_timeout_seconds`
+is the wall-clock budget one command invocation spends polling a single job; when it expires
+the job stays persisted and `meetcap asr resume` continues it. `http_timeout_seconds` is the
+per-request timeout enforced by the Polly timeout strategy inside the provider adapter.
 
 `request_speaker_info = true` means MeetCap asks Volcengine for anonymous speaker information when the selected API/service tier supports it.
 
