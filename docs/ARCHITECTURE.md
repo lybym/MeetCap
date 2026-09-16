@@ -364,6 +364,11 @@ The queue is bounded from `capture.buffer_seconds`. `TryWrite` is used, so a ful
 can never block the capture callback: the drop is counted and reported as an explicit
 `capture.buffer_overflow` degraded event instead of being hidden.
 
+M2 adds the accounting and the stalled-consumer reporting on top of that bound: how deep the
+queue actually got, what it had to drop and how long a consumer stopped draining are recorded
+with the session, and a stalled consumer is reported while capture keeps priority. See
+section 9.2.
+
 A capture device that disappears ends only the current capture segment. The session
 closes the audio already captured, waits, re-resolves the configured endpoint, and
 restarts capture behind the same session; a device that cannot be recovered ends the
@@ -409,6 +414,11 @@ Discontinuities are never smoothed over:
   already written against the session's format. The session ends as degraded with an
   explicit `capture.format_changed` event (naming both formats) and a non-zero exit,
   instead of writing new bytes under the old header.
+
+M2 makes the missing time explicit on both sides of a crash: the live timeline counts every
+discontinuity once as `CaptureTimeline.GapTotalMs` / `GapCount` and persists it in
+`session.json`, and startup recovery re-derives the same question from the chunk index with the
+gap audit. See section 9.2 and `docs/DATA_MODEL.md` section 5.1.
 
 ---
 
@@ -499,6 +509,97 @@ recoverable from session state and liveness, not from artifact presence alone:
 
 Previously closed chunks are never reopened or rewritten, which is what makes a forced
 kill unable to damage them.
+
+### 9.2 M2 implementation: bounded-buffer accounting, gap audit and session repair
+
+The bound from section 7.1 is now accounted for, not only enforced. `RecordingSession` creates
+one `CaptureBacklogMonitor` from the queue capacity it actually uses
+(`max(8, capture.buffer_seconds × 100)` packets, unchanged from M1), the capture callback
+records every packet the queue accepted or refused, and the consumer records every packet it
+drained. The counters are updated from both threads with interlocked operations, and the
+snapshot answers the questions a log line cannot: the queue bound actually used
+(`capacity_packets`), the deepest backlog reached (`peak_queued_packets`), the packets the bound
+refused (`dropped_packets`, `overflow_events`), the stalled-consumer observations
+(`stall_events`, `longest_stall_ms`) and the computed `is_degraded` verdict. The snapshot type
+is `AudioBufferHealth`; it is surfaced on `RecordingSessionOutcome.CaptureHealth` and
+persisted as `capture_health` in `session.json`, so "how close did the queue come to its
+bound" survives as part of the durable record instead of being reconstructed from logs
+(`docs/DATA_MODEL.md` section 3). `ChunkSpool` is unchanged, and M2 adds no configuration key:
+the threshold below is derived from the existing `capture.buffer_seconds`.
+
+A downstream consumer that stops draining is reported while recording keeps priority:
+
+```text
+every 250 ms housekeeping tick
+  queue non-empty and no chunk closed since the last tick
+    -> accumulate the stalled time
+    -> once it reaches capture.buffer_seconds (in milliseconds)
+         -> session marked degraded
+         -> one capture.consumer_stalled event, rate-limited to one per second while the
+            stall lasts (the stall counter counts one event per stalled period)
+```
+
+The event carries `source`, `at_ms`, `count` (packets still queued) and a `detail` naming the
+queued count against the capacity. Capture is never throttled: the queue still refuses packets
+at its bound, and drops are still reported as `capture.buffer_overflow`. The accounting
+observes; it never delays the callback (section 7 and `docs/RELIABILITY.md` section 4).
+
+`CaptureTimeline` now counts each discontinuity exactly once as `GapTotalMs` and `GapCount`. A
+device-position skip and a measured device outage both flow through `Observe`, so a
+discontinuity can neither be counted twice (once from the position and once from the measured
+outage) nor be smoothed away. `PacketTiming.GapMs` stays the per-buffer value.
+`RecordingSession.Complete()` assigns `gap_count`, `gap_total_ms` and `capture_health` on the
+manifest, and the `session.stopped` event carries `gap_ms`. `gaps_remain` and `gap_details` are
+always present in the document (`false` and `[]` by default) and are set by recovery or
+`meetcap session repair` when their audit still finds a gap.
+
+The durable half of the same question is `SessionGapAuditor`, which derives the missing
+stretches of a session timeline from the `audio_chunks` index and never mutates anything
+(`docs/DATA_MODEL.md` section 5.1). It reports `AudioGap` records with an explicit reason, and
+its rules keep the failure modes apart:
+
+```text
+run of non-durable chunks + adjacent timeline hole
+                             -> ONE gap, from the last durable chunk's end to the next
+                                durable chunk's start
+a non-durable chunk caused it -> chunk_unreadable / chunk_missing
+otherwise                     -> not_captured
+skipped chunk number, contiguous timeline
+                             -> still reported, as a zero-length span with MissingSequences
+                                populated
+```
+
+A gap is therefore always one event with a reason, never a hidden timestamp shift
+(`docs/RELIABILITY.md` section 7).
+
+Recovery is honest about what it could not fix. `SessionRecoveryScanner` audits the session
+after repairing it, and then:
+
+- writes an explicit `capture.gap` event for every gap the live recording never saw, after
+  reading the `(start_ms, source)` positions already in `events.jsonl`, so a repeated scan never
+  appends the same gap twice;
+- marks the session degraded when its audit is incomplete or the manifest's `capture_health`
+  is degraded, and records `gaps_remain` / `gap_details` on the manifest;
+- writes `session.repair.incomplete` (`reason = gap_detected`, or `audit_failed` when the chunk
+  index could not be read) whenever a gap remains, because a repair that could not make the
+  session whole must not report success (`docs/RELIABILITY.md` section 6);
+- writes `session.recovered` only when something was actually repaired or the session was not
+  cleanly stopped, carrying `gap_ms` and `reason=incomplete` when a gap remains.
+
+`meetcap session repair [--session <id>]` exposes that same pass as an operator action
+(`CaptureService.RepairSession`, returning `SessionRepairOutcome`). It repairs one session or
+every session under the data root, prints per-session status, detail and directory, the
+`timeline:` summary and one `gap:` line per gap, and **exits 1 when a known gap remains or the
+requested session was not found**, with an actionable error. Exit 0 means the session left no
+known gap. The same accounting is visible without that command: `meetcap start` prints
+`capture buffer: peak N/M packets, dropped N, stalled N time(s) (longest N ms)` on every run and
+`audio gaps: N (M ms missing)` when gaps occurred, and `meetcap status` prints the `timeline:`
+and `gap:` lines for a recovered session that still has a gap.
+
+Shutdown ordering belongs to the same guarantee: the capture loop runs as a task that is
+awaited, and the channel writer is completed only after that task has returned, so the packets
+a slow consumer still holds are drained instead of racing a late capture callback against a
+closed channel.
 
 ---
 
@@ -1011,6 +1112,7 @@ sherpa-onnx
 ```text
 DurableAudioSpool
 CrashRecovery
+GapAudit
 ASR job state machine
 TranscriptNormalizer
 TimelineMerger

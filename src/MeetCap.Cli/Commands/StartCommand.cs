@@ -115,18 +115,35 @@ internal static class StartCommand
         context.Out.WriteLine($"duration: {FormatDuration(outcome.DurationMs)}");
         context.Out.WriteLine($"chunks closed: {outcome.ChunksClosed} ({outcome.ClosedDataBytes / 1024 / 1024} MB)");
 
+        // The bounded-buffer accounting is reported on a clean run too: "the queue never
+        // came close to its bound" is the evidence docs/RELIABILITY.md section 4 asks for,
+        // and it is only useful if it is stated while the run succeeded.
+        context.Out.WriteLine(
+            $"capture buffer: peak {outcome.CaptureHealth.PeakQueuedPackets}/{outcome.CaptureHealth.CapacityPackets} packets, " +
+            $"dropped {outcome.CaptureHealth.DroppedPackets}, " +
+            $"stalled {outcome.CaptureHealth.StallEvents} time(s) (longest {outcome.CaptureHealth.LongestStallMs} ms)");
+
+        if (outcome.GapCount > 0)
+        {
+            context.Out.WriteLine($"audio gaps: {outcome.GapCount} ({outcome.GapTotalMs} ms missing)");
+        }
+
         if (outcome.Degraded)
         {
             context.Out.WriteLine($"degraded: yes ({outcome.EndReason ?? "unknown"})");
         }
 
         Logger(context).LogInformation(
-            "start: session={SessionId} status={Status} durationMs={DurationMs} chunks={Chunks} degraded={Degraded}",
+            "start: session={SessionId} status={Status} durationMs={DurationMs} chunks={Chunks} degraded={Degraded} " +
+            "gapMs={GapMs} droppedPackets={Dropped} stalled={Stalled}",
             outcome.SessionId,
             outcome.Status,
             outcome.DurationMs,
             outcome.ChunksClosed,
-            outcome.Degraded);
+            outcome.Degraded,
+            outcome.GapTotalMs,
+            outcome.CaptureHealth.DroppedPackets,
+            outcome.CaptureHealth.StallEvents);
 
         if (outcome.IsClean)
         {

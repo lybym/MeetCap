@@ -26,6 +26,15 @@ public sealed record RecordingSessionOutcome(
     /// </summary>
     public bool IsClean
         => !Degraded && string.Equals(Status, SessionStatus.Completed, StringComparison.Ordinal);
+
+    /// <summary>Audio time the capture timeline reported as missing, in milliseconds.</summary>
+    public long GapTotalMs { get; init; }
+
+    /// <summary>How many discontinuities produced <see cref="GapTotalMs"/>.</summary>
+    public int GapCount { get; init; }
+
+    /// <summary>The bounded-buffer accounting for this run (docs/RELIABILITY.md section 4).</summary>
+    public AudioBufferHealth CaptureHealth { get; init; } = AudioBufferHealth.Empty;
 }
 
 /// <summary>
@@ -67,6 +76,12 @@ public sealed class RecordingSession : IDisposable
     /// <summary>Backoff between device-recovery attempts.</summary>
     internal const int DeviceRecoveryBackoffMs = 1_000;
 
+    /// <summary>
+    /// Rate limit for repeated stalled-consumer events. The stall itself is measured to
+    /// the housekeeping interval; this only keeps one long stall from filling the log.
+    /// </summary>
+    internal const int ConsumerStallEventIntervalMs = 1_000;
+
     /// <summary>Assumed capture callback rate, used to bound the packet queue.</summary>
     internal const int PacketsPerSecondEstimate = 100;
 
@@ -87,6 +102,17 @@ public sealed class RecordingSession : IDisposable
     private readonly Action<AudioPacket> _packetHandler;
     private readonly EventHandler<CaptureStoppedEventArgs> _stoppedHandler;
 
+    /// <summary>
+    /// Test seam: invoked on the consumer thread after every packet is written.
+    /// </summary>
+    /// <remarks>
+    /// docs/RELIABILITY.md section 4 requires bounded memory to hold when a downstream
+    /// consumer cannot keep up, and the committed behaviour has to be provable in CI. A
+    /// real slow disk cannot be produced on demand, so a test supplies this hook to make
+    /// the consumer itself slow; production passes <c>null</c>.
+    /// </remarks>
+    private readonly Action? _afterPacketWritten;
+
     private CancellationTokenSource? _endCts;
     private SessionRecordingLock? _recordingLock;
     private TaskCompletionSource? _segmentEnded;
@@ -94,6 +120,7 @@ public sealed class RecordingSession : IDisposable
     private CaptureTimeline? _timeline;
     private ChunkSpool? _spool;
     private Channel<AudioPacket>? _channel;
+    private CaptureBacklogMonitor? _backlog;
     private AudioFormat? _format;
 
     private int _deviceRestarted;
@@ -101,7 +128,9 @@ public sealed class RecordingSession : IDisposable
     private int _overflowSignalled;
     private int _diskProbeFailureReported;
     private long _pendingGapMs;
-    private long _droppedPackets;
+    private long _stallObservedMs;
+    private int _closedChunkCountAtLastStallCheck;
+    private DateTimeOffset? _lastStallEventAt;
     private volatile bool _degraded;
     private volatile bool _captureStarted;
     private string? _endReason;
@@ -118,7 +147,8 @@ public sealed class RecordingSession : IDisposable
         IClock clock,
         SessionManifest manifest,
         int maxDeviceRecoveryAttempts,
-        SessionRecordingLock? recordingLock)
+        SessionRecordingLock? recordingLock,
+        Action? afterPacketWritten = null)
     {
         _paths = paths ?? throw new ArgumentNullException(nameof(paths));
         _settings = settings ?? throw new ArgumentNullException(nameof(settings));
@@ -130,6 +160,7 @@ public sealed class RecordingSession : IDisposable
         _manifest = manifest ?? throw new ArgumentNullException(nameof(manifest));
         _maxDeviceRecoveryAttempts = Math.Max(0, maxDeviceRecoveryAttempts);
         _recordingLock = recordingLock;
+        _afterPacketWritten = afterPacketWritten;
 
         _diskMonitor = new DiskSpaceMonitor(platform.DiskSpace, settings.MinimumFreeSpaceBytes);
         _stopSignal = new SessionStopSignal(paths.StopRequestPath);
@@ -186,7 +217,11 @@ public sealed class RecordingSession : IDisposable
                 _database,
                 _events,
                 _clock);
-            _channel = Channel.CreateBounded<AudioPacket>(new BoundedChannelOptions(QueueCapacity(_settings))
+
+            // The bound is fixed at start so the accounting records the bound that was
+            // actually used, not the bound the configuration happens to hold later.
+            _backlog = new CaptureBacklogMonitor(QueueCapacity(_settings));
+            _channel = Channel.CreateBounded<AudioPacket>(new BoundedChannelOptions(_backlog.Capacity)
             {
                 SingleReader = true,
                 SingleWriter = false,
@@ -202,12 +237,19 @@ public sealed class RecordingSession : IDisposable
             // between the session row being created and capture starting. Clearing it
             // would silently discard that request and the recording would never stop.
             var consumer = Task.Run(ConsumeAsync);
+            var capture = Task.Run(() => RunCaptureLoopAsync(source));
             var housekeeping = Task.Run(HousekeepAsync);
 
             try
             {
-                await RunCaptureLoopAsync(source).ConfigureAwait(false);
+                await capture.ConfigureAwait(false);
 
+                // A stalled or slow downstream consumer leaves packets queued while capture
+                // is still running. The capture loop only returns once the device has
+                // stopped delivering, so the callback cannot fire again and it is safe to
+                // complete the writer: the drain below then runs to completion instead of
+                // racing a late callback against a closed channel.
+                //
                 // Capture has ended. Transition to the documented FINALIZING checkpoint
                 // (docs/ARCHITECTURE.md section 20) before draining the queue and closing
                 // the final chunk, so a crash during that window leaves a session that
@@ -592,11 +634,17 @@ public sealed class RecordingSession : IDisposable
     /// </summary>
     private void OnPacketAvailable(AudioPacket packet)
     {
-        if (!_channel!.Writer.TryWrite(packet))
+        if (_channel!.Writer.TryWrite(packet))
         {
-            Interlocked.Increment(ref _droppedPackets);
-            Interlocked.Exchange(ref _overflowSignalled, 1);
+            _backlog!.RecordProduced();
+            return;
         }
+
+        // The queue is full, so the packet is dropped instead of blocking the capture
+        // callback (docs/RELIABILITY.md section 4 step 1). The drop is counted rather
+        // than hidden; ReportOverflowIfNeeded turns it into an explicit event.
+        _backlog!.RecordDropped();
+        Interlocked.Exchange(ref _overflowSignalled, 1);
     }
 
     private void OnCaptureStopped(object? sender, CaptureStoppedEventArgs e)
@@ -615,8 +663,10 @@ public sealed class RecordingSession : IDisposable
             {
                 while (_channel.Reader.TryRead(out var packet))
                 {
+                    _backlog!.RecordConsumed();
                     ProcessPacket(packet);
                     ReportOverflowIfNeeded();
+                    _afterPacketWritten?.Invoke();
                 }
             }
         }
@@ -728,16 +778,82 @@ public sealed class RecordingSession : IDisposable
             return;
         }
 
-        var dropped = Interlocked.Exchange(ref _droppedPackets, 0);
         _degraded = true;
         _events.Write(new SessionEvent(SessionEventNames.CaptureBufferOverflow, CurrentTimelineMs())
         {
             Source = Track.ToWireName(),
-            Count = (int)Math.Min(dropped, int.MaxValue),
+            Count = _backlog?.Dropped,
             Detail =
                 "the recording queue was full, so audio was dropped rather than blocking the capture " +
                 "callback because the disk could not keep up.",
         });
+    }
+
+    /// <summary>
+    /// Reports a downstream consumer that cannot keep up with capture
+    /// (docs/RELIABILITY.md section 4 step 3).
+    /// </summary>
+    /// <remarks>
+    /// A backlog that is still growing after <c>capture.buffer_seconds</c> of wall-clock
+    /// time is already deeper than the bound was configured to hold, so the condition is
+    /// reported even while the queue has not overflowed yet. Recording keeps priority
+    /// either way: this only observes and reports, and never throttles capture.
+    /// </remarks>
+    private void CheckConsumerBacklog()
+    {
+        var backlog = _backlog;
+        if (backlog is null)
+        {
+            return;
+        }
+
+        var queued = backlog.Queued;
+        var closedChunks = ClosedChunkCount;
+        var madeProgress = closedChunks != _closedChunkCountAtLastStallCheck;
+        _closedChunkCountAtLastStallCheck = closedChunks;
+
+        if (queued <= 0 || madeProgress)
+        {
+            EndStallObservation();
+            backlog.RecordStallObservation(0);
+            return;
+        }
+
+        _stallObservedMs += HousekeepingIntervalMs;
+        if (_stallObservedMs < (long)_settings.BufferSeconds * 1000)
+        {
+            return;
+        }
+
+        _degraded = true;
+        backlog.RecordStallObservation(_stallObservedMs);
+
+        var now = _clock.UtcNow;
+        if (_lastStallEventAt is { } previous &&
+            (now - previous).TotalMilliseconds < ConsumerStallEventIntervalMs)
+        {
+            return;
+        }
+
+        _lastStallEventAt = now;
+        _events.Write(new SessionEvent(SessionEventNames.CaptureConsumerStalled, CurrentTimelineMs())
+        {
+            Source = Track.ToWireName(),
+            Count = queued,
+            Detail =
+                $"the recording consumer has not drained the queue for {_stallObservedMs} ms while " +
+                $"{queued} of {backlog.Capacity} packet slots are still occupied; audio capture is " +
+                "unaffected and the backlog stays inside its configured bound.",
+        });
+    }
+
+    private void EndStallObservation()
+    {
+        if (Interlocked.Exchange(ref _stallObservedMs, 0) > 0)
+        {
+            // The stall ended, so the rate limit for the next one restarts.
+            _lastStallEventAt = null;
+        }
     }
 
     // --------------------------------------------------------------- housekeeping
@@ -770,6 +886,8 @@ public sealed class RecordingSession : IDisposable
                     lastFlush = now;
                     Interlocked.Exchange(ref _flushRequested, 1);
                 }
+
+                CheckConsumerBacklog();
 
                 if ((now - lastDiskCheck).TotalMilliseconds >= DiskCheckIntervalMs)
                 {
@@ -876,7 +994,10 @@ public sealed class RecordingSession : IDisposable
             ChunksClosed: 0,
             ClosedDataBytes: 0,
             Degraded: true,
-            EndReason: "capture_start_failed");
+            EndReason: "capture_start_failed")
+        {
+            CaptureHealth = new AudioBufferHealth { CapacityPackets = QueueCapacity(_settings) },
+        };
     }
 
     private RecordingSessionOutcome Complete()
@@ -894,6 +1015,14 @@ public sealed class RecordingSession : IDisposable
 
         var degraded = _degraded || _storageFailure is not null || !started;
 
+        // The gap and bounded-buffer accounting is written into the session document, not
+        // only into the event log, so "how much audio is missing and how close did the
+        // queue come to its bound" survives as part of the durable record
+        // (docs/RELIABILITY.md sections 4 and 7).
+        var health = CurrentCaptureHealth();
+        _manifest.GapCount = health.GapCount;
+        _manifest.GapTotalMs = health.GapTotalMs;
+        _manifest.CaptureHealth = health;
         _manifest.Status = status;
         _manifest.Degraded = degraded;
         _manifest.EndReason = endReason;
@@ -914,6 +1043,7 @@ public sealed class RecordingSession : IDisposable
         {
             Source = Track.ToWireName(),
             EndMs = durationMs,
+            GapMs = health.GapTotalMs > 0 ? health.GapTotalMs : null,
             Count = ClosedChunkCount,
             Detail = _storageFailure is null ? endReason : endReason + ": " + _storageFailure.Message,
         });
@@ -928,8 +1058,23 @@ public sealed class RecordingSession : IDisposable
             ClosedChunkCount,
             _spool?.ClosedDataBytes ?? 0,
             degraded,
-            endReason);
+            endReason)
+        {
+            GapTotalMs = health.GapTotalMs,
+            GapCount = health.GapCount,
+            CaptureHealth = health,
+        };
     }
+
+    /// <summary>The current bounded-buffer and gap accounting for this session.</summary>
+    private AudioBufferHealth CurrentCaptureHealth()
+        => _backlog?.Snapshot(_timeline?.GapTotalMs ?? 0, _timeline?.GapCount ?? 0)
+           ?? new AudioBufferHealth
+           {
+               CapacityPackets = QueueCapacity(_settings),
+               GapTotalMs = _timeline?.GapTotalMs ?? 0,
+               GapCount = _timeline?.GapCount ?? 0,
+           };
 
     /// <summary>Chunks closed durably so far, including rotations done by the spool.</summary>
     private int ClosedChunkCount => _spool?.ClosedChunkCount ?? 0;

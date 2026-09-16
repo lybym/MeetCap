@@ -75,6 +75,33 @@ public sealed class SessionManifest
     /// <summary>Set by startup recovery when this session was found not cleanly stopped.</summary>
     public DateTimeOffset? RecoveredAt { get; set; }
 
+    /// <summary>
+    /// How many discontinuities the capture timeline reported during this session. Written
+    /// with the session so the missing audio is part of the durable record rather than only
+    /// a line in the event log (docs/RELIABILITY.md section 7).
+    /// </summary>
+    public int GapCount { get; set; }
+
+    /// <summary>Total audio time the capture timeline reported as missing, in milliseconds.</summary>
+    public long GapTotalMs { get; set; }
+
+    /// <summary>
+    /// The bounded-buffer accounting for this session: queue bound, deepest backlog,
+    /// packets the bound refused, and how long a stalled consumer held a backlog
+    /// (docs/RELIABILITY.md section 4).
+    /// </summary>
+    public AudioBufferHealth? CaptureHealth { get; set; }
+
+    /// <summary>
+    /// Set by startup recovery or <c>meetcap session repair</c> when the session's
+    /// timeline still has a provable hole after every repair that could be attempted.
+    /// A session with this flag must never be presented as fully recovered.
+    /// </summary>
+    public bool GapsRemain { get; set; }
+
+    /// <summary>Where the remaining audio is missing, one line per gap.</summary>
+    public IReadOnlyList<string> GapDetails { get; set; } = Array.Empty<string>();
+
     public IReadOnlyList<CaptureTrackInfo> Capture { get; set; } = Array.Empty<CaptureTrackInfo>();
 }
 

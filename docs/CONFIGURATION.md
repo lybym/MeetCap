@@ -117,6 +117,21 @@ What M1 does with them:
   system. It never affects durability of closed chunks, which are flushed to disk before
   they are renamed out of `.part`.
 
+M2 added no configuration key, so this file and the configuration schema are unchanged. The
+queue bound, the reported backlog depth and the stalled-consumer threshold all come from the
+existing `buffer_seconds`:
+
+- the bound remains `buffer_seconds × 100` packets with a floor of 8, and that is the capacity
+  the session reports;
+- `buffer_seconds` is also the wall-clock threshold after which a queue that has not drained is
+  reported: once the queue has stayed populated that long without closing a chunk, the session
+  is marked degraded and writes `capture.consumer_stalled`;
+- `meetcap start` reports the same value on every run as
+  `capture buffer: peak N/M packets, dropped N, stalled N time(s) (longest N ms)`.
+
+There is deliberately no separate stall-timeout or backpressure key: the queue bound and the
+stall threshold are one quantity, and separate keys would only let them disagree.
+
 ## 7. ASR
 
 ```toml

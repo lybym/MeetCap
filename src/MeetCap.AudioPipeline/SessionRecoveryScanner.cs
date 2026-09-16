@@ -1,6 +1,7 @@
 namespace MeetCap.AudioPipeline;
 
 using System.Globalization;
+using System.Text.Json;
 using MeetCap.AudioPipeline.Wave;
 using MeetCap.Core.Capture;
 using MeetCap.Core.Sessions;
@@ -28,6 +29,15 @@ public sealed record RecoveredSession(
     public int RepairedChunks => Chunks.Count(c => c.Status == ChunkStates.Recovered);
 
     public int CorruptChunks => Chunks.Count(c => c.Status == ChunkStates.Corrupt);
+
+    /// <summary>
+    /// The session's post-repair gap audit. A session whose timeline still has a provable
+    /// hole must never be reported as fully recovered (docs/RELIABILITY.md section 6).
+    /// </summary>
+    public SessionAudit Audit { get; init; } = SessionAudit.Clean(string.Empty);
+
+    /// <summary>True when a known stretch of the session timeline holds no durable audio.</summary>
+    public bool RecoveryIncomplete => Audit.RecoveryIncomplete;
 }
 
 /// <summary>Outcome of a startup recovery scan.</summary>
@@ -69,12 +79,35 @@ public sealed class RecoveryReport
             .Where(c => ChunkStates.IsDurable(c.Status))
             .Sum(c => c.DataBytes);
 
+    /// <summary>Sessions that still have a known gap after every repair that could be made.</summary>
+    public IReadOnlyList<RecoveredSession> SessionsWithRemainingGaps
+        => Sessions.Where(s => s.RecoveryIncomplete).ToList();
+
+    /// <summary>
+    /// True when recovery must not claim success, because a known gap remains.
+    /// </summary>
+    public bool RecoveryIncomplete => SessionsWithRemainingGaps.Count > 0;
+
+    /// <summary>Missing audio across every session this scan touched, in milliseconds.</summary>
+    public long RemainingGapMs => Sessions.Sum(s => s.Audit.TotalGapMs);
+
     /// <summary>A one-line summary for the CLI.</summary>
     public string Describe()
-        => RecoveredSessions == 0
-            ? "no incomplete sessions found"
-            : $"{RecoveredSessions} incomplete session(s): {RepairedChunks} chunk(s) recovered, " +
-              $"{CorruptChunks} chunk(s) unreadable";
+    {
+        if (RecoveredSessions == 0)
+        {
+            return "no incomplete sessions found";
+        }
+
+        var summary =
+            $"{RecoveredSessions} incomplete session(s): {RepairedChunks} chunk(s) recovered, " +
+            $"{CorruptChunks} chunk(s) unreadable";
+
+        return RecoveryIncomplete
+            ? summary + $"; {SessionsWithRemainingGaps.Count} session(s) still have a known gap " +
+                        $"({RemainingGapMs} ms missing)"
+            : summary;
+    }
 }
 
 /// <summary>
@@ -115,25 +148,40 @@ public sealed class SessionRecoveryScanner
     }
 
     /// <summary>Scans every session directory under <paramref name="dataRoot"/>.</summary>
-    public RecoveryReport Scan(string dataRoot)
+    public RecoveryReport Scan(string dataRoot) => Scan(dataRoot, sessionId: null);
+
+    /// <summary>
+    /// Scans the session directories under <paramref name="dataRoot"/>, or only
+    /// <paramref name="sessionId"/> when one is given. The filtered form is what
+    /// <c>meetcap session repair --session</c> uses, so an operator can repair one
+    /// session without walking an unrelated data root.
+    /// </summary>
+    public RecoveryReport Scan(string dataRoot, string? sessionId)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(dataRoot);
 
         var directories = SessionPaths.EnumerateSessionDirectories(dataRoot);
+        if (!string.IsNullOrWhiteSpace(sessionId))
+        {
+            directories = directories
+                .Where(d => string.Equals(Path.GetFileName(d), sessionId, StringComparison.Ordinal))
+                .ToList();
+        }
+
         var recovered = new List<RecoveredSession>();
         var problems = new List<string>();
 
         foreach (var directory in directories)
         {
-            var sessionId = Path.GetFileName(directory);
-            if (string.IsNullOrEmpty(sessionId))
+            var id = Path.GetFileName(directory);
+            if (string.IsNullOrEmpty(id))
             {
                 continue;
             }
 
             try
             {
-                var session = ScanSession(new SessionPaths(dataRoot, sessionId), problems);
+                var session = ScanSession(new SessionPaths(dataRoot, id), problems);
                 if (session is not null)
                 {
                     recovered.Add(session);
@@ -142,7 +190,7 @@ public sealed class SessionRecoveryScanner
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
             {
                 // One unreadable session must not abort the scan.
-                problems.Add($"session '{sessionId}' could not be recovered: {ex.Message}");
+                problems.Add($"session '{id}' could not be recovered: {ex.Message}");
             }
         }
 
@@ -195,10 +243,150 @@ public sealed class SessionRecoveryScanner
             _database.Sessions.Insert(sessionRecord);
         }
 
-        using var events = new JsonlSessionEventSink(paths.EventsPath);
+        var repaired = RepairArtifacts(paths, partFiles);
+        try
+        {
+            return FinishRecovery(paths, existing, manifest, targetStatus, repaired);
+        }
+        finally
+        {
+            // The runner owns the event log: it must be closed and flushed before the scan
+            // reports its findings.
+            repaired.Events.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Audits the repaired session, writes its gap and recovery events, and updates the
+    /// session row and manifest.
+    /// </summary>
+    private RecoveredSession FinishRecovery(
+        SessionPaths paths,
+        SessionRecord? existing,
+        SessionManifest? manifest,
+        string targetStatus,
+        RepairPass repaired)
+    {
+        var audit = SessionGapAuditor.Audit(paths.SessionId, _database.Chunks.ListForSession(paths.SessionId));
+        WriteGapEvents(repaired.Events, audit, repaired.RecoveryStartMs);
+
+        var interrupted = string.Equals(targetStatus, SessionStatus.Interrupted, StringComparison.Ordinal);
+        var captureHealth = manifest?.CaptureHealth;
+        var degraded = interrupted
+            || (manifest?.Degraded ?? false)
+            || audit.RecoveryIncomplete
+            || (captureHealth?.IsDegraded ?? false);
+        var detail = BuildDetail(repaired.Chunks, audit);
+        // Reconciliation can create or extend a chunk row (notably when a process died
+        // after the atomic rename but before the index upsert). Session metadata must
+        // reflect that durable audio rather than the stale pre-recovery maximum.
+        var sessionEndMs = SessionEndMs(paths.SessionId);
+
+        // Only an actual recovery writes the recovery event. A targeted
+        // `meetcap session repair` re-scans the same session on every invocation, so an
+        // unconditional append here would grow the event log without recording anything
+        // new. A session that was not cleanly stopped always writes it: that transition
+        // is the recovery.
+        if (repaired.Chunks.Count > 0 || interrupted)
+        {
+            repaired.Events.Write(new SessionEvent(SessionEventNames.SessionRecovered, sessionEndMs)
+            {
+                Count = repaired.Chunks.Count,
+                GapMs = audit.TotalGapMs > 0 ? audit.TotalGapMs : null,
+                Reason = audit.RecoveryIncomplete ? "incomplete" : null,
+                Detail = (interrupted
+                        ? "this session was not cleanly stopped; "
+                        : "this session stopped cleanly but held a stray artifact; ") + detail,
+            });
+
+            if (audit.RecoveryIncomplete)
+            {
+                // docs/RELIABILITY.md section 6: a repair that could not make the session
+                // whole records that fact instead of reporting success.
+                repaired.Events.Write(new SessionEvent(
+                    SessionEventNames.SessionRepairIncomplete,
+                    sessionEndMs)
+                {
+                    GapMs = audit.TotalGapMs,
+                    Count = audit.Gaps.Count,
+                    Reason = audit.HasProblems ? "audit_failed" : "gap_detected",
+                    Detail =
+                        "recovery could not make this session whole; " + audit.Describe() +
+                        (audit.HasProblems ? " (the audit itself failed: " + string.Join("; ", audit.Problems) + ")" : string.Empty) +
+                        ". The audio that is missing has no durable chunk and was not invented.",
+                });
+            }
+        }
+
+        // A terminal session keeps its own metadata: its `stopped_at`, its `duration_ms`
+        // and its `recovered_at` are already the truth, and overwriting them would
+        // present a cleanly stopped recording as an interrupted one.
+        var updatedAt = interrupted ? _clock.UtcNow : existing?.UpdatedAt ?? _clock.UtcNow;
+
+        if (manifest is not null)
+        {
+            manifest.Status = targetStatus;
+            manifest.Degraded = degraded;
+            manifest.EndReason = manifest.EndReason ?? (interrupted ? "interrupted" : null);
+            manifest.GapCount = Math.Max(manifest.GapCount, audit.Gaps.Count);
+            manifest.GapTotalMs = Math.Max(manifest.GapTotalMs, audit.TotalGapMs);
+            manifest.GapsRemain = audit.RecoveryIncomplete;
+            manifest.GapDetails = audit.DescribeGaps().ToList();
+
+            if (interrupted)
+            {
+                manifest.RecoveredAt = _clock.UtcNow;
+            }
+
+            SessionManifestStore.Save(paths.ManifestPath, manifest);
+        }
+
+        _database.Sessions.UpdateLifecycle(
+            paths.SessionId,
+            targetStatus,
+            updatedAt,
+            stoppedAt: interrupted ? null : existing?.StoppedAt,
+            durationMs: interrupted ? sessionEndMs : existing?.DurationMs ?? sessionEndMs);
+
+        return new RecoveredSession(
+            paths.SessionId,
+            paths.SessionDirectory,
+            targetStatus,
+            repaired.Chunks,
+            degraded,
+            detail)
+        {
+            Audit = audit,
+        };
+    }
+
+    /// <summary>
+    /// Artifacts the repair pass had to deal with, plus the log it wrote to and the
+    /// timeline position repair events are placed after.
+    /// </summary>
+    /// <remarks>
+    /// The event sink is owned by the caller, not by the repair pass: the gap audit and
+    /// the session-level recovery event are written after the artifacts have been
+    /// reconciled, and they must land in the same log.
+    /// </remarks>
+    private sealed record RepairPass(
+        IReadOnlyList<RecoveredChunk> Chunks,
+        JsonlSessionEventSink Events,
+        long RecoveryStartMs);
+
+    /// <summary>
+    /// Repairs one session's <c>.part</c> chunks and reconciles final WAVs whose index row
+    /// never became durable. Shared by the startup scan and by a targeted
+    /// <c>meetcap session repair</c>, so both paths classify artifacts identically.
+    /// </summary>
+    private RepairPass RepairArtifacts(SessionPaths paths, IReadOnlyList<string> partFiles)
+    {
+        var events = new JsonlSessionEventSink(paths.EventsPath);
+
         // Use the pre-recovery end only to place individual repair events after the
         // already-indexed audio. Recovery can promote an open/missing index row to a
-        // chunk with a later end, so the session-level end is calculated again below.
+        // chunk with a later end, so the session-level end is calculated again by the
+        // caller.
         var recoveryStartMs = SessionEndMs(paths.SessionId);
         var recoveredChunks = new List<RecoveredChunk>();
 
@@ -226,56 +414,103 @@ public sealed class SessionRecoveryScanner
             }
         }
 
-        var interrupted = string.Equals(targetStatus, SessionStatus.Interrupted, StringComparison.Ordinal);
-        var degraded = interrupted || (manifest?.Degraded ?? false);
-        var detail = BuildDetail(recoveredChunks);
-        // Reconciliation above can create or extend a chunk row (notably when a
-        // process died after the atomic rename but before the index upsert). Session
-        // metadata must reflect that durable audio rather than the stale pre-recovery
-        // maximum.
-        var sessionEndMs = SessionEndMs(paths.SessionId);
+        return new RepairPass(recoveredChunks, events, recoveryStartMs);
+    }
 
-        events.Write(new SessionEvent(SessionEventNames.SessionRecovered, sessionEndMs)
+    /// <summary>
+    /// Writes an explicit <c>capture.gap</c> event for every gap the audit found,
+    /// skipping positions the event log already describes.
+    /// </summary>
+    /// <remarks>
+    /// docs/RELIABILITY.md section 7 forbids hiding missing audio by only shifting later
+    /// timestamps, so a hole the live recording never saw (because the process died) has
+    /// to become an event too. Recovery is idempotent, so the already-recorded positions
+    /// are read back first: otherwise every <c>meetcap status</c> would append the same
+    /// gap again and the event log would grow without bound.
+    /// </remarks>
+    private static void WriteGapEvents(ISessionEventSink events, SessionAudit audit, long atMs)
+    {
+        if (!audit.HasGap)
         {
-            Count = recoveredChunks.Count,
-            Detail = (interrupted
-                    ? "this session was not cleanly stopped; "
-                    : "this session stopped cleanly but held a stray artifact; ") + detail,
-        });
-
-        // A terminal session keeps its own metadata: its `stopped_at`, its `duration_ms`
-        // and its `recovered_at` are already the truth, and overwriting them would
-        // present a cleanly stopped recording as an interrupted one.
-        var updatedAt = interrupted ? _clock.UtcNow : existing?.UpdatedAt ?? _clock.UtcNow;
-
-        if (manifest is not null)
-        {
-            manifest.Status = targetStatus;
-            manifest.Degraded = degraded;
-            manifest.EndReason = manifest.EndReason ?? (interrupted ? "interrupted" : null);
-
-            if (interrupted)
-            {
-                manifest.RecoveredAt = _clock.UtcNow;
-            }
-
-            SessionManifestStore.Save(paths.ManifestPath, manifest);
+            return;
         }
 
-        _database.Sessions.UpdateLifecycle(
-            paths.SessionId,
-            targetStatus,
-            updatedAt,
-            stoppedAt: interrupted ? null : existing?.StoppedAt,
-            durationMs: interrupted ? sessionEndMs : existing?.DurationMs ?? sessionEndMs);
+        var alreadyReported = ReadReportedGapPositions(events);
+        foreach (var gap in audit.Gaps)
+        {
+            if (alreadyReported.Contains((gap.StartMs, gap.Source)))
+            {
+                continue;
+            }
 
-        return new RecoveredSession(
-            paths.SessionId,
-            paths.SessionDirectory,
-            targetStatus,
-            recoveredChunks,
-            degraded,
-            detail);
+            events.Write(new SessionEvent(SessionEventNames.CaptureGap, Math.Max(gap.EndMs, atMs))
+            {
+                Source = gap.Source,
+                StartMs = gap.StartMs,
+                EndMs = gap.EndMs,
+                GapMs = gap.GapMs,
+                Reason = gap.Reason,
+                Count = gap.MissingSequences.Count > 0 ? gap.MissingSequences.Count : null,
+                Detail = gap.Detail,
+            });
+        }
+    }
+
+    /// <summary>
+    /// The <c>(start_ms, source)</c> positions already described by a <c>capture.gap</c>
+    /// event in the session's log.
+    /// </summary>
+    private static HashSet<(long StartMs, string Source)> ReadReportedGapPositions(ISessionEventSink events)
+    {
+        var positions = new HashSet<(long, string)>();
+        if (events is not JsonlSessionEventSink jsonl || !File.Exists(jsonl.Path))
+        {
+            return positions;
+        }
+
+        foreach (var line in ReadLines(jsonl.Path))
+        {
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                continue;
+            }
+
+            try
+            {
+                using var document = JsonDocument.Parse(line);
+                var root = document.RootElement;
+                if (root.ValueKind != JsonValueKind.Object ||
+                    !root.TryGetProperty("event", out var name) ||
+                    name.GetString() != SessionEventNames.CaptureGap ||
+                    !root.TryGetProperty("start_ms", out var startMs) ||
+                    !startMs.TryGetInt64(out var start) ||
+                    !root.TryGetProperty("source", out var source))
+                {
+                    continue;
+                }
+
+                positions.Add((start, source.GetString() ?? string.Empty));
+            }
+            catch (JsonException)
+            {
+                // A torn final line from a killed process is expected; it simply carries
+                // no position to de-duplicate against.
+            }
+        }
+
+        return positions;
+    }
+
+    private static IEnumerable<string> ReadLines(string path)
+    {
+        // The event log is appended by another process while a recording runs, so it is
+        // opened with the sharing the sink itself uses.
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var reader = new StreamReader(stream);
+        while (reader.ReadLine() is { } line)
+        {
+            yield return line;
+        }
     }
 
     private RecoveredChunk? RecoverPartFile(
@@ -690,10 +925,11 @@ public sealed class SessionRecoveryScanner
         }
     }
 
-    private static string BuildDetail(IReadOnlyList<RecoveredChunk> chunks)
+    private static string BuildDetail(IReadOnlyList<RecoveredChunk> chunks, SessionAudit audit)
     {
         var repaired = chunks.Count(c => c.Status == ChunkStates.Recovered);
         var corrupt = chunks.Count(c => c.Status == ChunkStates.Corrupt);
-        return $"{repaired} chunk(s) repaired, {corrupt} chunk(s) unreadable";
+        return $"{repaired} chunk(s) repaired, {corrupt} chunk(s) unreadable; " +
+               $"timeline: {audit.Describe()}";
     }
 }

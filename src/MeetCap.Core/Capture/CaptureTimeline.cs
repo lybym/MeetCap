@@ -72,6 +72,21 @@ public sealed class CaptureTimeline
     public long LastEndMs => _lastEndMs;
 
     /// <summary>
+    /// Total audio time this timeline knows is missing, in milliseconds.
+    /// </summary>
+    /// <remarks>
+    /// Every gap is counted here exactly once, at the moment it is placed on the
+    /// timeline. Recording-level gap accounting reads this property instead of
+    /// re-deriving it, so a discontinuity cannot be counted twice (once from the
+    /// device position and once from the measured outage) and cannot be silently
+    /// smoothed away (docs/RELIABILITY.md section 7).
+    /// </remarks>
+    public long GapTotalMs { get; private set; }
+
+    /// <summary>How many discontinuities produced <see cref="GapTotalMs"/>.</summary>
+    public int GapCount { get; private set; }
+
+    /// <summary>
     /// Records that capture was interrupted for <paramref name="downtimeMs"/> and
     /// that the device stream restarted afterwards.
     /// </summary>
@@ -124,6 +139,13 @@ public sealed class CaptureTimeline
             _originFrames = packet.DevicePositionFrames - _format.MillisecondsToFrames(targetMs);
             _nextExpectedFrames = packet.DevicePositionFrames + frames;
             _lastEndMs = targetMs + durationMs;
+
+            if (gap > 0)
+            {
+                GapTotalMs += gap;
+                GapCount++;
+            }
+
             return new PacketTiming(targetMs, _lastEndMs, gap, flagged, false, SegmentRestart: true);
         }
 
@@ -156,6 +178,12 @@ public sealed class CaptureTimeline
         var endMs = startMs + durationMs;
         _nextExpectedFrames = packet.DevicePositionFrames + frames;
         _lastEndMs = endMs;
+
+        if (gapMs > 0)
+        {
+            GapTotalMs += gapMs;
+            GapCount++;
+        }
 
         return new PacketTiming(startMs, endMs, gapMs, flagged, anomaly);
     }

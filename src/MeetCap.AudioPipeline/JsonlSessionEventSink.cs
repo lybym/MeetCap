@@ -85,6 +85,7 @@ public sealed class JsonlSessionEventSink : ISessionEventSink, IDisposable
         WriteOptionalNumber(writer, "device_position_frames", sessionEvent.DevicePositionFrames);
         WriteOptionalNumber(writer, "qpc_position_ticks", sessionEvent.QpcPositionTicks);
         WriteOptionalNumber(writer, "free_bytes", sessionEvent.FreeBytes);
+        WriteOptionalString(writer, "reason", sessionEvent.Reason);
         if (sessionEvent.Count is { } count)
         {
             writer.WriteNumber("count", count);

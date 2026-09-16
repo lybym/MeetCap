@@ -648,6 +648,149 @@ public class SessionRecoveryScannerTests
     }
 
     [Fact]
+    public void Scan_WithAnUnrepairableChunk_ReportsTheGapAndNeverClaimsSuccess()
+    {
+        using var workspace = new TempWorkspace(sessionStatus: SessionStatus.Recording);
+        var paths = workspace.Paths;
+
+        // A durable closed chunk, then a chunk whose bytes are not a WAV at all, then a
+        // durable chunk after it. Recovery can do nothing for the middle chunk, so 2 s of
+        // the session timeline has no durable audio and must be reported as such
+        // (docs/RELIABILITY.md section 6).
+        WriteChunk(paths, sequence: 1, dataBytes: 2 * SecondBytes, close: true);
+        IndexChunk(paths, workspace.Database, sequence: 1, startMs: 0, endMs: 2_000, ChunkStates.Closed);
+
+        File.WriteAllBytes(
+            paths.ChunkPartPath(AudioSource.Mic, 2),
+            Enumerable.Range(0, 512).Select(i => (byte)i).ToArray());
+
+        WriteChunk(paths, sequence: 3, dataBytes: 2 * SecondBytes, close: true);
+        IndexChunk(paths, workspace.Database, sequence: 3, startMs: 4_000, endMs: 6_000, ChunkStates.Closed);
+
+        WriteManifest(paths, SessionStatus.Recording);
+
+        var report = new SessionRecoveryScanner(workspace.Database, new FakeClock()).Scan(workspace.DataRoot);
+
+        var session = Assert.Single(report.Sessions);
+        Assert.Equal(1, session.CorruptChunks);
+
+        // The gap is the corrupt chunk's own stint, classified as unrecoverable bytes
+        // rather than "the device skipped it".
+        var gap = Assert.Single(session.Audit.Gaps);
+        Assert.Equal(AudioGapReasons.ChunkUnreadable, gap.Reason);
+        Assert.Equal(2, gap.Sequence);
+        Assert.Equal(2_000, gap.GapMs);
+
+        // Recovery must not claim success while that gap remains.
+        Assert.True(session.RecoveryIncomplete);
+        Assert.True(report.RecoveryIncomplete);
+        Assert.Equal(2_000, report.RemainingGapMs);
+        Assert.Contains("still have a known gap", report.Describe(), StringComparison.Ordinal);
+
+        var events = ReadEvents(paths);
+        Assert.Equal(1, CountEvents(events, SessionEventNames.SessionRepairIncomplete));
+        Assert.Equal(1, CountEvents(events, SessionEventNames.CaptureGap));
+
+        var repairEvent = Assert.Single(events, e => Name(e) == SessionEventNames.SessionRepairIncomplete);
+        Assert.Equal(2_000, repairEvent.GetProperty("gap_ms").GetInt64());
+
+        SessionManifestStore.TryLoad(paths.ManifestPath, out var manifest, out _);
+        Assert.True(manifest!.GapsRemain);
+        Assert.Equal(2_000, manifest.GapTotalMs);
+        Assert.Contains(manifest.GapDetails, line => line.Contains("chunk_unreadable", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Scan_WithAContiguousTrack_FindsNoGap()
+    {
+        using var workspace = new TempWorkspace(sessionStatus: SessionStatus.Recording);
+        var paths = workspace.Paths;
+
+        WriteChunk(paths, sequence: 1, dataBytes: 2 * SecondBytes, close: true);
+        IndexChunk(paths, workspace.Database, sequence: 1, startMs: 0, endMs: 2_000, ChunkStates.Closed);
+        WritePartWithData(paths, sequence: 2, dataBytes: 2 * SecondBytes);
+        IndexChunk(paths, workspace.Database, sequence: 2, startMs: 2_000, endMs: 4_000, ChunkStates.Open);
+
+        WriteManifest(paths, SessionStatus.Recording);
+
+        var report = new SessionRecoveryScanner(workspace.Database, new FakeClock()).Scan(workspace.DataRoot);
+
+        var session = Assert.Single(report.Sessions);
+        Assert.Equal(1, session.RepairedChunks);
+        Assert.False(session.Audit.HasGap);
+        Assert.False(session.RecoveryIncomplete);
+        Assert.False(report.RecoveryIncomplete);
+        Assert.Equal(0, CountEvents(ReadEvents(paths), SessionEventNames.CaptureGap));
+        Assert.Equal(0, CountEvents(ReadEvents(paths), SessionEventNames.SessionRepairIncomplete));
+
+        SessionManifestStore.TryLoad(paths.ManifestPath, out var manifest, out _);
+        Assert.False(manifest!.GapsRemain);
+    }
+
+    [Fact]
+    public void Scan_TargetingOneSession_LeavesUnrelatedSessionsAlone()
+    {
+        const string otherId = "ses_20260915T160000Z_0000000d";
+        using var workspace = new TempWorkspace(sessionStatus: SessionStatus.Recording);
+
+        WriteChunk(workspace.Paths, sequence: 1, dataBytes: 2 * SecondBytes, close: false);
+        WriteManifest(workspace.Paths, SessionStatus.Recording);
+
+        var otherPaths = new SessionPaths(workspace.DataRoot, otherId);
+        otherPaths.CreateDirectories();
+        WriteChunk(otherPaths, sequence: 1, dataBytes: 2 * SecondBytes, close: false);
+        workspace.Database.Sessions.Insert(new SessionRecord
+        {
+            Id = otherId,
+            Title = "Other",
+            Mode = SessionModes.Offline,
+            SourceType = SessionSourceTypes.Live,
+            Status = SessionStatus.Recording,
+            ConfigVersion = 1,
+            Tracks = new[] { AudioSources.Mic },
+            CreatedAt = DateTimeOffset.UnixEpoch,
+            UpdatedAt = DateTimeOffset.UnixEpoch,
+        });
+
+        var scanner = new SessionRecoveryScanner(workspace.Database, new FakeClock());
+        var report = scanner.Scan(workspace.DataRoot, workspace.SessionId);
+
+        Assert.Equal(1, report.ScannedSessions);
+        Assert.Equal(workspace.SessionId, Assert.Single(report.Sessions).SessionId);
+
+        // The unrelated session kept its recording surface untouched.
+        Assert.True(File.Exists(otherPaths.ChunkPartPath(AudioSource.Mic, 1)));
+        Assert.Equal(SessionStatus.Recording, workspace.Database.Sessions.Find(otherId)!.Status);
+    }
+
+    [Fact]
+    public void Scan_DoesNotRepeatGapEventsOnALaterPass()
+    {
+        using var workspace = new TempWorkspace(sessionStatus: SessionStatus.Recording);
+        var paths = workspace.Paths;
+
+        // One durable chunk, then a permanent hole, then another durable chunk: the gap is
+        // a fact about the artifacts, so a second repair pass must report the same gap
+        // without appending the same event again.
+        WriteChunk(paths, sequence: 1, dataBytes: 2 * SecondBytes, close: true);
+        IndexChunk(paths, workspace.Database, sequence: 1, startMs: 0, endMs: 2_000, ChunkStates.Closed);
+        File.WriteAllBytes(
+            paths.ChunkPartPath(AudioSource.Mic, 2),
+            Enumerable.Range(0, 512).Select(i => (byte)i).ToArray());
+        WriteChunk(paths, sequence: 3, dataBytes: 2 * SecondBytes, close: true);
+        IndexChunk(paths, workspace.Database, sequence: 3, startMs: 4_000, endMs: 6_000, ChunkStates.Closed);
+        WriteManifest(paths, SessionStatus.Recording);
+
+        var scanner = new SessionRecoveryScanner(workspace.Database, new FakeClock());
+        var first = scanner.Scan(workspace.DataRoot);
+        var second = scanner.Scan(workspace.DataRoot);
+
+        Assert.True(first.RecoveryIncomplete);
+        Assert.True(second.RecoveryIncomplete);
+        Assert.Equal(1, CountEvents(ReadEvents(paths), SessionEventNames.CaptureGap));
+    }
+
+    [Fact]
     public void Scan_ReportsUnreadableSessionsWithoutAbortingTheWholeScan()
     {
         using var workspace = new TempWorkspace(sessionStatus: SessionStatus.Recording);
@@ -754,9 +897,37 @@ public class SessionRecoveryScannerTests
         });
     }
 
-    private static void WriteManifest(SessionPaths paths, string status)
+    /// <summary>
+    /// Writes a chunk index row with an explicit timeline position, so the gap audit can
+    /// reason about a track whose sequence numbering has a hole in it.
+    /// </summary>
+    private static void IndexChunk(
+        SessionPaths paths,
+        MeetCapDatabase database,
+        int sequence,
+        long startMs,
+        long endMs,
+        string status)
     {
-        SessionManifestStore.Save(paths.ManifestPath, new SessionManifest
+        database.Chunks.Upsert(new AudioChunkRecord
+        {
+            Id = AudioChunkRecord.BuildId(paths.SessionId, AudioSource.Mic, sequence),
+            SessionId = paths.SessionId,
+            Source = AudioSource.Mic,
+            Sequence = sequence,
+            RelativePath = paths.RelativeChunkPath(AudioSource.Mic, sequence),
+            StartMs = startMs,
+            EndMs = endMs,
+            Format = Format,
+            ByteLength = (endMs - startMs) * 96,
+            Status = status,
+            CreatedAt = DateTimeOffset.UnixEpoch,
+            ClosedAt = ChunkStates.IsDurable(status) ? DateTimeOffset.UnixEpoch : null,
+        });
+    }
+
+    private static void WriteManifest(SessionPaths paths, string status)
+    {        SessionManifestStore.Save(paths.ManifestPath, new SessionManifest
         {
             SessionId = paths.SessionId,
             Title = "Test Session",

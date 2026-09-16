@@ -11,6 +11,9 @@ scripted capture source, but it runs without a microphone. Until the scenarios b
 have been executed on real hardware, M1 must be described as *implemented and
 automatically covered*, not as *verified*.
 
+Section 10 holds the same kind of checklist for the M2 additions from Issue #4 (bounded
+buffer accounting, explicit gap reporting, `meetcap session repair`).
+
 ---
 
 ## 1. Environment to record
@@ -228,7 +231,75 @@ sqlite3 "$env:LOCALAPPDATA\MeetCap\meetcap.db" `
 
 ---
 
-## 9. Result
+## 10. M2 additions — bounded buffer, explicit gaps and session repair
+
+Issue #4 (M2, *durable spool and crash recovery*) adds behaviour that also needs a real
+Windows run. The automated coverage is in `tests/MeetCap.Core.Tests/Capture/`,
+`tests/MeetCap.AudioPipeline.Tests/SessionGapAuditorTests.cs`,
+`tests/MeetCap.AudioPipeline.Tests/RecordingSessionTests.cs` and
+`tests/MeetCap.Cli.Tests/CaptureCommandTests.cs`; what a scripted capture source cannot
+show is how the accounting behaves against a real device and a real slow disk.
+
+Run these after the M1 scenarios above.
+
+### 10.1 Bounded buffer reported on a healthy session
+
+```powershell
+meetcap start "M2 buffer check" --mode offline
+# record a minute, then `meetcap stop`
+```
+
+- [ ] `meetcap start` prints a `capture buffer:` line, and `peak` is a small fraction of
+      the printed capacity on a healthy run.
+- [ ] `dropped` is `0` and `stalled` is `0 time(s)`.
+- [ ] `session.json` carries `capture_health` with the same `capacity_packets`, plus
+      `peak_queued_packets`, `dropped_packets`, `overflow_events`, `longest_stall_ms`,
+      `stall_events`, `gap_count` and `gap_total_ms`.
+- [ ] No `capture.buffer_overflow` or `capture.consumer_stalled` event appears in
+      `events.jsonl`.
+
+### 10.2 Slow consumer does not grow memory or stop capture
+
+Make the data-root volume genuinely slow (a busy USB 2.0 stick, or a disk under heavy
+load) and record a burst of loud input.
+
+- [ ] If the backlog is reported, `events.jsonl` contains `capture.consumer_stalled` with a
+      `count` below the capacity, and/or `capture.buffer_overflow` with a `count`.
+- [ ] The working set stays flat for the duration of the run; it must not track the
+      backlog.
+- [ ] Capture itself never stalls: the recording arrives with a normal duration and the
+      session still reaches a terminal state.
+
+### 10.3 Explicit gap accounting
+
+Re-use M1 scenario 3 (unplug/replug) and scenario 6 (timing).
+
+- [ ] `session.json` `gap_count` and `gap_total_ms` match the `capture.gap` events in
+      `events.jsonl` (one timeline gap is counted once, never twice).
+- [ ] `meetcap start` prints an `audio gaps:` line when a gap occurred.
+- [ ] No later chunk's `start_ms` moved backwards to hide the missing audio.
+
+### 10.4 `meetcap session repair`
+
+```powershell
+# after a forced kill with an active .part file
+meetcap session repair
+meetcap session repair --session <session-id>
+```
+
+- [ ] `meetcap session repair` prints `repair:`, the per-session status, `timeline:` and
+      one `gap:` line per gap.
+- [ ] It exits `0` when the repaired session has no gap, and the repaired chunk is readable.
+- [ ] Destroy the active `*.part` (overwrite its first bytes) so it cannot be repaired, then
+      run it again: it exits non-zero, prints the gap, and `events.jsonl` contains
+      `session.repair.incomplete`.
+- [ ] Running it twice does not append a second `capture.gap` for the same position.
+- [ ] `meetcap session repair --session <unknown-id>` exits non-zero and says the session was
+      not found.
+
+---
+
+## 11. Result
 
 | Scenario | Result | Notes |
 | --- | --- | --- |
@@ -238,6 +309,10 @@ sqlite3 "$env:LOCALAPPDATA\MeetCap\meetcap.db" `
 | 4. Forced kill | | |
 | 5. Low disk space | | |
 | 6. Timing metadata | | |
+| 10.1 M2 buffer accounting | | |
+| 10.2 M2 slow consumer | | |
+| 10.3 M2 explicit gaps | | |
+| 10.4 M2 session repair | | |
 
-M1 may be described as verified on real hardware only when every row above is filled in
-and passing, or when the residual failure is written down here as a known limitation.
+M1 and M2 may be described as verified on real hardware only when every row above is filled
+in and passing, or when the residual failure is written down here as a known limitation.

@@ -66,6 +66,18 @@ internal static class StatusCommand
         {
             context.Out.WriteLine($"  {session.SessionId}: {session.Status} — {session.Detail}");
             context.Out.WriteLine($"      directory: {session.SessionDirectory}");
+
+            // A repaired session that still has a hole in its timeline must say so here,
+            // not only in the event log: docs/RELIABILITY.md section 6 forbids presenting
+            // such a session as recovered.
+            if (session.Audit.HasGap)
+            {
+                context.Out.WriteLine($"      timeline:  {session.Audit.Describe()}");
+                foreach (var gap in session.Audit.DescribeGaps())
+                {
+                    context.Out.WriteLine($"      gap:       {gap}");
+                }
+            }
         }
 
         foreach (var problem in report.Problems)
@@ -76,11 +88,13 @@ internal static class StatusCommand
         context.LoggerFactory
             .CreateLogger(CliContext.LoggerCategory)
             .LogInformation(
-                "status: dataRoot={DataRoot} dbInitialized={DbInit} activeSessions={Active} recovered={Recovered}",
+                "status: dataRoot={DataRoot} dbInitialized={DbInit} activeSessions={Active} recovered={Recovered} " +
+                "gapsRemain={GapsRemain}",
                 dataRoot,
                 dbInitialized,
                 activeSessions,
-                report.RecoveredSessions);
+                report.RecoveredSessions,
+                report.RecoveryIncomplete);
 
         return Task.FromResult(0);
     }
