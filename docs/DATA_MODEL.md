@@ -36,8 +36,13 @@ artifacts rather than inferred:
 
 - startup recovery found the session was never cleanly stopped (for example the process
   was killed), so `stopped_at` stays `null` and the manifest records `recovered_at`;
-- the recording process had to abandon the session, because capture never started or the
-  final chunk could not be closed, so `stopped_at` is set.
+- the recording process had to abandon the session, because capture never started, the
+  final chunk could not be closed, or the capture device came back at a different
+  format (`device_format_changed`), so `stopped_at` is set.
+
+A terminal session is never reclassified. Recovery may repair a stray artifact found in
+a `COMPLETED` session's directory, but `COMPLETED` keeps its status, its `stopped_at` and
+its `duration_ms`: it *was* cleanly stopped.
 
 A device that disappears and comes back does **not** make a session `INTERRUPTED`: the
 session still completes, and the outage is recorded as a degraded flag plus explicit
@@ -55,6 +60,7 @@ sessions/<session-id>/
   session.json
   events.jsonl
   stop.request          (present only while a stop is being requested)
+  recording.lock        (held exclusively while a recording is in progress)
 
   audio/
     mic/
@@ -89,6 +95,14 @@ For offline mode, `audio/loopback/` is absent.
 process from `meetcap start`, so it signals the running recorder by writing this file,
 which the recording loop polls. It carries no session state and is removed when the
 session ends.
+
+`recording.lock` is a liveness marker, not an artifact: the recording process holds it
+open exclusively for as long as the session owns the recording surface, and the operating
+system releases the handle when that process exits for any reason. Recovery scans use it
+to tell a recording that is still in progress apart from a session abandoned by a killed
+process, so `meetcap status` can never rewrite a live session to `INTERRUPTED`
+(`docs/ARCHITECTURE.md` section 9.1). It is deleted at the end of a clean session; an
+undeletable leftover carries no meaning because it is not held.
 
 `audio/import/` holds the materialized import source and, when normalization was required,
 the normalized derivative. `transcript/raw.jsonl` is the mandatory normalized transcript;
@@ -186,7 +200,7 @@ audio.chunk.recovered      audio.chunk.corrupt
 
 capture.gap                capture.discontinuity
 capture.device_lost        capture.device_restored   capture.device_lost_fatal
-capture.buffer_overflow
+capture.format_changed     capture.buffer_overflow
 
 storage.low_disk_space     storage.disk_exhausted    storage.probe_failed
 ```

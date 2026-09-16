@@ -2,7 +2,7 @@ namespace MeetCap.Core.Sessions;
 
 /// <summary>
 /// Session lifecycle values stored in <c>sessions.status</c>. The state machine is
-/// defined in docs/ARCHITECTURE.md section 19.
+/// defined in docs/ARCHITECTURE.md section 20.
 /// </summary>
 /// <remarks>
 /// M1 uses <see cref="Created"/> to <see cref="Recording"/> to

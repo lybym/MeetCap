@@ -403,7 +403,12 @@ Discontinuities are never smoothed over:
   timeline stays monotonic, and is reported as a `capture.discontinuity`;
 - the device's own buffer flags are surfaced as `capture.discontinuity`;
 - after a device loss and recovery, the measured outage is inserted as an explicit gap,
-  and the first buffer of the new stream starts a new chunk.
+  and the first buffer of the new stream starts a new chunk;
+- a reopened endpoint that reports a **different mix format** cannot be folded into the
+  running session, because the chunk headers, the chunk index and the timeline are
+  already written against the session's format. The session ends as degraded with an
+  explicit `capture.format_changed` event (naming both formats) and a non-zero exit,
+  instead of writing new bytes under the old header.
 
 ---
 
@@ -468,7 +473,25 @@ Startup recovery runs before a new recording starts and from `meetcap status`:
 .part that is not a WAV      -> leave the bytes in place, mark corrupt, report the reason
 .part alongside a closed .wav -> never overwrite the WAV; retain the .part as .collided, mark corrupt
 session not cleanly stopped  -> status INTERRUPTED, manifest records recovered_at
+session already terminal     -> repair the stray artifact, keep the terminal status and stopped_at
+session with a held liveness marker -> skip: a live recording owns its own chunk surface
 ```
+
+The scan is safe to run on every command because it decides whether a session is
+recoverable from session state and liveness, not from artifact presence alone:
+
+- only a session whose status is `CREATED`, `RECORDING` or `FINALIZING` — or a session
+  directory with no row at all — is treated as "not cleanly stopped". A session that is
+  already `COMPLETED` or `INTERRUPTED` keeps its status, its `stopped_at` and its
+  `duration_ms` even when recovery repairs a stray artifact it found next to the durable
+  audio, because it *was* cleanly stopped.
+- a session whose liveness marker (`recording.lock`) is held by a running process is
+  skipped entirely. The recording process holds that marker exclusively for the lifetime
+  of the recording, and the operating system releases it when the process exits for any
+  reason, so a killed recorder is still recovered. Without it, `meetcap status` (a
+  different process) would rewrite a healthy live session to `INTERRUPTED`, stamp false
+  recovery events on its clean event log, and make `meetcap stop` — which only finds
+  `CREATED`/`RECORDING` sessions — unable to stop a recording that is still running.
 
 Previously closed chunks are never reopened or rewritten, which is what makes a forced
 kill unable to damage them.
@@ -788,6 +811,7 @@ No component may read ad-hoc environment variables directly except the configura
       session.json
       events.jsonl
       stop.request          (present only while a stop is being requested)
+      recording.lock        (held exclusively while a recording is in progress)
       audio/
         mic/
         loopback/
@@ -810,6 +834,12 @@ No component may read ad-hoc environment variables directly except the configura
 process from `meetcap start`, so it signals the running recorder by writing this file,
 which the recording loop polls. It carries no session state and is removed when the
 session ends. See `docs/DATA_MODEL.md` section 2.
+
+`recording.lock` is a liveness marker, not an artifact: the recording process holds it
+open exclusively while the session owns the recording surface, and the operating system
+releases it when that process exits for any reason. It is what lets `meetcap status` run
+the startup recovery scan without ever touching a recording that is still in progress.
+See section 9.1 and `docs/DATA_MODEL.md` section 2.
 
 Speaker embeddings and name mappings remain local by default and are treated as sensitive identity-related data.
 

@@ -173,7 +173,7 @@ public class RepositoryTests : IDisposable
     }
 
     [Fact]
-    public void AudioChunkRepository_AggregatesPerSession()
+    public void AudioChunkRepository_CountsAndSumsEveryIndexedChunkPerSession()
     {
         _database.Sessions.Insert(Session("ses_totals"));
         _database.Chunks.Upsert(Chunk("ses_totals", 1, ChunkStates.Closed, byteLength: 100));
@@ -181,7 +181,16 @@ public class RepositoryTests : IDisposable
         _database.Chunks.Upsert(Chunk("ses_totals", 3, ChunkStates.Corrupt, byteLength: 10));
 
         Assert.Equal(3, _database.Chunks.CountForSession("ses_totals"));
+
+        // The sum is over every indexed row, not only durable audio: a corrupt row still
+        // records bytes that are retained on disk for inspection. Callers that need the
+        // durable total pair this with ListByStatus / ChunkStates.IsDurable, the way
+        // RecoveryReport.RecoveredDataBytes does.
         Assert.Equal(360, _database.Chunks.TotalByteLengthForSession("ses_totals"));
+        Assert.Equal(350, _database.Chunks.ListByStatus("ses_totals", ChunkStates.Closed)
+            .Concat(_database.Chunks.ListByStatus("ses_totals", ChunkStates.Recovered))
+            .Sum(c => c.ByteLength));
+
         Assert.Single(_database.Chunks.ListByStatus("ses_totals", ChunkStates.Recovered));
         Assert.Equal(3, _database.Chunks.ListForSession("ses_totals").Count);
     }

@@ -125,7 +125,12 @@ public sealed class AudioChunkRepository
         return result is long l ? (int)l : 0;
     }
 
-    /// <summary>Total indexed bytes of a session's durable audio.</summary>
+    /// <summary>
+    /// Total indexed bytes of a session's audio across every chunk status. A corrupt or
+    /// open row still describes bytes that are retained on disk, so callers that need
+    /// the durable total filter with <see cref="ChunkStates.IsDurable"/> themselves (as
+    /// <c>RecoveryReport.RecoveredDataBytes</c> does).
+    /// </summary>
     public long TotalByteLengthForSession(string sessionId)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(sessionId);

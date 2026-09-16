@@ -195,6 +195,53 @@ public class CaptureCommandTests
     }
 
     [Fact]
+    public async Task Status_WhileARecordingIsInProgress_DoesNotInterruptIt()
+    {
+        using var harness = CliHarness.Create();
+        harness.WriteCaptureConfig(chunkSeconds: 1);
+
+        var startTask = Task.Run(() => harness.Run("start", "Live Status"));
+        var sessionDirectory = WaitForSessionDirectory(harness.DataRoot);
+        Assert.NotNull(sessionDirectory);
+        WaitForActiveSession(harness.DataRoot);
+
+        // `meetcap status` runs the startup recovery scan from a different process. The
+        // live recording holds its liveness marker, so the scan must leave it alone:
+        // rewriting it to INTERRUPTED would also make `meetcap stop` unable to find it,
+        // leaving a recording that cannot be stopped.
+        var status = harness.Run("status");
+
+        Assert.Equal(0, status.ExitCode);
+        Assert.Contains("recovery: no incomplete sessions found", status.Output);
+        Assert.Contains("sessions: 1 active", status.Output);
+
+        // The scan must not have touched the recording: it is still active, its event log
+        // gained no false recovery event, and it is still stoppable.
+        var database = new MeetCapDatabase(Path.Combine(harness.DataRoot, "meetcap.db"));
+        Assert.NotNull(database.Sessions.FindActiveSession());
+        Assert.Equal(SessionStatus.Recording, database.Sessions.Find(Path.GetFileName(sessionDirectory!))!.Status);
+
+        using (var stream = new FileStream(
+            Path.Combine(sessionDirectory!, "events.jsonl"),
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete))
+        using (var reader = new StreamReader(stream))
+        {
+            Assert.DoesNotContain("session.recovered", reader.ReadToEnd(), StringComparison.Ordinal);
+        }
+
+        var stop = harness.Run("stop");
+        var start = await AwaitBounded(
+            startTask,
+            TimeSpan.FromSeconds(60),
+            "meetcap start did not finish after meetcap stop");
+
+        Assert.Equal(0, stop.ExitCode);
+        Assert.Equal(0, start.ExitCode);
+    }
+
+    [Fact]
     public void Status_ReportsAndRecoversASessionThatWasNotCleanlyStopped()
     {
         using var harness = CliHarness.Create();

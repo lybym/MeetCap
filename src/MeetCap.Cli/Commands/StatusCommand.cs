@@ -15,9 +15,11 @@ using Microsoft.Extensions.Logging;
 /// <remarks>
 /// Running the scan here is deliberate: docs/RELIABILITY.md section 6 requires
 /// incomplete sessions and chunks to be found on startup, and every CLI invocation is a
-/// startup. The scan is idempotent, so running it from <c>status</c> as well as from
-/// <c>start</c> cannot repair the same chunk twice. It also runs before the state is
-/// reported, so the report describes the state after recovery rather than before it.
+/// startup. The scan is safe to run from <c>status</c> because it only touches sessions
+/// that are recoverable and whose liveness marker is free, so it can never rewrite a
+/// recording that is still in progress or repair the same chunk twice
+/// (docs/ARCHITECTURE.md section 9.1). It also runs before the state is reported, so the
+/// report describes the state after recovery rather than before it.
 /// </remarks>
 internal static class StatusCommand
 {

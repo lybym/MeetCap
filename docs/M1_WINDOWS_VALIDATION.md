@@ -92,6 +92,10 @@ Check:
       default change; if it does, the device transition is visible in `events.jsonl`.
 - [ ] The second session captures the new default device.
 - [ ] `meetcap devices` marks the new default with `(system default)`.
+- [ ] If capture had to be reopened during the session and the endpoint came back at a
+      different mix format, the session ends degraded with `capture.format_changed`
+      naming both formats, and `meetcap start` exits non-zero. New-format audio must
+      never be written under the session's original WAV header.
 
 ---
 
@@ -153,6 +157,19 @@ Check:
 - [ ] The former `*.part` was renamed to `*.wav` and is readable by a player/`ffprobe`.
 - [ ] `session.json` `status` is `INTERRUPTED` with `recovered_at` set.
 - [ ] A second `meetcap status` reports no further findings (recovery is idempotent).
+
+Also verify, **while a recording is still running**, that the recovery scan cannot touch
+it (this is the live-recording half of `docs/ARCHITECTURE.md` section 9.1):
+
+1. Start a session and let a chunk close.
+2. Run `meetcap status` in another shell.
+
+Check:
+
+- [ ] `meetcap status` reports no incomplete sessions and the session as active.
+- [ ] `events.jsonl` gained no `session.recovered` or `audio.chunk.corrupt` event.
+- [ ] `meetcap stop` still stops the recording, and `meetcap start` exits 0.
+- [ ] `events.jsonl` is readable while the session is recording (no sharing violation).
 
 Quantify the loss in the active chunk:
 
