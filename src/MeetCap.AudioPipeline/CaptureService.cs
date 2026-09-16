@@ -198,12 +198,15 @@ public sealed class CaptureService
             Thread.Sleep(StopPollInterval);
 
             var current = _database.Sessions.Find(active.SessionId);
+            Console.Error.WriteLine($"[DIAG] STOP: poll status={current?.Status ?? "null"} elapsedMs={deadline.ElapsedMilliseconds}");
             if (current is null || !SessionStatus.IsActive(current.Status))
             {
+                Console.Error.WriteLine("[DIAG] STOP: returning confirmed (terminal)");
                 return new StopRequestOutcome(true, active.SessionId, "recording stopped", true);
             }
         }
 
+        Console.Error.WriteLine("[DIAG] STOP: returning still-finalizing (timeout)");
         return new StopRequestOutcome(
             true,
             active.SessionId,

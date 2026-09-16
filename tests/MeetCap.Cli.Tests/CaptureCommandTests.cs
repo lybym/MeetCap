@@ -147,12 +147,54 @@ public class CaptureCommandTests
 
         var stop = harness.Run("stop");
 
-        // Bounded: if the recorder ever fails to stop, the test must fail with a clear
-        // message rather than hanging the suite and the CI job.
-        var start = await AwaitBounded(
-            startTask,
-            TimeSpan.FromSeconds(60),
-            "meetcap start did not finish after meetcap stop");
+        CliResult start;
+        try
+        {
+            // Bounded: if the recorder ever fails to stop, the test must fail with a clear
+            // message rather than hanging the suite and the CI job.
+            start = await AwaitBounded(
+                startTask,
+                TimeSpan.FromSeconds(60),
+                "meetcap start did not finish after meetcap stop");
+        }
+        catch (TimeoutException)
+        {
+            // [DIAG] Temporary investigation instrumentation: capture the lifecycle state
+            // at the timeout so the CI log shows exactly how far `meetcap start` progressed.
+            Console.Error.WriteLine("[DIAG] === Start_ThenStop TIMEOUT DIAGNOSTICS ===");
+            Console.Error.WriteLine($"[DIAG] stop.ExitCode={stop.ExitCode}");
+            Console.Error.WriteLine($"[DIAG] stop.Output={stop.Output}");
+            Console.Error.WriteLine($"[DIAG] stop.Error={stop.Error}");
+            try
+            {
+                Console.Error.WriteLine("[DIAG] events.jsonl:");
+                Console.Error.WriteLine(File.ReadAllText(Path.Combine(sessionDirectory!, "events.jsonl")));
+            }
+            catch (Exception ex) { Console.Error.WriteLine($"[DIAG] events.jsonl read failed: {ex.Message}"); }
+            try
+            {
+                Console.Error.WriteLine("[DIAG] session.json:");
+                Console.Error.WriteLine(File.ReadAllText(Path.Combine(sessionDirectory!, "session.json")));
+            }
+            catch (Exception ex) { Console.Error.WriteLine($"[DIAG] session.json read failed: {ex.Message}"); }
+            try
+            {
+                var micDir = Path.Combine(sessionDirectory!, "audio", "mic");
+                var files = Directory.Exists(micDir)
+                    ? string.Join(", ", Directory.GetFiles(micDir).Select(Path.GetFileName))
+                    : "(no dir)";
+                Console.Error.WriteLine($"[DIAG] audio/mic files: {files}");
+            }
+            catch (Exception ex) { Console.Error.WriteLine($"[DIAG] audio dir failed: {ex.Message}"); }
+            try
+            {
+                var dbStatus = new MeetCapDatabase(Path.Combine(harness.DataRoot, "meetcap.db"))
+                    .Sessions.Find(Path.GetFileName(sessionDirectory!))?.Status ?? "(null)";
+                Console.Error.WriteLine($"[DIAG] db sessions.status={dbStatus}");
+            }
+            catch (Exception ex) { Console.Error.WriteLine($"[DIAG] db read failed: {ex.Message}"); }
+            throw;
+        }
 
         Assert.Equal(0, stop.ExitCode);
         Assert.Contains("stopped session", stop.Output);
