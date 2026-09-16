@@ -398,6 +398,160 @@ public class SessionRecoveryScannerTests
     }
 
     [Fact]
+    public void Scan_RepairsAStrayArtifactOnACompletedSessionWithoutDowngradingIt()
+    {
+        using var workspace = new TempWorkspace(sessionStatus: SessionStatus.Completed);
+        var paths = workspace.Paths;
+
+        // A session that stopped cleanly, whose directory nevertheless holds a later
+        // stray `.part` with real audio in it (a duplicate or a late close). The session
+        // was cleanly stopped, so docs/DATA_MODEL.md section 1 and
+        // docs/ARCHITECTURE.md section 20 say it must stay COMPLETED: recovery may repair
+        // the stray artifact, but it must not reclassify the session or clear the
+        // clean-stop timestamp it already recorded.
+        WriteChunk(paths, sequence: 1, dataBytes: 2 * SecondBytes, close: true);
+        WriteManifest(paths, SessionStatus.Completed);
+
+        var stoppedAt = new DateTimeOffset(2026, 9, 15, 14, 5, 0, TimeSpan.Zero);
+        workspace.Database.Sessions.UpdateLifecycle(
+            workspace.SessionId,
+            SessionStatus.Completed,
+            stoppedAt,
+            stoppedAt,
+            durationMs: 2_000);
+
+        WritePartWithData(paths, sequence: 2, dataBytes: 3 * SecondBytes);
+        Assert.True(File.Exists(paths.ChunkPartPath(AudioSource.Mic, 2)));
+
+        var report = new SessionRecoveryScanner(workspace.Database, new FakeClock()).Scan(workspace.DataRoot);
+
+        var session = Assert.Single(report.Sessions);
+        Assert.Equal(SessionStatus.Completed, session.Status);
+        Assert.Equal(2, session.RepairedChunks);
+        Assert.False(session.Degraded);
+
+        // The stray audio is made durable...
+        Assert.False(File.Exists(paths.ChunkPartPath(AudioSource.Mic, 2)));
+        Assert.True(File.Exists(paths.ChunkFinalPath(AudioSource.Mic, 2)));
+        var recovered = workspace.Database.Chunks.Find(workspace.SessionId, AudioSource.Mic, 2)!;
+        Assert.Equal(ChunkStates.Recovered, recovered.Status);
+        Assert.Equal(3 * SecondBytes, recovered.ByteLength);
+
+        // ...but the session keeps its terminal status, its clean-stop timestamp and its
+        // duration, and is never stamped as recovered.
+        var stored = workspace.Database.Sessions.Find(workspace.SessionId)!;
+        Assert.Equal(SessionStatus.Completed, stored.Status);
+        Assert.Equal(stoppedAt, stored.StoppedAt);
+        Assert.Equal(2_000, stored.DurationMs);
+
+        SessionManifestStore.TryLoad(paths.ManifestPath, out var manifest, out _);
+        Assert.Equal(SessionStatus.Completed, manifest!.Status);
+        Assert.False(manifest.Degraded);
+        Assert.Null(manifest.RecoveredAt);
+
+        // The report still states plainly that a stray artifact had to be dealt with.
+        var recoveredEvent = Assert.Single(ReadEvents(paths), e => Name(e) == SessionEventNames.SessionRecovered);
+        Assert.Contains(
+            "stopped cleanly but held a stray artifact",
+            recoveredEvent.GetProperty("detail").GetString(),
+            StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Scan_ReconcilesAChunkLeftBehindWhileTheSessionWasFinalizing()
+    {
+        using var workspace = new TempWorkspace(sessionStatus: SessionStatus.Finalizing);
+        var paths = workspace.Paths;
+
+        // The crash window the FINALIZING checkpoint exists for: capture has ended and the
+        // artifacts are being closed, so the process died after the atomic rename but
+        // before the closed-index upsert. The session is not terminal, so recovery has to
+        // reconcile the WAV and state that this session never finished.
+        WriteFinalWavWithOpenRow(paths, workspace.Database, sequence: 1, dataBytes: 2 * SecondBytes);
+        WriteManifest(paths, SessionStatus.Finalizing);
+
+        var report = new SessionRecoveryScanner(workspace.Database, new FakeClock()).Scan(workspace.DataRoot);
+
+        var session = Assert.Single(report.Sessions);
+        Assert.Equal(SessionStatus.Interrupted, session.Status);
+        Assert.Equal(1, session.RepairedChunks);
+
+        var row = workspace.Database.Chunks.Find(workspace.SessionId, AudioSource.Mic, 1)!;
+        Assert.Equal(ChunkStates.Recovered, row.Status);
+        Assert.Equal(2 * SecondBytes, row.ByteLength);
+
+        var stored = workspace.Database.Sessions.Find(workspace.SessionId)!;
+        Assert.Equal(SessionStatus.Interrupted, stored.Status);
+        Assert.Equal(2_000, stored.DurationMs);
+
+        SessionManifestStore.TryLoad(paths.ManifestPath, out var manifest, out _);
+        Assert.Equal(SessionStatus.Interrupted, manifest!.Status);
+        Assert.NotNull(manifest.RecoveredAt);
+
+        var sessionRecovered = Assert.Single(ReadEvents(paths), e => Name(e) == SessionEventNames.SessionRecovered);
+        Assert.Equal(2_000, sessionRecovered.GetProperty("at_ms").GetInt64());
+    }
+
+    [Fact]
+    public void Scan_LeavesALiveRecordingAloneWhileItHoldsTheLivenessMarker()
+    {
+        using var workspace = new TempWorkspace(sessionStatus: SessionStatus.Recording);
+        var paths = workspace.Paths;
+
+        // A recording that is still in progress: its session row is legitimately
+        // RECORDING, and at this instant its active chunk is a `.part` file. Artifact
+        // presence alone cannot distinguish this from a killed session, so the recording
+        // claims the exclusive liveness marker and the scan must stand down.
+        WriteChunk(paths, sequence: 1, dataBytes: 3 * SecondBytes, close: false);
+        WriteManifest(paths, SessionStatus.Recording);
+
+        using var held = SessionRecordingLock.TryAcquire(paths.RecordingLockPath);
+        Assert.NotNull(held);
+
+        var report = new SessionRecoveryScanner(workspace.Database, new FakeClock()).Scan(workspace.DataRoot);
+
+        Assert.False(report.HasFindings);
+        Assert.Equal(0, report.RecoveredSessions);
+
+        // Nothing about the live session was touched: it is still recording, its active
+        // chunk is still being written, and its event log gained no false recovery events.
+        var stored = workspace.Database.Sessions.Find(workspace.SessionId)!;
+        Assert.Equal(SessionStatus.Recording, stored.Status);
+        Assert.Null(stored.StoppedAt);
+        Assert.True(File.Exists(paths.ChunkPartPath(AudioSource.Mic, 1)));
+        Assert.False(File.Exists(paths.ChunkFinalPath(AudioSource.Mic, 1)));
+
+        SessionManifestStore.TryLoad(paths.ManifestPath, out var manifest, out _);
+        Assert.Equal(SessionStatus.Recording, manifest!.Status);
+        Assert.Null(manifest.RecoveredAt);
+        Assert.False(File.Exists(paths.EventsPath) && File.ReadAllText(paths.EventsPath).Contains("session.recovered", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Scan_RecoversASessionWhoseLivenessMarkerWasReleasedByAForcedKill()
+    {
+        using var workspace = new TempWorkspace(sessionStatus: SessionStatus.Recording);
+        var paths = workspace.Paths;
+
+        // The same session as above, except the process was killed: the artifact and the
+        // RECORDING row are identical, but the marker is free because the operating
+        // system released the handle. Recovery must still run, otherwise a forced kill
+        // would stop being recoverable.
+        WriteChunk(paths, sequence: 1, dataBytes: 3 * SecondBytes, close: false);
+        WriteManifest(paths, SessionStatus.Recording);
+
+        var killed = SessionRecordingLock.TryAcquire(paths.RecordingLockPath);
+        Assert.NotNull(killed);
+        killed!.Dispose();
+
+        var report = new SessionRecoveryScanner(workspace.Database, new FakeClock()).Scan(workspace.DataRoot);
+
+        var session = Assert.Single(report.Sessions);
+        Assert.Equal(1, session.RepairedChunks);
+        Assert.Equal(SessionStatus.Interrupted, workspace.Database.Sessions.Find(workspace.SessionId)!.Status);
+    }
+
+    [Fact]
     public void Scan_ReportsUnreadableSessionsWithoutAbortingTheWholeScan()
     {
         using var workspace = new TempWorkspace(sessionStatus: SessionStatus.Recording);
