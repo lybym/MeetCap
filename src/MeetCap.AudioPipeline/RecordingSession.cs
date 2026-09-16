@@ -180,28 +180,20 @@ public sealed class RecordingSession
             var housekeeping = Task.Run(HousekeepAsync);
 
             await RunCaptureLoopAsync(source).ConfigureAwait(false);
-            Console.Error.WriteLine("[DIAG] RS: captureLoopDone");
 
             // Capture has ended. Transition to the documented FINALIZING checkpoint
             // (docs/ARCHITECTURE.md section 20) before draining the queue and closing
             // the final chunk, so a crash during that window leaves a session that
             // startup recovery treats as not-cleanly-stopped instead of RECORDING.
             BeginFinalizing();
-            Console.Error.WriteLine("[DIAG] RS: beginFinalizingDone");
 
             _channel.Writer.TryComplete();
-            Console.Error.WriteLine("[DIAG] RS: channelComplete");
             await consumer.ConfigureAwait(false);
-            Console.Error.WriteLine("[DIAG] RS: consumerDone");
 
             CancelEnd();
-            Console.Error.WriteLine("[DIAG] RS: cancelEnd");
             await housekeeping.ConfigureAwait(false);
-            Console.Error.WriteLine("[DIAG] RS: housekeepingDone");
 
-            var diagOutcome = Complete();
-            Console.Error.WriteLine($"[DIAG] RS: completeDone status={diagOutcome.Status}");
-            return diagOutcome;
+            return Complete();
         }
         finally
         {
@@ -656,11 +648,8 @@ public sealed class RecordingSession
         {
             while (await timer.WaitForNextTickAsync(_endCts!.Token).ConfigureAwait(false))
             {
-                var stopRequested = _stopSignal.IsRequested();
-                Console.Error.WriteLine($"[DIAG] HK: tick stopRequested={stopRequested}");
-                if (stopRequested)
+                if (_stopSignal.IsRequested())
                 {
-                    Console.Error.WriteLine("[DIAG] HK: stop detected -> RequestEnd");
                     _events.Write(new SessionEvent(SessionEventNames.SessionStopRequested, CurrentTimelineMs())
                     {
                         Source = Track.ToWireName(),

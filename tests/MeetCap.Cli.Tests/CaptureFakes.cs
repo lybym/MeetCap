@@ -114,28 +114,23 @@ internal sealed class FakeCaptureSource : IAudioCaptureSource
         }
         catch (OperationCanceledException)
         {
-            Console.Error.WriteLine("[DIAG] FAKE: producer exited (OCE)");
             // Stopped.
         }
     }
 
     public void Stop()
     {
-        Console.Error.WriteLine("[DIAG] FAKE: stop enter");
         _stop.Cancel();
         try
         {
-            var ok = _producer?.Wait(TimeSpan.FromSeconds(5));
-            Console.Error.WriteLine($"[DIAG] FAKE: producer wait returned ok={ok}");
+            _producer?.Wait(TimeSpan.FromSeconds(5));
         }
         catch (AggregateException)
         {
-            Console.Error.WriteLine("[DIAG] FAKE: producer wait threw AggregateException");
             // The producer is already ending.
         }
 
         Stopped?.Invoke(this, new CaptureStoppedEventArgs(null));
-        Console.Error.WriteLine("[DIAG] FAKE: stop exit");
     }
 
     public void Dispose() => _stop.Dispose();
