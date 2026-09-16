@@ -153,6 +153,47 @@ public class SessionArtifactTests : IDisposable
     }
 
     [Fact]
+    public void EventSink_StaysReadableWhileTheSessionIsStillRecording()
+    {
+        var path = Path.Combine(_directory, "events.jsonl");
+
+        using (var sink = new JsonlSessionEventSink(path))
+        {
+            sink.Write(new SessionEvent(SessionEventNames.SessionStarted, 0));
+
+            // A live session keeps the log open for the whole recording, and `meetcap
+            // status` as well as the forced-kill checklist (docs/RELIABILITY.md section
+            // 11) read it while that is happening. A reader must therefore be able to open
+            // the still-open file at all, which is what the sink's share mode controls.
+            // (The reader opts into write sharing too: a reader that denies writes would
+            // conflict with the live appender.)
+            Assert.Equal(
+                SessionEventNames.SessionStarted,
+                ReadFirstEventName(path));
+
+            // The appender is still usable after the concurrent read.
+            sink.Write(new SessionEvent(SessionEventNames.CaptureGap, 10) { GapMs = 5 });
+        }
+
+        // Both writes landed as whole lines.
+        Assert.Equal(2, File.ReadAllLines(path).Length);
+    }
+
+    private static string? ReadFirstEventName(string path)
+    {
+        using var stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete);
+        using var reader = new StreamReader(stream);
+        var line = reader.ReadLine();
+        Assert.NotNull(line);
+        using var document = JsonDocument.Parse(line!);
+        return document.RootElement.GetProperty("event").GetString();
+    }
+
+    [Fact]
     public async Task EventSink_SerializesConcurrentWritersIntoWholeLines()
     {
         var path = Path.Combine(_directory, "events.jsonl");
