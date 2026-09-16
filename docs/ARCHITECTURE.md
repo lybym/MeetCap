@@ -547,11 +547,17 @@ observes; it never delays the callback (section 7 and `docs/RELIABILITY.md` sect
 `CaptureTimeline` now counts each discontinuity exactly once as `GapTotalMs` and `GapCount`. A
 device-position skip and a measured device outage both flow through `Observe`, so a
 discontinuity can neither be counted twice (once from the position and once from the measured
-outage) nor be smoothed away. `PacketTiming.GapMs` stays the per-buffer value.
+outage) nor be smoothed away. `PacketTiming.GapMs` stays the per-buffer value, and
+`PacketTiming.GapStartMs` / `GapEndMs` carry the hole's own interval — where audio stopped and
+where it resumed — separately from `StartMs`, which is where the buffer that follows the hole
+sits. Recording writes that interval onto the live `capture.gap` event, which is what lets
+recovery recognise its own finding as the same hole (`docs/DATA_MODEL.md` section 4.1).
 `RecordingSession.Complete()` assigns `gap_count`, `gap_total_ms` and `capture_health` on the
 manifest, and the `session.stopped` event carries `gap_ms`. `gaps_remain` and `gap_details` are
 always present in the document (`false` and `[]` by default) and are set by recovery or
-`meetcap session repair` when their audit still finds a gap.
+`meetcap session repair` when their audit still finds a gap; recovery does not overwrite
+`gap_count` / `gap_total_ms`, because those mean "what the live timeline measured"
+(`docs/DATA_MODEL.md` section 3).
 
 The durable half of the same question is `SessionGapAuditor`, which derives the missing
 stretches of a session timeline from the `audio_chunks` index and never mutates anything
@@ -575,14 +581,18 @@ A gap is therefore always one event with a reason, never a hidden timestamp shif
 Recovery is honest about what it could not fix. `SessionRecoveryScanner` audits the session
 after repairing it, and then:
 
-- writes an explicit `capture.gap` event for every gap the live recording never saw, after
-  reading the `(start_ms, source)` positions already in `events.jsonl`, so a repeated scan never
-  appends the same gap twice;
+- writes an explicit `capture.gap` event for every gap the live recording never saw, naming the
+  hole's own interval and recognising a hole the recording already reported by interval overlap.
+  A repeated scan therefore never appends the same gap twice, and a different hole that merely
+  shares a boundary position is still reported — matching on a position alone would hide real
+  lost audio, which is worse than the duplicate it would prevent;
 - marks the session degraded when its audit is incomplete or the manifest's `capture_health`
   is degraded, and records `gaps_remain` / `gap_details` on the manifest;
 - writes `session.repair.incomplete` (`reason = gap_detected`, or `audit_failed` when the chunk
-  index could not be read) whenever a gap remains, because a repair that could not make the
-  session whole must not report success (`docs/RELIABILITY.md` section 6);
+  index could not be read) whenever a gap remains — including for a session that had already
+  stopped cleanly — because a repair that could not make the session whole must not report
+  success (`docs/RELIABILITY.md` section 6). It is written once per verdict rather than once per
+  pass, so recovery re-running on every command does not restate the same finding;
 - writes `session.recovered` only when something was actually repaired or the session was not
   cleanly stopped, carrying `gap_ms` and `reason=incomplete` when a gap remains.
 
@@ -594,7 +604,11 @@ requested session was not found**, with an actionable error. Exit 0 means the se
 known gap. The same accounting is visible without that command: `meetcap start` prints
 `capture buffer: peak N/M packets, dropped N, stalled N time(s) (longest N ms)` on every run and
 `audio gaps: N (M ms missing)` when gaps occurred, and `meetcap status` prints the `timeline:`
-and `gap:` lines for a recovered session that still has a gap.
+and `gap:` lines for a recovered session that still has a gap. `meetcap status` keeps exiting 0
+in every case, including a session it could not make whole: it describes state, and a command
+whose exit code is always 0 never has to be interpreted. `meetcap session repair` is the acting
+command and carries the non-zero exit when recovery is incomplete
+(`docs/DEVELOPMENT.md` section 8).
 
 Shutdown ordering belongs to the same guarantee: the capture loop runs as a task that is
 awaited, and the channel writer is completed only after that task has returned, so the packets

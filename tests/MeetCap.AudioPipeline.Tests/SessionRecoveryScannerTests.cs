@@ -696,8 +696,12 @@ public class SessionRecoveryScannerTests
 
         SessionManifestStore.TryLoad(paths.ManifestPath, out var manifest, out _);
         Assert.True(manifest!.GapsRemain);
-        Assert.Equal(2_000, manifest.GapTotalMs);
         Assert.Contains(manifest.GapDetails, line => line.Contains("chunk_unreadable", StringComparison.Ordinal));
+
+        // The audit's finding lives in `gaps_remain` / `gap_details`, not in the live
+        // measurement: `gap_total_ms` means "what the capture timeline observed while it was
+        // alive" (docs/DATA_MODEL.md section 3) and this session never observed the loss.
+        Assert.Equal(0, manifest.GapTotalMs);
     }
 
     [Fact]
@@ -788,6 +792,191 @@ public class SessionRecoveryScannerTests
         Assert.True(first.RecoveryIncomplete);
         Assert.True(second.RecoveryIncomplete);
         Assert.Equal(1, CountEvents(ReadEvents(paths), SessionEventNames.CaptureGap));
+
+        // The verdict is a fact about the artifacts, so a later pass must not restate it
+        // either. An ungated append would add one identical copy per `meetcap status`,
+        // `meetcap start` and `meetcap session repair`, and misstate how often the session
+        // was found broken.
+        Assert.Equal(1, CountEvents(ReadEvents(paths), SessionEventNames.SessionRepairIncomplete));
+    }
+
+    [Fact]
+    public void Scan_DoesNotRestateGapAndRepairVerdictsAcrossManyPasses()
+    {
+        using var workspace = new TempWorkspace(sessionStatus: SessionStatus.Recording);
+        var paths = workspace.Paths;
+
+        WriteChunk(paths, sequence: 1, dataBytes: 2 * SecondBytes, close: true);
+        IndexChunk(paths, workspace.Database, sequence: 1, startMs: 0, endMs: 2_000, ChunkStates.Closed);
+        File.WriteAllBytes(
+            paths.ChunkPartPath(AudioSource.Mic, 2),
+            Enumerable.Range(0, 512).Select(i => (byte)i).ToArray());
+        WriteChunk(paths, sequence: 3, dataBytes: 2 * SecondBytes, close: true);
+        IndexChunk(paths, workspace.Database, sequence: 3, startMs: 4_000, endMs: 6_000, ChunkStates.Closed);
+        WriteManifest(paths, SessionStatus.Recording);
+
+        var scanner = new SessionRecoveryScanner(workspace.Database, new FakeClock());
+        for (var pass = 0; pass < 5; pass++)
+        {
+            scanner.Scan(workspace.DataRoot);
+        }
+
+        var events = ReadEvents(paths);
+        Assert.Equal(1, CountEvents(events, SessionEventNames.CaptureGap));
+        Assert.Equal(1, CountEvents(events, SessionEventNames.SessionRepairIncomplete));
+    }
+
+    [Fact]
+    public void Scan_DoesNotRepeatAGapTheLiveRecordingAlreadyReported()
+    {
+        using var workspace = new TempWorkspace(sessionStatus: SessionStatus.Recording);
+        var paths = workspace.Paths;
+
+        // The shape a real recording leaves behind when the device skips audio: durable audio
+        // up to 10 s, a hole, then durable audio from 15 s. The live recorder reported that
+        // hole while it was running, in the gap's own coordinates.
+        WriteChunk(paths, sequence: 1, dataBytes: 10 * SecondBytes, close: true);
+        IndexChunk(paths, workspace.Database, sequence: 1, startMs: 0, endMs: 10_000, ChunkStates.Closed);
+        WriteChunk(paths, sequence: 2, dataBytes: 20 * SecondBytes, close: true);
+        IndexChunk(paths, workspace.Database, sequence: 2, startMs: 15_000, endMs: 35_000, ChunkStates.Closed);
+
+        // Plus a later, separate hole from 35 s to 40 s that the live recording never saw,
+        // because the process died before it could report it.
+        WriteChunk(paths, sequence: 3, dataBytes: 10 * SecondBytes, close: true);
+        IndexChunk(paths, workspace.Database, sequence: 3, startMs: 40_000, endMs: 50_000, ChunkStates.Closed);
+
+        File.AppendAllText(
+            paths.EventsPath,
+            // at_ms is the resume position, as the live recorder writes it; the interval is the
+            // hole itself. The audit derives the same hole from the chunk index, so recovery
+            // must recognise it and stay silent about that one.
+            "{\"event\":\"capture.gap\",\"at_ms\":15000,\"source\":\"mic\"," +
+            "\"gap_start_ms\":10000,\"gap_end_ms\":15000,\"gap_ms\":5000," +
+            "\"detail\":\"the device skipped audio between buffers.\"}\n");
+
+        WriteManifest(paths, SessionStatus.Recording);
+
+        var report = new SessionRecoveryScanner(workspace.Database, new FakeClock()).Scan(workspace.DataRoot);
+        var session = Assert.Single(report.Sessions);
+
+        // The audit still finds both holes: recognising what was already recorded must not
+        // hide a hole from the audit itself.
+        Assert.Equal(2, session.Audit.Gaps.Count);
+        Assert.True(session.RecoveryIncomplete);
+
+        var gaps = ReadEvents(paths).Where(e => Name(e) == SessionEventNames.CaptureGap).ToList();
+
+        // Two holes, two events: the live one and the newly discovered one. Reporting the
+        // already-recorded hole a second time would describe one hole as two.
+        Assert.Equal(2, gaps.Count);
+
+        var newlyReported = Assert.Single(gaps, e => e.TryGetProperty("reason", out _));
+        Assert.Equal(35_000, newlyReported.GetProperty("gap_start_ms").GetInt64());
+        Assert.Equal(40_000, newlyReported.GetProperty("gap_end_ms").GetInt64());
+    }
+
+    [Fact]
+    public void Scan_StillReportsAHoleThatAConcurrentLiveGapDoesNotCover()
+    {
+        using var workspace = new TempWorkspace(sessionStatus: SessionStatus.Recording);
+        var paths = workspace.Paths;
+
+        WriteChunk(paths, sequence: 1, dataBytes: 10 * SecondBytes, close: true);
+        IndexChunk(paths, workspace.Database, sequence: 1, startMs: 0, endMs: 10_000, ChunkStates.Closed);
+        WriteChunk(paths, sequence: 2, dataBytes: 20 * SecondBytes, close: true);
+        IndexChunk(paths, workspace.Database, sequence: 2, startMs: 15_000, endMs: 35_000, ChunkStates.Closed);
+
+        // The live recorder reported a hole that starts where this one does but reaches past
+        // its end: the wall-clock outage it measured lasted longer than the span the chunk
+        // index shows, because another skip happened inside it. Suppressing the audit's gap on
+        // a matching start position alone would hide real lost audio, which is worse than the
+        // duplicate this de-duplication exists to prevent.
+        File.AppendAllText(
+            paths.EventsPath,
+            "{\"event\":\"capture.gap\",\"at_ms\":17000,\"source\":\"mic\"," +
+            "\"gap_start_ms\":10000,\"gap_end_ms\":17000,\"gap_ms\":7000," +
+            "\"detail\":\"the device skipped audio between buffers.\"}\n");
+
+        WriteManifest(paths, SessionStatus.Recording);
+
+        var report = new SessionRecoveryScanner(workspace.Database, new FakeClock()).Scan(workspace.DataRoot);
+
+        Assert.Single(report.Sessions);
+        Assert.Equal(1, CountEvents(ReadEvents(paths), SessionEventNames.CaptureGap));
+    }
+
+    [Fact]
+    public void Scan_ReportsAnIncompleteRepairForACleanlyStoppedSessionThatStillHasAGap()
+    {
+        using var workspace = new TempWorkspace(sessionStatus: SessionStatus.Completed);
+        var paths = workspace.Paths;
+
+        WriteChunk(paths, sequence: 1, dataBytes: 2 * SecondBytes, close: true);
+        IndexChunk(paths, workspace.Database, sequence: 1, startMs: 0, endMs: 2_000, ChunkStates.Closed);
+
+        // A permanently unreadable chunk, and nothing else to repair, on a session that had
+        // already stopped cleanly. docs/DATA_MODEL.md section 4 says the event is written when
+        // the timeline still holds a provable gap, which is exactly this case.
+        File.WriteAllBytes(
+            paths.ChunkPartPath(AudioSource.Mic, 2),
+            Enumerable.Range(0, 512).Select(i => (byte)i).ToArray());
+        WriteManifest(paths, SessionStatus.Completed);
+
+        var report = new SessionRecoveryScanner(workspace.Database, new FakeClock()).Scan(workspace.DataRoot);
+
+        var session = Assert.Single(report.Sessions);
+        Assert.True(session.RecoveryIncomplete);
+
+        // The unreadable bytes were classified, not repaired, so no audio was made durable.
+        Assert.Equal(0, session.RepairedChunks);
+
+        var events = ReadEvents(paths);
+
+        // The pass did classify an artifact, so the session-level recovery event records that
+        // (the pre-existing rule for a stray artifact on an already clean session), and the
+        // incomplete event records that the session is still not whole. The audit's own
+        // verdict, not the artifact count, is what decides whether recovery succeeded.
+        Assert.Equal(1, CountEvents(events, SessionEventNames.SessionRecovered));
+        Assert.Equal(1, CountEvents(events, SessionEventNames.SessionRepairIncomplete));
+
+        // A terminal session still keeps its own metadata while it says it is not whole.
+        var stored = workspace.Database.Sessions.Find(workspace.SessionId)!;
+        Assert.Equal(SessionStatus.Completed, stored.Status);
+
+        SessionManifestStore.TryLoad(paths.ManifestPath, out var manifest, out _);
+        Assert.True(manifest!.GapsRemain);
+        Assert.NotEmpty(manifest.GapDetails);
+    }
+
+    [Fact]
+    public void Scan_LeavesTheLiveGapMeasurementAloneAndRecordsItsOwnFindingsSeparately()
+    {
+        using var workspace = new TempWorkspace(sessionStatus: SessionStatus.Completed);
+        var paths = workspace.Paths;
+
+        // The session recorded and measured its own timeline: no discontinuity, so its live
+        // gap accounting is legitimately zero.
+        WriteChunk(paths, sequence: 1, dataBytes: 2 * SecondBytes, close: true);
+        IndexChunk(paths, workspace.Database, sequence: 1, startMs: 0, endMs: 2_000, ChunkStates.Closed);
+        File.WriteAllBytes(
+            paths.ChunkPartPath(AudioSource.Mic, 2),
+            Enumerable.Range(0, 512).Select(i => (byte)i).ToArray());
+        WriteManifest(paths, SessionStatus.Completed);
+
+        var report = new SessionRecoveryScanner(workspace.Database, new FakeClock()).Scan(workspace.DataRoot);
+
+        Assert.True(Assert.Single(report.Sessions).RecoveryIncomplete);
+
+        SessionManifestStore.TryLoad(paths.ManifestPath, out var manifest, out _);
+
+        // `gap_count` / `gap_total_ms` mean "what the capture timeline observed while it was
+        // alive" (docs/DATA_MODEL.md section 3). Recovery records what it found in
+        // `gaps_remain` / `gap_details` instead of overwriting that measurement, so the field
+        // never changes meaning and can never claim a loss the live recording did not measure.
+        Assert.Equal(0, manifest!.GapCount);
+        Assert.Equal(0, manifest.GapTotalMs);
+        Assert.True(manifest.GapsRemain);
+        Assert.NotEmpty(manifest.GapDetails);
     }
 
     [Fact]

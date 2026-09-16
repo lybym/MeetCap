@@ -53,6 +53,26 @@ public sealed record SessionEvent(string Name, long AtMs)
 
     public long? EndMs { get; init; }
 
+    /// <summary>
+    /// Where a <c>capture.gap</c> starts, in session-relative milliseconds: the position at
+    /// which audio stopped.
+    /// </summary>
+    /// <remarks>
+    /// The live recording and the recovery gap audit are two independent observers of the
+    /// same hole, and <see cref="StartMs"/> means different things to each of them — the live
+    /// writer sets it to the position this buffer begins at, which is where audio
+    /// <em>resumes</em>. Publishing the gap's own interval on both records is what lets a
+    /// reader — and recovery itself — tell that two events describe one hole rather than two
+    /// (docs/RELIABILITY.md section 7).
+    /// </remarks>
+    public long? GapStartMs { get; init; }
+
+    /// <summary>
+    /// Where a <c>capture.gap</c> ends, in session-relative milliseconds: the position at
+    /// which captured audio resumes.
+    /// </summary>
+    public long? GapEndMs { get; init; }
+
     public long? GapMs { get; init; }
 
     public long? DevicePositionFrames { get; init; }

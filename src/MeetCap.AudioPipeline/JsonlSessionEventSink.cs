@@ -81,6 +81,8 @@ public sealed class JsonlSessionEventSink : ISessionEventSink, IDisposable
         WriteOptionalString(writer, "chunk", sessionEvent.Chunk);
         WriteOptionalNumber(writer, "start_ms", sessionEvent.StartMs);
         WriteOptionalNumber(writer, "end_ms", sessionEvent.EndMs);
+        WriteOptionalNumber(writer, "gap_start_ms", sessionEvent.GapStartMs);
+        WriteOptionalNumber(writer, "gap_end_ms", sessionEvent.GapEndMs);
         WriteOptionalNumber(writer, "gap_ms", sessionEvent.GapMs);
         WriteOptionalNumber(writer, "device_position_frames", sessionEvent.DevicePositionFrames);
         WriteOptionalNumber(writer, "qpc_position_ticks", sessionEvent.QpcPositionTicks);

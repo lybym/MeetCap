@@ -16,9 +16,6 @@ public static class AudioGapReasons
 
     /// <summary>The index knows a chunk at this position, but no file is on disk.</summary>
     public const string ChunkMissing = "chunk_missing";
-
-    /// <summary>Every reason value an audit may report.</summary>
-    public static readonly IReadOnlyList<string> All = new[] { NotCaptured, ChunkUnreadable, ChunkMissing };
 }
 
 /// <summary>

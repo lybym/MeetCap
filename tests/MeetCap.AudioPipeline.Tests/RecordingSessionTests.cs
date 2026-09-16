@@ -135,6 +135,42 @@ public class RecordingSessionTests
     }
 
     [Fact]
+    public async Task RunAsync_DeviceGap_PublishesTheGapsOwnInterval()
+    {
+        using var harness = new SessionHarness(chunkSeconds: 60, bufferSeconds: 30);
+        var source = new FakeCaptureSource(Format, harness.Device);
+        harness.Sources.Enqueue(source);
+
+        var session = harness.Service.PrepareSession("Gap interval");
+        var paths = Paths(harness, session);
+
+        using var cancellation = new CancellationTokenSource();
+        var run = session.RunAsync(cancellation.Token);
+        Assert.True(await Wait.UntilAsync(() => source.StartCount == 1));
+
+        TestAudio.EmitSeconds(source, Format, 0, milliseconds: 1_000);
+
+        // The device skipped 2 s and carried on.
+        var skipFrames = 2 * Format.SampleRate + TestAudio.Frames(Format, 1_000);
+        source.Emit(TestAudio.Packet(Format, skipFrames, TestAudio.Frames(Format, 1_000)));
+        cancellation.Cancel();
+        await Finish(run);
+
+        var gap = Assert.Single(ReadEvents(paths), e => Name(e) == SessionEventNames.CaptureGap);
+
+        // The event names the hole itself (audio stopped at 1000 ms, resumed at 3000 ms) and
+        // not only the position of the buffer that follows it. Recovery re-derives the same
+        // hole from the chunk index, so without this the two records of one hole cannot be
+        // recognised as the same one (docs/RELIABILITY.md section 7).
+        Assert.Equal(1_000, gap.GetProperty("gap_start_ms").GetInt64());
+        Assert.Equal(3_000, gap.GetProperty("gap_end_ms").GetInt64());
+        Assert.Equal(2_000, gap.GetProperty("gap_ms").GetInt64());
+
+        // `at_ms` stays the resume position, which is what the timeline places the event at.
+        Assert.Equal(3_000, gap.GetProperty("at_ms").GetInt64());
+    }
+
+    [Fact]
     public async Task RunAsync_DeviceFlags_RecordsADiscontinuityEvent()
     {
         using var harness = new SessionHarness();

@@ -268,8 +268,8 @@ public sealed class SessionRecoveryScanner
         RepairPass repaired)
     {
         var audit = SessionGapAuditor.Audit(paths.SessionId, _database.Chunks.ListForSession(paths.SessionId));
-        WriteGapEvents(repaired.Events, audit, repaired.RecoveryStartMs);
-
+        var recorded = ReadRecordedEventLog(repaired.Events);
+        WriteGapEvents(repaired.Events, audit, recorded.Gaps, repaired.RecoveryStartMs);
         var interrupted = string.Equals(targetStatus, SessionStatus.Interrupted, StringComparison.Ordinal);
         var captureHealth = manifest?.CaptureHealth;
         var degraded = interrupted
@@ -298,24 +298,28 @@ public sealed class SessionRecoveryScanner
                         ? "this session was not cleanly stopped; "
                         : "this session stopped cleanly but held a stray artifact; ") + detail,
             });
+        }
 
-            if (audit.RecoveryIncomplete)
+        // docs/RELIABILITY.md section 6: a repair that could not make the session whole
+        // records that fact instead of reporting success. It is written for every incomplete
+        // audit, including a cleanly stopped session, and de-duplicated like a gap event:
+        // recovery re-runs on every command, so an ungated append would add one identical
+        // copy per invocation and misstate how often the session was found broken.
+        var incompleteReason = audit.HasProblems ? "audit_failed" : "gap_detected";
+        if (audit.RecoveryIncomplete && !HasRepairIncompleteEvent(recorded.RepairIncompleteEvents, incompleteReason, audit))
+        {
+            repaired.Events.Write(new SessionEvent(
+                SessionEventNames.SessionRepairIncomplete,
+                sessionEndMs)
             {
-                // docs/RELIABILITY.md section 6: a repair that could not make the session
-                // whole records that fact instead of reporting success.
-                repaired.Events.Write(new SessionEvent(
-                    SessionEventNames.SessionRepairIncomplete,
-                    sessionEndMs)
-                {
-                    GapMs = audit.TotalGapMs,
-                    Count = audit.Gaps.Count,
-                    Reason = audit.HasProblems ? "audit_failed" : "gap_detected",
-                    Detail =
-                        "recovery could not make this session whole; " + audit.Describe() +
-                        (audit.HasProblems ? " (the audit itself failed: " + string.Join("; ", audit.Problems) + ")" : string.Empty) +
-                        ". The audio that is missing has no durable chunk and was not invented.",
-                });
-            }
+                GapMs = audit.TotalGapMs,
+                Count = audit.Gaps.Count,
+                Reason = incompleteReason,
+                Detail =
+                    "recovery could not make this session whole; " + audit.Describe() +
+                    (audit.HasProblems ? " (the audit itself failed: " + string.Join("; ", audit.Problems) + ")" : string.Empty) +
+                    ". The audio that is missing has no durable chunk and was not invented.",
+            });
         }
 
         // A terminal session keeps its own metadata: its `stopped_at`, its `duration_ms`
@@ -328,8 +332,13 @@ public sealed class SessionRecoveryScanner
             manifest.Status = targetStatus;
             manifest.Degraded = degraded;
             manifest.EndReason = manifest.EndReason ?? (interrupted ? "interrupted" : null);
-            manifest.GapCount = Math.Max(manifest.GapCount, audit.Gaps.Count);
-            manifest.GapTotalMs = Math.Max(manifest.GapTotalMs, audit.TotalGapMs);
+
+            // `gap_count` / `gap_total_ms` stay what they are documented to be: the live
+            // capture timeline's own measurement, written by the recording. Recovery records
+            // what it found separately in `gaps_remain` / `gap_details`, so a field never
+            // silently changes meaning and `gaps_remain: true` can never sit next to a
+            // `gap_total_ms` that says nothing was lost
+            // (docs/DATA_MODEL.md section 3, docs/RELIABILITY.md section 7).
             manifest.GapsRemain = audit.RecoveryIncomplete;
             manifest.GapDetails = audit.DescribeGaps().ToList();
 
@@ -418,27 +427,77 @@ public sealed class SessionRecoveryScanner
     }
 
     /// <summary>
-    /// Writes an explicit <c>capture.gap</c> event for every gap the audit found,
-    /// skipping positions the event log already describes.
+    /// A <c>capture.gap</c> event already present in the session's log, reduced to the
+    /// identity needed to recognise the same hole again.
+    /// </summary>
+    /// <param name="Source">The track the gap belongs to.</param>
+    /// <param name="StartMs">Where the missing audio starts, when the event says so.</param>
+    /// <param name="EndMs">Where the missing audio ends, when the event says so.</param>
+    /// <param name="ResumeMs">
+    /// Where captured audio resumes. The live recorder always knows this (it is the position
+    /// of the buffer that follows the gap) even when the event predates the explicit
+    /// interval fields.
+    /// </param>
+    private readonly record struct RecordedGap(string Source, long? StartMs, long? EndMs, long ResumeMs);
+
+    /// <summary>A <c>session.repair.incomplete</c> verdict already present in the session's log.</summary>
+    private readonly record struct RecordedRepairIncomplete(string? Reason, int GapCount, long GapTotalMs);
+
+    /// <summary>
+    /// The session's existing event log, reduced to the facts recovery has to de-duplicate
+    /// against.
+    /// </summary>
+    private sealed record RecordedEventLog(
+        IReadOnlyList<RecordedGap> Gaps,
+        IReadOnlyList<RecordedRepairIncomplete> RepairIncompleteEvents);
+
+    /// <summary>Reads the session's existing event log for de-duplication.</summary>
+    private static RecordedEventLog ReadRecordedEventLog(ISessionEventSink events)
+    {
+        if (events is not JsonlSessionEventSink jsonl || !File.Exists(jsonl.Path))
+        {
+            return new RecordedEventLog(Array.Empty<RecordedGap>(), Array.Empty<RecordedRepairIncomplete>());
+        }
+
+        return new RecordedEventLog(
+            ReadRecordedGaps(jsonl.Path),
+            ReadRecordedRepairIncomplete(jsonl.Path));
+    }
+
+    /// <summary>
+    /// Writes an explicit <c>capture.gap</c> event for every gap the audit found, skipping
+    /// holes the session's own log already describes.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// docs/RELIABILITY.md section 7 forbids hiding missing audio by only shifting later
-    /// timestamps, so a hole the live recording never saw (because the process died) has
-    /// to become an event too. Recovery is idempotent, so the already-recorded positions
-    /// are read back first: otherwise every <c>meetcap status</c> would append the same
-    /// gap again and the event log would grow without bound.
+    /// timestamps, so a hole the live recording never saw (because the process died) has to
+    /// become an event too. Recovery re-runs on every command, so an append that is not
+    /// de-duplicated would grow the log without bound and describe one hole as many.
+    /// </para>
+    /// <para>
+    /// The two producers of a gap event are independent observers and do not share a
+    /// coordinate system for <c>start_ms</c>: the live recorder publishes the position the
+    /// buffer it is writing <em>begins</em> at (where audio resumed), while the audit spans
+    /// from where the last durable chunk ended to where the next one starts. Matching them on
+    /// a single position therefore both duplicates one hole and can collide two different
+    /// ones. Identity is the gap's interval instead: see <see cref="IsSameGap"/>.
+    /// </para>
     /// </remarks>
-    private static void WriteGapEvents(ISessionEventSink events, SessionAudit audit, long atMs)
+    private static void WriteGapEvents(
+        ISessionEventSink events,
+        SessionAudit audit,
+        IReadOnlyList<RecordedGap> recordedGaps,
+        long atMs)
     {
         if (!audit.HasGap)
         {
             return;
         }
 
-        var alreadyReported = ReadReportedGapPositions(events);
         foreach (var gap in audit.Gaps)
         {
-            if (alreadyReported.Contains((gap.StartMs, gap.Source)))
+            if (recordedGaps.Any(recorded => IsSameGap(recorded, gap)))
             {
                 continue;
             }
@@ -448,6 +507,8 @@ public sealed class SessionRecoveryScanner
                 Source = gap.Source,
                 StartMs = gap.StartMs,
                 EndMs = gap.EndMs,
+                GapStartMs = gap.StartMs,
+                GapEndMs = gap.EndMs,
                 GapMs = gap.GapMs,
                 Reason = gap.Reason,
                 Count = gap.MissingSequences.Count > 0 ? gap.MissingSequences.Count : null,
@@ -457,49 +518,150 @@ public sealed class SessionRecoveryScanner
     }
 
     /// <summary>
-    /// The <c>(start_ms, source)</c> positions already described by a <c>capture.gap</c>
-    /// event in the session's log.
+    /// Whether two gap events describe the same hole.
     /// </summary>
-    private static HashSet<(long StartMs, string Source)> ReadReportedGapPositions(ISessionEventSink events)
+    /// <remarks>
+    /// The test is interval overlap, not position equality. Quantisation alone can move a
+    /// boundary — a device outage is measured by wall clock while the audit derives the same
+    /// span from chunk boundaries, so the two records of one hole can be a few milliseconds
+    /// apart — and two adjacent holes share the boundary position without being the same
+    /// hole. Overlap is true in the first case and false in the second.
+    /// </remarks>
+    private static bool IsSameGap(RecordedGap recorded, AudioGap gap)
     {
-        var positions = new HashSet<(long, string)>();
-        if (events is not JsonlSessionEventSink jsonl || !File.Exists(jsonl.Path))
+        if (!string.Equals(recorded.Source, gap.Source, StringComparison.Ordinal))
         {
-            return positions;
+            return false;
         }
 
-        foreach (var line in ReadLines(jsonl.Path))
+        if (recorded.StartMs is { } recordedStart && recorded.EndMs is { } recordedEnd)
+        {
+            // Both events carry the gap's own interval.
+            return Overlaps(recordedStart, recordedEnd, gap.StartMs, gap.EndMs);
+        }
+
+        // An event written before the interval fields existed, or a live event that only
+        // knows where audio resumed: the recorded resume position is inside the hole the
+        // audit derived, or exactly at its end when the hole is zero-length.
+        return recorded.ResumeMs >= gap.StartMs && recorded.ResumeMs <= gap.EndMs;
+    }
+
+    private static bool Overlaps(long leftStart, long leftEnd, long rightStart, long rightEnd)
+        => (leftStart < rightEnd && rightStart < leftEnd)
+           || (leftStart == rightStart && leftEnd == rightEnd);
+
+    /// <summary>
+    /// Whether the session's log already states, for this outcome, that recovery could not
+    /// make it whole.
+    /// </summary>
+    /// <remarks>
+    /// The comparison is the verdict (reason, gap count, missing milliseconds), not the
+    /// position: recovery re-runs on every command, and an ungated append would add one
+    /// identical copy per invocation and misstate how often the session was found broken. A
+    /// pass that finds different numbers writes a new event, because that is new information.
+    /// </remarks>
+    private static bool HasRepairIncompleteEvent(
+        IReadOnlyList<RecordedRepairIncomplete> recorded,
+        string reason,
+        SessionAudit audit)
+        => recorded.Any(candidate =>
+            string.Equals(candidate.Reason, reason, StringComparison.Ordinal) &&
+            candidate.GapCount == audit.Gaps.Count &&
+            candidate.GapTotalMs == audit.TotalGapMs);
+
+    /// <summary>
+    /// The <c>capture.gap</c> events already present in the session's log.
+    /// </summary>
+    private static IReadOnlyList<RecordedGap> ReadRecordedGaps(string path)
+    {
+        var recorded = new List<RecordedGap>();
+        foreach (var root in ReadEventObjects(path))
+        {
+            if (!root.TryGetProperty("event", out var name) ||
+                name.GetString() != SessionEventNames.CaptureGap ||
+                !root.TryGetProperty("source", out var source))
+            {
+                continue;
+            }
+
+            var startMs = OptionalLong(root, "gap_start_ms") ?? OptionalLong(root, "start_ms");
+            var endMs = OptionalLong(root, "gap_end_ms") ?? OptionalLong(root, "end_ms");
+            var atMs = OptionalLong(root, "at_ms") ?? 0;
+
+            // The resume position: the explicit gap end when present, otherwise where this
+            // event was placed on the timeline.
+            recorded.Add(new RecordedGap(
+                source.GetString() ?? string.Empty,
+                startMs,
+                endMs,
+                endMs ?? atMs));
+        }
+
+        return recorded;
+    }
+
+    /// <summary>
+    /// The <c>session.repair.incomplete</c> verdicts already present in the session's log.
+    /// </summary>
+    private static IReadOnlyList<RecordedRepairIncomplete> ReadRecordedRepairIncomplete(string path)
+    {
+        var recorded = new List<RecordedRepairIncomplete>();
+        foreach (var root in ReadEventObjects(path))
+        {
+            if (!root.TryGetProperty("event", out var name) ||
+                name.GetString() != SessionEventNames.SessionRepairIncomplete)
+            {
+                continue;
+            }
+
+            recorded.Add(new RecordedRepairIncomplete(
+                root.TryGetProperty("reason", out var reason) ? reason.GetString() : null,
+                (int)(OptionalLong(root, "count") ?? 0),
+                OptionalLong(root, "gap_ms") ?? 0));
+        }
+
+        return recorded;
+    }
+
+    /// <summary>Parses the session's log into event objects, skipping a torn final line.</summary>
+    private static IEnumerable<JsonElement> ReadEventObjects(string path)
+    {
+        if (!File.Exists(path))
+        {
+            yield break;
+        }
+
+        foreach (var line in ReadLines(path))
         {
             if (string.IsNullOrWhiteSpace(line))
             {
                 continue;
             }
 
+            JsonElement root;
             try
             {
                 using var document = JsonDocument.Parse(line);
-                var root = document.RootElement;
-                if (root.ValueKind != JsonValueKind.Object ||
-                    !root.TryGetProperty("event", out var name) ||
-                    name.GetString() != SessionEventNames.CaptureGap ||
-                    !root.TryGetProperty("start_ms", out var startMs) ||
-                    !startMs.TryGetInt64(out var start) ||
-                    !root.TryGetProperty("source", out var source))
+                if (document.RootElement.ValueKind != JsonValueKind.Object)
                 {
                     continue;
                 }
 
-                positions.Add((start, source.GetString() ?? string.Empty));
+                root = document.RootElement.Clone();
             }
             catch (JsonException)
             {
-                // A torn final line from a killed process is expected; it simply carries
-                // no position to de-duplicate against.
+                // A torn final line from a killed process is expected; it simply carries no
+                // event to de-duplicate against.
+                continue;
             }
-        }
 
-        return positions;
+            yield return root;
+        }
     }
+
+    private static long? OptionalLong(JsonElement root, string name)
+        => root.TryGetProperty(name, out var value) && value.TryGetInt64(out var number) ? number : null;
 
     private static IEnumerable<string> ReadLines(string path)
     {

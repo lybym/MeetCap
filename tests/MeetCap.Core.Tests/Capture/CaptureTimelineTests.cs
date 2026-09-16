@@ -212,6 +212,63 @@ public class CaptureTimelineTests
         Assert.Equal(0, timeline.GapCount);
     }
 
+    // ------------------------------------------------------------- gap identity
+    //
+    // A gap has two independent observers: the live timeline, and the recovery gap audit that
+    // re-derives the same hole from the chunk index. Both have to be able to name it the same
+    // way, which is why the gap carries its own interval instead of only the position of the
+    // buffer that follows it (docs/RELIABILITY.md section 7).
+
+    [Fact]
+    public void GapInterval_NamesTheMissingStretchSeparatelyFromTheBufferPosition()
+    {
+        var timeline = new CaptureTimeline(Mono48k);
+
+        timeline.Observe(Packet(0, TenMs)); // placed at 0..10 ms
+
+        // The device skipped one second: audio is missing from 10 ms to 1010 ms, and this
+        // buffer begins where the audio resumes.
+        var timing = timeline.Observe(Packet(TenMs + Mono48k.SampleRate, TenMs));
+
+        Assert.Equal(1_010, timing.StartMs);
+        Assert.Equal(10, timing.GapStartMs);
+        Assert.Equal(1_010, timing.GapEndMs);
+    }
+
+    [Fact]
+    public void GapInterval_SpansAMeasuredDeviceOutage()
+    {
+        var timeline = new CaptureTimeline(Mono48k);
+
+        timeline.Observe(Packet(0, TenMs)); // placed at 0..10 ms
+        timeline.RecordDeviceLoss(5_000);
+        var timing = timeline.Observe(Packet(0, TenMs));
+
+        // Audio stopped at 10 ms and resumes at 5010 ms: the outage is the gap, and it is not
+        // conflated with where the buffer itself sits.
+        Assert.Equal(10, timing.GapStartMs);
+        Assert.Equal(5_010, timing.GapEndMs);
+        Assert.Equal(5_010, timing.StartMs);
+    }
+
+    [Fact]
+    public void GapInterval_IsAbsentWhenNothingIsMissing()
+    {
+        var timeline = new CaptureTimeline(Mono48k);
+
+        timeline.Observe(Packet(0, TenMs));
+        var contiguous = timeline.Observe(Packet(TenMs, TenMs));
+
+        Assert.Null(contiguous.GapStartMs);
+        Assert.Null(contiguous.GapEndMs);
+
+        // A backwards jump is flagged but is not a gap either.
+        var anomaly = timeline.Observe(Packet(0, TenMs));
+        Assert.True(anomaly.DevicePositionAnomaly);
+        Assert.Null(anomaly.GapStartMs);
+        Assert.Null(anomaly.GapEndMs);
+    }
+
     private static AudioPacket Packet(
         long devicePosition,
         int frames,

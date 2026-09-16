@@ -168,12 +168,36 @@ Implemented, and covered by the automated suite that runs in CI (`.github/workfl
   `tests/MeetCap.AudioPipeline.Tests/SessionRecoveryScannerTests.cs`.
 - **`meetcap session repair` (section 6).** The same recovery pass is exposed as an operator
   action that exits non-zero when a known gap remains or the requested session was not found,
-  and prints where the audio is missing. Covered by
+  and prints where the audio is missing. `meetcap status` deliberately still exits 0 in every
+  case — it describes state, including a broken one — which is why the acting command is the one
+  that carries the exit code. Covered by
   `tests/MeetCap.Cli.Tests/CaptureCommandTests.cs`.
+- **One gap, one record (section 7).** A gap has two observers — the live timeline and the
+  recovery audit — so `capture.gap` carries the hole's own interval (`gap_start_ms` /
+  `gap_end_ms`) and recovery recognises its own finding against the recording's by interval
+  overlap rather than by a single position. Recovering an already-reported hole therefore does
+  not report it a second time, and a *different* hole that merely shares a boundary position is
+  still reported. `session.repair.incomplete` is likewise written once per verdict rather than
+  once per pass. Covered by
+  `tests/MeetCap.AudioPipeline.Tests/SessionRecoveryScannerTests.cs`,
+  `tests/MeetCap.AudioPipeline.Tests/RecordingSessionTests.cs` and
+  `tests/MeetCap.Core.Tests/Capture/CaptureTimelineTests.cs`.
 - **Recording independence (section 1).** `MeetCap.AudioPipeline` references no ASR, cloud,
   HTTP or speaker assembly and exposes no provider type, so the M2 exit criterion is enforced
   structurally and not only behaviourally. Covered by
   `tests/MeetCap.AudioPipeline.Tests/CaptureIndependenceTests.cs`.
+
+Known coverage limits of the gap audit, stated rather than implied:
+
+- `SessionGapAuditor.Audit(sessionId)`'s failure path — a `SqliteException` while reading the
+  index, which turns into `SessionAudit.Problems` and therefore into an incomplete repair — is
+  **not covered by a test**. Provoking it needs an unreadable or schema-less database, which a
+  healthy run cannot produce, and the exit-code contract it feeds *is* covered through the
+  `gaps_remain` path. It must not be read as verified.
+- The audit reads spans from the chunk index, so it sees a hole *between* durable chunks. A
+  device skip inside a single chunk's span is invisible to it and is reported only by the live
+  timeline. This is a real limit of the audit's evidence, not a bug in it
+  (`docs/DATA_MODEL.md` section 5.1).
 
 Still not verified on real hardware:
 

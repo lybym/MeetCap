@@ -720,6 +720,11 @@ public sealed class RecordingSession : IDisposable
             _events.Write(new SessionEvent(SessionEventNames.CaptureGap, timing.StartMs)
             {
                 Source = Track.ToWireName(),
+                // The gap's own interval, not this buffer's position: recovery re-derives the
+                // same hole from the chunk index, and both records have to name it the same
+                // way or the log describes one hole twice (docs/RELIABILITY.md section 7).
+                GapStartMs = timing.GapStartMs,
+                GapEndMs = timing.GapEndMs,
                 GapMs = timing.GapMs,
                 DevicePositionFrames = packet.DevicePositionFrames,
                 QpcPositionTicks = packet.QpcPositionTicks,
