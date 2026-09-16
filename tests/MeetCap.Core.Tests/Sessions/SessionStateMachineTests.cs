@@ -21,14 +21,63 @@ public class SessionStateMachineTests
     [Theory]
     [InlineData(SessionStatus.Created, SessionStatus.Recording, true)]
     [InlineData(SessionStatus.Created, SessionStatus.Processing, true)]
+    [InlineData(SessionStatus.Created, SessionStatus.Interrupted, true)]
     [InlineData(SessionStatus.Recording, SessionStatus.Finalizing, true)]
+    [InlineData(SessionStatus.Recording, SessionStatus.Interrupted, true)]
+    [InlineData(SessionStatus.Finalizing, SessionStatus.Completed, true)]
     [InlineData(SessionStatus.Finalizing, SessionStatus.Processing, true)]
+    [InlineData(SessionStatus.Finalizing, SessionStatus.Interrupted, true)]
     [InlineData(SessionStatus.Processing, SessionStatus.Completed, true)]
+    [InlineData(SessionStatus.Processing, SessionStatus.Interrupted, true)]
     [InlineData(SessionStatus.Created, SessionStatus.Completed, false)]
     [InlineData(SessionStatus.Completed, SessionStatus.Processing, false)]
+    [InlineData(SessionStatus.Completed, SessionStatus.Interrupted, false)]
+    [InlineData(SessionStatus.Interrupted, SessionStatus.Completed, false)]
+    [InlineData(SessionStatus.Interrupted, SessionStatus.Recording, false)]
     [InlineData(SessionStatus.Recording, SessionStatus.Completed, false)]
     public void CanTransition_MatchesTheDocumentedLifecycle(string from, string to, bool expected) =>
         Assert.Equal(expected, SessionStateMachine.CanTransition(from, to));
+
+    [Fact]
+    public void M1RecordingPath_StopsAtFinalizingThenCompletesWithoutProcessing()
+    {
+        // docs/ARCHITECTURE.md section 20: M1 implements the subset with no post-capture
+        // work, so a clean offline recording goes straight from FINALIZING to COMPLETED
+        // and never enters PROCESSING.
+        var session = Session(SessionStatus.Created)
+            .WithStatus(SessionStatus.Recording, s_now.AddSeconds(1))
+            .WithStatus(SessionStatus.Finalizing, s_now.AddMinutes(5))
+            .WithStatus(SessionStatus.Completed, s_now.AddMinutes(5).AddSeconds(2));
+
+        Assert.Equal(SessionStatus.Completed, session.Status);
+        Assert.True(SessionStateMachine.IsTerminal(SessionStatus.Completed));
+    }
+
+    [Theory]
+    [InlineData(SessionStatus.Created)]
+    [InlineData(SessionStatus.Recording)]
+    [InlineData(SessionStatus.Finalizing)]
+    [InlineData(SessionStatus.Processing)]
+    public void Interrupted_IsReachableFromEveryNonTerminalStatus(string from)
+    {
+        // Every non-terminal status can be found abandoned by startup recovery, or be
+        // abandoned by the recording process, so INTERRUPTED is a legal edge from each.
+        var interrupted = Session(from).WithStatus(SessionStatus.Interrupted, s_now.AddMinutes(1));
+
+        Assert.Equal(SessionStatus.Interrupted, interrupted.Status);
+        Assert.True(SessionStateMachine.IsTerminal(SessionStatus.Interrupted));
+    }
+
+    [Fact]
+    public void M1RecordingPath_CanBeInterruptedFromFinalizing()
+    {
+        // The close/index window: capture ended and the artifacts were being closed when
+        // the process died, leaving a FINALIZING session that recovery must terminalize.
+        var interrupted = Session(SessionStatus.Finalizing)
+            .WithStatus(SessionStatus.Interrupted, s_now.AddMinutes(6));
+
+        Assert.Equal(SessionStatus.Interrupted, interrupted.Status);
+    }
 
     [Fact]
     public void ImportSession_GoesStraightToProcessingAndThenCompleted()
@@ -48,10 +97,21 @@ public class SessionStateMachineTests
     }
 
     [Fact]
+    public void InterruptedSession_CannotBeReopened()
+    {
+        // INTERRUPTED is terminal, so a session that recovery already terminalized can
+        // never be advanced back into the recording lifecycle.
+        Assert.Throws<InvalidSessionTransitionException>(
+            () => Session(SessionStatus.Interrupted).WithStatus(SessionStatus.Recording, s_now));
+    }
+
+    [Fact]
     public void ActiveStatuses_AreTheNonTerminalOnes()
     {
         Assert.True(SessionStatus.IsActive(SessionStatus.Processing));
+        Assert.True(SessionStatus.IsActive(SessionStatus.Finalizing));
         Assert.False(SessionStatus.IsActive(SessionStatus.Completed));
+        Assert.False(SessionStatus.IsActive(SessionStatus.Interrupted));
     }
 }
 
