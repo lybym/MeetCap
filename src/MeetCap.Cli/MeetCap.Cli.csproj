@@ -18,6 +18,11 @@
     <ProjectReference Include="..\MeetCap.WindowsAudio\MeetCap.WindowsAudio.csproj" />
     <ProjectReference Include="..\MeetCap.Asr\MeetCap.Asr.csproj" />
     <ProjectReference Include="..\MeetCap.Asr.Volcengine\MeetCap.Asr.Volcengine.csproj" />
+    <!-- M6 / docs/ARCHITECTURE.md section 17: speaker registry semantics and the
+         sherpa-onnx + 3D-Speaker identity provider. The CLI composition root joins
+         them; domain code reaches neither. -->
+    <ProjectReference Include="..\MeetCap.Speakers\MeetCap.Speakers.csproj" />
+    <ProjectReference Include="..\MeetCap.Speakers.SherpaOnnx\MeetCap.Speakers.SherpaOnnx.csproj" />
   </ItemGroup>
 
   <ItemGroup>

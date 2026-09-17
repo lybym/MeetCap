@@ -653,7 +653,7 @@ Store multiple embeddings per person.
 
 ## 10. Speaker attribution
 
-Per-session artifact:
+Per-session artifact (`speakers/attribution.json`, `docs/ARCHITECTURE.md` section 19):
 
 ```json
 {
@@ -668,6 +668,14 @@ Per-session artifact:
 ```
 
 Possible source: `manual`, `voiceprint`, `owner_assumption`, `unknown`.
+
+The `speaker_assignments` SQLite table (migration `0004_speakers`, section 14) stores the
+durable binding of each `(session_id, speaker_label)` to a person, so a manual assignment
+or a re-run of the voiceprint pipeline is idempotent (the `UNIQUE (session_id,
+speaker_label)` constraint makes upsert replace rather than duplicate). The `attribution.json`
+artifact is the materialized view produced by `meetcap speakers attribute`, combining manual
+assignments and voiceprint candidates through the matching policy
+(`docs/ARCHITECTURE.md` section 17.3).
 
 ## 11. SQLite minimum tables
 
@@ -714,6 +722,15 @@ already-applied, and an unnumbered script is never considered at all.
 - **0001_sessions** (M0): creates `schema_migrations` and the `sessions` table (section 1) with `CHECK` constraints on `mode` (`offline`/`online`/`import`) and `source_type` (`live`/`import`), plus convenience indexes on `status` and `started_at`.
 - **0002_audio_chunks** (M1): creates the `audio_chunks` table (section 5) with `CHECK` constraints on `source` (`mic`/`loopback`), `sample_format` (`pcm`/`ieee_float`) and `status`, a unique key on `(session_id, source, sequence)`, a `REFERENCES sessions (id) ON DELETE CASCADE` clause, and indexes on `(session_id, source, sequence)` and `status`. Foreign keys are enabled per connection, so a chunk row cannot exist without its session.
 - **0003_asr_jobs** (M3): creates the `asr_jobs` table (section 6) with a `CHECK` constraint on `status` and indexes on `status`, `session_id`, and `next_retry_at`.
+- **0004_speakers** (M6): creates the `speakers` (section 8), `speaker_embeddings` (section 9),
+  and `speaker_assignments` (section 10) tables. `speakers.display_name` is `UNIQUE` so
+  enrollment cannot create a silent duplicate; `speaker_embeddings.speaker_id` has
+  `REFERENCES speakers (id) ON DELETE CASCADE` so deleting a person removes their
+  voiceprints; `speaker_assignments` has a `CHECK` on `source`
+  (`manual`/`voiceprint`/`owner_assumption`/`unknown`) and `locked`, a `UNIQUE
+  (session_id, speaker_label)` so upsert is idempotent, and `speaker_id` is nullable
+  with `ON DELETE SET NULL` so an unknown label has no person and removing a person
+  demotes their assignments rather than orphaning them.
 - **M2** requires no new migration. The bounded-buffer accounting and the gap totals live in
   `session.json` and `events.jsonl` (sections 3 and 4), and the gap audit (section 5.1) reads
   the M1 `audio_chunks` index. No table, column or constraint changed, so the applied schema is

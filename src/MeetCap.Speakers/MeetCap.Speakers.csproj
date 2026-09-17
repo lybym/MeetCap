@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <RootNamespace>MeetCap.Speakers</RootNamespace>
+    <AssemblyName>MeetCap.Speakers</AssemblyName>
+    <PackageId>MeetCap.Speakers</PackageId>
+    <Description>MeetCap speaker registry semantics: enrollment workflow, clean sample selection, voiceprint attribution, and manual-lock policy coordination.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MeetCap.Core\MeetCap.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="MeetCap.Speakers.Tests" />
+  </ItemGroup>
+
+</Project>

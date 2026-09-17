@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <RootNamespace>MeetCap.Speakers.SherpaOnnx</RootNamespace>
+    <AssemblyName>MeetCap.Speakers.SherpaOnnx</AssemblyName>
+    <PackageId>MeetCap.Speakers.SherpaOnnx</PackageId>
+    <Description>MeetCap sherpa-onnx + 3D-Speaker ERes2Net-base speaker identity provider. The default local identity stack behind the MeetCap.Speakers boundary.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MeetCap.Core\MeetCap.Core.csproj" />
+    <ProjectReference Include="..\MeetCap.Speakers\MeetCap.Speakers.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="org.k2fsa.sherpa.onnx" Version="1.13.8" />
+  </ItemGroup>
+
+</Project>

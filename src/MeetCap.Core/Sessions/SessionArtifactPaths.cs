@@ -96,6 +96,18 @@ public sealed class SessionArtifactPaths
 
     public string LiveTranscriptMarkdown => Path.Combine(TranscriptDirectory, "live.md");
 
+    /// <summary>Speaker-attributed transcript (M6+, arrives with speaker attribution).</summary>
+    public string FinalTranscriptJsonl => Path.Combine(TranscriptDirectory, "final.jsonl");
+
+    /// <summary>Speaker-attributed Markdown transcript (M6+).</summary>
+    public string FinalTranscriptMarkdown => Path.Combine(TranscriptDirectory, "final.md");
+
+    /// <summary>Per-session speaker attribution artifact (<c>speakers/attribution.json</c>).</summary>
+    public string SpeakersDirectory => Path.Combine(SessionDirectory, "speakers");
+
+    /// <summary>The per-session speaker attribution artifact (docs/DATA_MODEL.md section 10).</summary>
+    public string SpeakerAttributionJson => Path.Combine(SpeakersDirectory, "attribution.json");
+
     public string LogsDirectory => Path.Combine(SessionDirectory, "logs");
 
     public string SessionLog => Path.Combine(LogsDirectory, "session.log");

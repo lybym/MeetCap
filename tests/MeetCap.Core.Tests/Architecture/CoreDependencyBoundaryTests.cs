@@ -107,11 +107,11 @@ public class CoreDependencyBoundaryTests
     }
 
     /// <summary>
-    /// The contracts M3 adds are the ones infrastructure must implement. Asserting they
-    /// exist keeps a future refactor from quietly moving a contract into an adapter.
+    /// The contracts M3 and M6 add are the ones infrastructure must implement. Asserting
+    /// they exist keeps a future refactor from quietly moving a contract into an adapter.
     /// </summary>
     [Fact]
-    public void M3Contracts_AreOwnedByCore()
+    public void CorePublicContracts_AreOwnedByCore()
     {
         var assembly = typeof(MeetCapConfiguration).Assembly;
         string[] expected =
@@ -124,6 +124,14 @@ public class CoreDependencyBoundaryTests
             "MeetCap.Core.Sessions.ISessionArtifactWriter",
             "MeetCap.Core.Transcripts.ITranscriptStore",
             "MeetCap.Core.Transcripts.TranscriptSegment",
+            // M6: speaker identity and registry contracts (docs/ARCHITECTURE.md section 17).
+            "MeetCap.Core.Speakers.ISpeakerIdentityProvider",
+            "MeetCap.Core.Speakers.ISpeakerStore",
+            "MeetCap.Core.Speakers.Speaker",
+            "MeetCap.Core.Speakers.SpeakerEmbedding",
+            "MeetCap.Core.Speakers.SpeakerCandidate",
+            "MeetCap.Core.Speakers.SpeakerAssignment",
+            "MeetCap.Core.Speakers.SpeakerMatchingPolicy",
         };
 
         foreach (var name in expected)
