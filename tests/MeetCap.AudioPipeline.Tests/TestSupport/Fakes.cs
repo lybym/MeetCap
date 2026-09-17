@@ -38,14 +38,22 @@ internal sealed class FakeDiskSpaceProbe : IDiskSpaceProbe
 internal sealed class FakeDeviceEnumerator : IAudioDeviceEnumerator
 {
     private readonly List<CaptureDeviceInfo> _devices = new();
+    private readonly List<CaptureDeviceInfo> _renderDevices = new();
 
     public FakeDeviceEnumerator(params CaptureDeviceInfo[] devices) => _devices.AddRange(devices);
 
-    /// <summary>Replaces the enumerated endpoints, for tests that reshape the machine.</summary>
+    /// <summary>Replaces the enumerated capture endpoints, for tests that reshape the machine.</summary>
     public void Replace(params CaptureDeviceInfo[] devices)
     {
         _devices.Clear();
         _devices.AddRange(devices);
+    }
+
+    /// <summary>Sets the render endpoints available for loopback (docs/ROADMAP.md M5).</summary>
+    public void SetRenderDevices(params CaptureDeviceInfo[] devices)
+    {
+        _renderDevices.Clear();
+        _renderDevices.AddRange(devices);
     }
 
     public IReadOnlyList<CaptureDeviceInfo> EnumerateCaptureDevices() => _devices;
@@ -54,6 +62,13 @@ internal sealed class FakeDeviceEnumerator : IAudioDeviceEnumerator
 
     public CaptureDeviceInfo? FindCaptureDevice(string deviceId)
         => _devices.FirstOrDefault(d => string.Equals(d.Id, deviceId, StringComparison.OrdinalIgnoreCase));
+
+    public IReadOnlyList<CaptureDeviceInfo> EnumerateRenderDevices() => _renderDevices;
+
+    public CaptureDeviceInfo? GetDefaultRenderDevice() => _renderDevices.FirstOrDefault(d => d.IsDefault);
+
+    public CaptureDeviceInfo? FindRenderDevice(string deviceId)
+        => _renderDevices.FirstOrDefault(d => string.Equals(d.Id, deviceId, StringComparison.OrdinalIgnoreCase));
 }
 
 /// <summary>
@@ -166,6 +181,51 @@ internal sealed class FakeCaptureSourceFactory : IAudioCaptureSourceFactory
 
         return created;
     }
+
+    /// <summary>
+    /// Scripted sources handed out for loopback, in dequeue order. When empty the
+    /// <see cref="LoopbackFallback"/> (or an implicit source) is used, mirroring the
+    /// microphone path so a dual-track test can script both tracks independently
+    /// (docs/ARCHITECTURE.md section 6: the two tracks never wait for one another).
+    /// </summary>
+    private readonly Queue<Func<LoopbackCaptureRequest, IAudioCaptureSource>> _scriptedLoopback = new();
+
+    /// <summary>Loopback sources handed out so far, in order.</summary>
+    public IReadOnlyList<FakeCaptureSource> LoopbackCreated => _loopbackCreated;
+
+    private readonly List<FakeCaptureSource> _loopbackCreated = new();
+
+    public Func<LoopbackCaptureRequest, IAudioCaptureSource>? LoopbackFallback { get; set; }
+
+    public void EnqueueLoopback(FakeCaptureSource source)
+        => _scriptedLoopback.Enqueue(_ => source);
+
+    public void EnqueueLoopbackFailure(Exception error)
+        => _scriptedLoopback.Enqueue(_ => throw error);
+
+    public IAudioCaptureSource CreateLoopback(LoopbackCaptureRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        var factory = _scriptedLoopback.Count > 0 ? _scriptedLoopback.Dequeue() : LoopbackFallback;
+        if (factory is null)
+        {
+            var implicitSource = new FakeCaptureSource(
+                TestAudio.Formats.Mono48kPcm,
+                request.RenderDevice,
+                AudioSource.Loopback);
+            _loopbackCreated.Add(implicitSource);
+            return implicitSource;
+        }
+
+        var created = factory(request);
+        if (created is FakeCaptureSource fake)
+        {
+            _loopbackCreated.Add(fake);
+        }
+
+        return created;
+    }
 }
 
 /// <summary>Shared audio formats and packet builders for the pipeline tests.</summary>
@@ -188,8 +248,16 @@ internal static class TestAudio
         long startFrame,
         int frames,
         AudioBufferFlags flags = AudioBufferFlags.None)
+        => Packet(format, startFrame, frames, AudioSource.Mic, flags);
+
+    public static AudioPacket Packet(
+        AudioFormat format,
+        long startFrame,
+        int frames,
+        AudioSource source,
+        AudioBufferFlags flags = AudioBufferFlags.None)
         => new(
-            AudioSource.Mic,
+            source,
             format,
             new byte[frames * format.BlockAlign],
             startFrame,
@@ -199,6 +267,19 @@ internal static class TestAudio
 
     /// <summary>
     /// Emits <paramref name="milliseconds"/> of contiguous audio in 100 ms buffers,
+    /// returning the next free device position. Packets are labelled with the source's
+    /// own track so mic and loopback stay distinguishable (docs/ARCHITECTURE.md section 6).
+    /// </summary>
+    public static long EmitSeconds(
+        FakeCaptureSource source,
+        AudioFormat format,
+        long startFrame,
+        int milliseconds,
+        int bufferMs = 100)
+        => EmitSeconds(source, format, startFrame, milliseconds, source.Source, bufferMs);
+
+    /// <summary>
+    /// Emits <paramref name="milliseconds"/> of contiguous audio on a specific track,
     /// returning the next free device position.
     /// </summary>
     public static long EmitSeconds(
@@ -206,6 +287,7 @@ internal static class TestAudio
         AudioFormat format,
         long startFrame,
         int milliseconds,
+        AudioSource track,
         int bufferMs = 100)
     {
         var remaining = milliseconds;
@@ -215,7 +297,7 @@ internal static class TestAudio
         {
             var chunkMs = Math.Min(bufferMs, remaining);
             var frames = Frames(format, chunkMs);
-            source.Emit(Packet(format, frame, frames));
+            source.Emit(Packet(format, frame, frames, track));
             frame += frames;
             remaining -= chunkMs;
         }

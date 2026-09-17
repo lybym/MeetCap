@@ -117,6 +117,15 @@ public sealed class CaptureService
     public CaptureDeviceInfo ResolveDevice()
         => AudioDeviceResolver.Resolve(_platform.Devices, _settings.MicrophoneDeviceId);
 
+    /// <summary>
+    /// Resolves the render endpoint an online session would loopback from, or
+    /// <c>null</c> for an offline session (docs/ROADMAP.md M5).
+    /// </summary>
+    public CaptureDeviceInfo? ResolveRenderDevice()
+        => _settings.Online is null
+            ? null
+            : AudioDeviceResolver.ResolveRender(_platform.Devices, _settings.Online.RenderDeviceId);
+
     /// <summary>Runs the startup scan (docs/RELIABILITY.md section 6).</summary>
     public RecoveryReport RunStartupRecovery()
     {
@@ -160,10 +169,11 @@ public sealed class CaptureService
 
     /// <summary>
     /// Creates the session directory, manifest and index row, then returns the runner
-    /// for it. Everything that can fail before recording — device resolution and the
-    /// free-space check — fails here, before any artifact is written.
+    /// for it. Everything that can fail before recording — device resolution, the
+    /// free-space check and the loopback mode — fails here, before any artifact is written.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// The returned session already holds its exclusive liveness marker
     /// (<c>recording.lock</c>). Claiming ownership here rather than in
     /// <see cref="RecordingSession.RunAsync"/> is what makes publication and recovery
@@ -172,26 +182,58 @@ public sealed class CaptureService
     /// indistinguishable from one abandoned by a killed recorder. Disposing the returned
     /// session without running it releases the marker, so an abandoned session is left
     /// recoverable (docs/ARCHITECTURE.md section 9.1).
+    /// </para>
+    /// <para>
+    /// An offline session resolves one microphone track; an online session resolves the
+    /// microphone and a loopback track (docs/ROADMAP.md M5). The endpoints, the free-space
+    /// level and <c>capture.online.loopback_mode</c> are all resolved and validated before
+    /// the session exists, so those failures leave nothing behind.
+    /// </para>
+    /// <para>
+    /// The capture <em>sources</em> are built later, by
+    /// <see cref="RecordingSession.RunAsync"/>, because the process-loopback target cannot
+    /// be resolved until the platform audio boundary constructs the source. A target that
+    /// is not running therefore still fails after publication: the session is marked
+    /// <c>INTERRUPTED</c> with <c>capture_start_failed</c> and the actionable reason
+    /// surfaces on <see cref="RecordingSessionOutcome.StartFailureDetail"/>, which
+    /// <c>meetcap start</c> prints to stderr (docs/RELIABILITY.md section 16).
+    /// </para>
     /// </remarks>
     /// <param name="title">Session title recorded in the manifest and the index row.</param>
     /// <param name="afterPacketWritten">
     /// Test seam forwarded to the recording session, so a test can make the consumer slow
     /// and observe bounded-buffer behaviour. Production callers omit it.
     /// </param>
-    /// <exception cref="DeviceUnavailableException">No usable microphone.</exception>
+    /// <exception cref="DeviceUnavailableException">No usable microphone, or (online) no usable render endpoint.</exception>
     /// <exception cref="InsufficientDiskSpaceException">Not enough free space to record.</exception>
     /// <exception cref="MeetCapException">Another process already owns this session's marker.</exception>
     public RecordingSession PrepareSession(string title, Action? afterPacketWritten = null)
     {
-        var device = ResolveDevice();
+        var micDevice = ResolveDevice();
+        CaptureDeviceInfo? renderDevice = null;
+        if (_settings.IsOnline)
+        {
+            renderDevice = ResolveRenderDevice();
+        }
 
         new DiskSpaceMonitor(_platform.DiskSpace, _settings.MinimumFreeSpaceBytes)
             .EnsureSufficientAtStart(_settings.DataRoot);
 
+        // Validate the loopback mode before publishing anything. The mode is parsed again
+        // when the track specs are built below, but that happens inside the publication
+        // block, so an invalid mode would otherwise surface only after the session
+        // directory, manifest, sessions row and audio/loopback/ already existed
+        // (docs/M1_WINDOWS_VALIDATION.md section 13, docs/RELIABILITY.md section 16).
+        ValidateLoopbackMode();
+
         var now = _platform.Clock.UtcNow;
         var sessionId = SessionIds.Create(now);
         var paths = new SessionPaths(_settings.DataRoot, sessionId);
-        paths.CreateDirectories();
+        paths.CreateDirectories(includeLoopback: _settings.IsOnline);
+
+        var tracks = _settings.IsOnline
+            ? new[] { AudioSources.Mic, AudioSources.Loopback }
+            : new[] { AudioSources.Mic };
 
         SessionRecordingLock? recordingLock = null;
         try
@@ -204,11 +246,11 @@ public sealed class CaptureService
             {
                 SessionId = sessionId,
                 Title = title,
-                Mode = SessionModes.Offline,
+                Mode = _settings.Mode,
                 SourceType = SessionSourceTypes.Live,
                 Status = SessionStatus.Created,
                 ConfigVersion = _settings.ConfigVersion,
-                Tracks = new[] { AudioSources.Mic },
+                Tracks = tracks,
                 ChunkSeconds = _settings.ChunkSeconds,
             };
             SessionManifestStore.Save(paths.ManifestPath, manifest);
@@ -217,15 +259,17 @@ public sealed class CaptureService
             {
                 Id = sessionId,
                 Title = title,
-                Mode = SessionModes.Offline,
+                Mode = _settings.Mode,
                 SourceType = SessionSourceTypes.Live,
                 Status = SessionStatus.Created,
                 ConfigVersion = _settings.ConfigVersion,
                 ConfigSnapshot = CaptureConfigSnapshot.ToJson(_settings),
-                Tracks = new[] { AudioSources.Mic },
+                Tracks = tracks,
                 CreatedAt = now,
                 UpdatedAt = now,
             });
+
+            var trackSpecs = BuildTrackSpecs(micDevice, renderDevice);
 
             var session = new RecordingSession(
                 paths,
@@ -233,7 +277,7 @@ public sealed class CaptureService
                 _platform,
                 _database,
                 new JsonlSessionEventSink(paths.EventsPath),
-                device,
+                trackSpecs,
                 _platform.Clock,
                 manifest,
                 _maxDeviceRecoveryAttempts,
@@ -248,6 +292,68 @@ public sealed class CaptureService
             // Only reached when publishing failed: on success the marker is owned by the
             // returned session and must outlive this method.
             recordingLock?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Builds the per-track capture specs for this session: one microphone track for an
+    /// offline session, plus a loopback track for an online session. Each spec carries
+    /// the closures that (re)create its capture source and re-resolve its endpoint after
+    /// a device loss, so the recording session stays source-agnostic and NAudio types
+    /// never leave the platform boundary (docs/DEVELOPMENT.md section 4).
+    /// </summary>
+    private IReadOnlyList<CaptureTrackSpec> BuildTrackSpecs(
+        CaptureDeviceInfo micDevice,
+        CaptureDeviceInfo? renderDevice)
+    {
+        var specs = new List<CaptureTrackSpec>(2);
+
+        var micDeviceId = _settings.MicrophoneDeviceId;
+        specs.Add(new CaptureTrackSpec(
+            AudioSource.Mic,
+            micDevice,
+            device => _platform.CaptureSources.Create(AudioSource.Mic, device),
+            () => AudioDeviceResolver.TryResolve(_platform.Devices, micDeviceId)));
+
+        if (_settings.IsOnline && _settings.Online is { } online && renderDevice is not null)
+        {
+            // The mode and the process name were validated before the session was published
+            // (see ValidateLoopbackMode). Parsing again here keeps the spec the single
+            // source of truth for the request the loopback track is built from.
+            var loopbackMode = LoopbackModes.Parse(online.LoopbackMode);
+            var processName = online.ProcessName;
+            var renderDeviceId = online.RenderDeviceId;
+
+            specs.Add(new CaptureTrackSpec(
+                AudioSource.Loopback,
+                renderDevice,
+                device => _platform.CaptureSources.CreateLoopback(
+                    new LoopbackCaptureRequest(device, loopbackMode, processName)),
+                () => AudioDeviceResolver.TryResolveRender(_platform.Devices, renderDeviceId)));
+        }
+
+        return specs;
+    }
+
+    /// <summary>
+    /// Rejects an unusable <c>capture.online.loopback_mode</c> before the session is
+    /// published, so the failure leaves no session artifacts behind.
+    /// </summary>
+    /// <remarks>
+    /// Only meaningful for an online session: the key configures the loopback track, which
+    /// an offline session never builds. <c>start</c> reports the same problem from
+    /// configuration validation, but the pipeline owns the value it actually parses, so it
+    /// refuses it here too rather than trusting every caller
+    /// (docs/DEVELOPMENT.md section 8).
+    /// </remarks>
+    /// <exception cref="ArgumentException">
+    /// <c>capture.online.loopback_mode</c> is not one of the documented modes.
+    /// </exception>
+    private void ValidateLoopbackMode()
+    {
+        if (_settings.Online is { } online)
+        {
+            LoopbackModes.Parse(online.LoopbackMode);
         }
     }
 

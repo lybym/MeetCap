@@ -1,4 +1,5 @@
 using MeetCap.Core.Capture;
+using MeetCap.Core.Sessions;
 using MeetCap.Persistence.Storage;
 
 namespace MeetCap.AudioPipeline.Tests.TestSupport;
@@ -10,8 +11,6 @@ namespace MeetCap.AudioPipeline.Tests.TestSupport;
 /// </summary>
 internal sealed class SessionHarness : IDisposable
 {
-    private readonly TempWorkspace _workspace;
-
     public SessionHarness(
         int chunkSeconds = 60,
         int bufferSeconds = 60,
@@ -19,7 +18,11 @@ internal sealed class SessionHarness : IDisposable
         double minimumFreeSpaceGb = 5,
         string microphoneDeviceId = "mic-default",
         int maxDeviceRecoveryAttempts = 3,
-        TempWorkspace? workspace = null)
+        TempWorkspace? workspace = null,
+        string? mode = null,
+        string? renderDeviceId = null,
+        string? loopbackMode = null,
+        string? loopbackProcessName = null)
     {
         _workspace = workspace ?? new TempWorkspace();
         OwnsWorkspace = workspace is null;
@@ -27,8 +30,21 @@ internal sealed class SessionHarness : IDisposable
         Clock = new FakeClock();
         Disk = new FakeDiskSpaceProbe();
         Device = new CaptureDeviceInfo("mic-default", "Test Microphone", true);
+        RenderDevice = new CaptureDeviceInfo("render-default", "Test Speakers", true);
         Devices = new FakeDeviceEnumerator(Device);
+        Devices.SetRenderDevices(RenderDevice);
         Sources = new FakeCaptureSourceFactory();
+
+        var isOnline = string.Equals(mode, SessionModes.Online, StringComparison.Ordinal);
+        OnlineCaptureSettings? online = null;
+        if (isOnline)
+        {
+            online = new OnlineCaptureSettings(
+                microphoneDeviceId,
+                loopbackMode ?? "system",
+                renderDeviceId ?? "default",
+                loopbackProcessName ?? string.Empty);
+        }
 
         Settings = new CaptureSettings(
             _workspace.DataRoot,
@@ -37,7 +53,9 @@ internal sealed class SessionHarness : IDisposable
             flushIntervalMs,
             minimumFreeSpaceGb,
             microphoneDeviceId,
-            configVersion: 1);
+            configVersion: 1,
+            mode: isOnline ? SessionModes.Online : SessionModes.Offline,
+            online: online);
 
         Platform = new CapturePlatform(Devices, Sources, Disk, Clock);
         Database = _workspace.Database;
@@ -58,6 +76,9 @@ internal sealed class SessionHarness : IDisposable
 
     public CaptureDeviceInfo Device { get; }
 
+    /// <summary>The render endpoint an online session loopbacks from (docs/ROADMAP.md M5).</summary>
+    public CaptureDeviceInfo RenderDevice { get; }
+
     public FakeDeviceEnumerator Devices { get; }
 
     public FakeCaptureSourceFactory Sources { get; }
@@ -68,6 +89,21 @@ internal sealed class SessionHarness : IDisposable
 
     public CaptureService Service { get; }
 
+    /// <summary>
+    /// A single-microphone track spec built from this harness's platform, for tests that
+    /// construct a <see cref="RecordingSession"/> directly rather than through
+    /// <see cref="CaptureService.PrepareSession"/>.
+    /// </summary>
+    public IReadOnlyList<CaptureTrackSpec> MicTrackSpecs()
+        => new[]
+        {
+            new CaptureTrackSpec(
+                AudioSource.Mic,
+                Device,
+                device => Platform.CaptureSources.Create(AudioSource.Mic, device),
+                () => AudioDeviceResolver.TryResolve(Devices, Settings.MicrophoneDeviceId)),
+        };
+
     public void Dispose()
     {
         if (OwnsWorkspace)
@@ -75,4 +111,6 @@ internal sealed class SessionHarness : IDisposable
             _workspace.Dispose();
         }
     }
+
+    private readonly TempWorkspace _workspace;
 }

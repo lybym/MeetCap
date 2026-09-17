@@ -90,6 +90,83 @@ public sealed class NAudioDeviceEnumerator : IAudioDeviceEnumerator
     }
 
     /// <summary>
+    /// Currently active render endpoints (speakers/headphones). These are the source
+    /// for system loopback capture (docs/ARCHITECTURE.md section 7, docs/ROADMAP.md M5).
+    /// </summary>
+    public IReadOnlyList<CaptureDeviceInfo> EnumerateRenderDevices()
+    {
+        using var enumerator = new MMDeviceEnumerator();
+        var defaultId = TryGetDefaultRenderDeviceId(enumerator);
+
+        using var collection = enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active);
+        var devices = new List<CaptureDeviceInfo>(collection.Count);
+
+        for (var i = 0; i < collection.Count; i++)
+        {
+            using var device = collection[i];
+            var id = SafeId(device);
+            if (string.IsNullOrEmpty(id))
+            {
+                continue;
+            }
+
+            devices.Add(new CaptureDeviceInfo(
+                id,
+                SafeFriendlyName(device),
+                string.Equals(id, defaultId, StringComparison.OrdinalIgnoreCase)));
+        }
+
+        return devices;
+    }
+
+    public CaptureDeviceInfo? GetDefaultRenderDevice()
+    {
+        using var enumerator = new MMDeviceEnumerator();
+
+        foreach (var role in DefaultRolePreference)
+        {
+            if (!enumerator.TryGetDefaultAudioEndpoint(DataFlow.Render, role, out var device))
+            {
+                continue;
+            }
+
+            using (device)
+            {
+                var id = SafeId(device);
+                if (!string.IsNullOrEmpty(id))
+                {
+                    return new CaptureDeviceInfo(id, SafeFriendlyName(device), IsDefault: true);
+                }
+            }
+        }
+
+        return null;
+    }
+
+    public CaptureDeviceInfo? FindRenderDevice(string deviceId)
+    {
+        if (string.IsNullOrWhiteSpace(deviceId))
+        {
+            return null;
+        }
+
+        using var enumerator = new MMDeviceEnumerator();
+        using var collection = enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active);
+
+        for (var i = 0; i < collection.Count; i++)
+        {
+            using var device = collection[i];
+            var id = SafeId(device);
+            if (id is not null && string.Equals(id, deviceId, StringComparison.OrdinalIgnoreCase))
+            {
+                return new CaptureDeviceInfo(id, SafeFriendlyName(device), IsDefault: false);
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
     /// Windows "default device" for capture is the multimedia role; the
     /// communications role is the "default communication device" and is used as a
     /// fallback so a machine that only defines one of the two still resolves.
@@ -106,6 +183,28 @@ public sealed class NAudioDeviceEnumerator : IAudioDeviceEnumerator
         foreach (var role in DefaultRolePreference)
         {
             if (!enumerator.TryGetDefaultAudioEndpoint(DataFlow.Capture, role, out var device))
+            {
+                continue;
+            }
+
+            using (device)
+            {
+                var id = SafeId(device);
+                if (!string.IsNullOrEmpty(id))
+                {
+                    return id;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static string? TryGetDefaultRenderDeviceId(MMDeviceEnumerator enumerator)
+    {
+        foreach (var role in DefaultRolePreference)
+        {
+            if (!enumerator.TryGetDefaultAudioEndpoint(DataFlow.Render, role, out var device))
             {
                 continue;
             }

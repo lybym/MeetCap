@@ -58,5 +58,27 @@ public interface IAudioCaptureSource : IDisposable
 /// </summary>
 public interface IAudioCaptureSourceFactory
 {
+    /// <summary>
+    /// Creates a microphone capture source for a resolved capture endpoint. The
+    /// returned source has <see cref="IAudioCaptureSource.Source"/> equal to
+    /// <see cref="AudioSource.Mic"/>.
+    /// </summary>
     IAudioCaptureSource Create(AudioSource source, CaptureDeviceInfo device);
+
+    /// <summary>
+    /// Creates the loopback capture source — "what the machine plays" — for a resolved
+    /// render endpoint and a loopback mode (docs/ARCHITECTURE.md section 7,
+    /// docs/ROADMAP.md M5). The returned source has
+    /// <see cref="IAudioCaptureSource.Source"/> equal to
+    /// <see cref="AudioSource.Loopback"/>.
+    /// </summary>
+    /// <remarks>
+    /// The implementation uses NAudio's supported loopback capture rather than raw
+    /// WASAPI/COM plumbing (docs/ARCHITECTURE.md section 2). Process loopback is an
+    /// additive capture-source option; system loopback is the baseline, so a request
+    /// whose <see cref="LoopbackCaptureRequest.Mode"/> is
+    /// <see cref="LoopbackMode.System"/> ignores
+    /// <see cref="LoopbackCaptureRequest.ProcessName"/>.
+    /// </remarks>
+    IAudioCaptureSource CreateLoopback(LoopbackCaptureRequest request);
 }

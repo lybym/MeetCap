@@ -36,11 +36,18 @@ internal sealed class FakeDiskSpaceProbe : IDiskSpaceProbe
 internal sealed class FakeDeviceEnumerator : IAudioDeviceEnumerator
 {
     private readonly List<CaptureDeviceInfo> _devices = new();
+    private readonly List<CaptureDeviceInfo> _renderDevices = new();
 
     public void Replace(params CaptureDeviceInfo[] devices)
     {
         _devices.Clear();
         _devices.AddRange(devices);
+    }
+
+    public void SetRenderDevices(params CaptureDeviceInfo[] devices)
+    {
+        _renderDevices.Clear();
+        _renderDevices.AddRange(devices);
     }
 
     public IReadOnlyList<CaptureDeviceInfo> EnumerateCaptureDevices() => _devices;
@@ -49,25 +56,34 @@ internal sealed class FakeDeviceEnumerator : IAudioDeviceEnumerator
 
     public CaptureDeviceInfo? FindCaptureDevice(string deviceId)
         => _devices.FirstOrDefault(d => string.Equals(d.Id, deviceId, StringComparison.OrdinalIgnoreCase));
+
+    public IReadOnlyList<CaptureDeviceInfo> EnumerateRenderDevices() => _renderDevices;
+
+    public CaptureDeviceInfo? GetDefaultRenderDevice() => _renderDevices.FirstOrDefault(d => d.IsDefault);
+
+    public CaptureDeviceInfo? FindRenderDevice(string deviceId)
+        => _renderDevices.FirstOrDefault(d => string.Equals(d.Id, deviceId, StringComparison.OrdinalIgnoreCase));
 }
 
 /// <summary>
-/// A capture source that behaves like a live microphone: once started it keeps
-/// producing 48 kHz mono audio until it is stopped, so command-level tests can record a
-/// real session in the background.
+/// A capture source that behaves like a live endpoint: once started it keeps
+/// producing audio until it is stopped, so command-level tests can record a real
+/// session in the background. Used for both the mic and loopback tracks
+/// (docs/ARCHITECTURE.md section 5).
 /// </summary>
 internal sealed class FakeCaptureSource : IAudioCaptureSource
 {
     private readonly CancellationTokenSource _stop = new();
     private Task? _producer;
 
-    public FakeCaptureSource(AudioFormat format, CaptureDeviceInfo device)
+    public FakeCaptureSource(AudioFormat format, CaptureDeviceInfo device, AudioSource source)
     {
         Format = format;
         Device = device;
+        Source = source;
     }
 
-    public AudioSource Source => AudioSource.Mic;
+    public AudioSource Source { get; }
 
     public AudioFormat Format { get; }
 
@@ -101,7 +117,7 @@ internal sealed class FakeCaptureSource : IAudioCaptureSource
             {
                 var frames = (int)Format.MillisecondsToFrames(100);
                 PacketAvailable?.Invoke(new AudioPacket(
-                    AudioSource.Mic,
+                    Source,
                     Format,
                     new byte[frames * Format.BlockAlign],
                     frame,
@@ -139,10 +155,15 @@ internal sealed class FakeCaptureSource : IAudioCaptureSource
 internal sealed class FakeCaptureSourceFactory : IAudioCaptureSourceFactory
 {
     private readonly List<FakeCaptureSource> _created = new();
+    private readonly List<FakeCaptureSource> _loopbackCreated = new();
 
     public Func<AudioSource, CaptureDeviceInfo, IAudioCaptureSource>? Fallback { get; set; }
 
+    public Func<LoopbackCaptureRequest, IAudioCaptureSource>? LoopbackFallback { get; set; }
+
     public IReadOnlyList<FakeCaptureSource> Created => _created;
+
+    public IReadOnlyList<FakeCaptureSource> LoopbackCreated => _loopbackCreated;
 
     public AudioFormat Format { get; set; } = new(48_000, 1, 16, AudioSampleFormat.Pcm);
 
@@ -153,8 +174,20 @@ internal sealed class FakeCaptureSourceFactory : IAudioCaptureSourceFactory
             return Fallback(source, device);
         }
 
-        var created = new FakeCaptureSource(Format, device);
+        var created = new FakeCaptureSource(Format, device, source);
         _created.Add(created);
+        return created;
+    }
+
+    public IAudioCaptureSource CreateLoopback(LoopbackCaptureRequest request)
+    {
+        if (LoopbackFallback is not null)
+        {
+            return LoopbackFallback(request);
+        }
+
+        var created = new FakeCaptureSource(Format, request.RenderDevice, AudioSource.Loopback);
+        _loopbackCreated.Add(created);
         return created;
     }
 }

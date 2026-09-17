@@ -26,12 +26,24 @@ public static class CaptureConfigSnapshot
         {
             writer.WriteStartObject();
             writer.WriteString("data_root", settings.DataRoot);
+            writer.WriteString("mode", settings.Mode);
             writer.WriteNumber("chunk_seconds", settings.ChunkSeconds);
             writer.WriteNumber("buffer_seconds", settings.BufferSeconds);
             writer.WriteNumber("flush_interval_ms", settings.FlushIntervalMs);
             writer.WriteNumber("minimum_free_space_gb", settings.MinimumFreeSpaceGb);
             writer.WriteString("microphone_device_id", settings.MicrophoneDeviceId);
             writer.WriteNumber("config_version", settings.ConfigVersion);
+
+            if (settings.Online is { } online)
+            {
+                writer.WriteStartObject("online");
+                writer.WriteString("microphone_device_id", online.MicrophoneDeviceId);
+                writer.WriteString("loopback_mode", online.LoopbackMode);
+                writer.WriteString("render_device_id", online.RenderDeviceId);
+                writer.WriteString("process_name", online.ProcessName);
+                writer.WriteEndObject();
+            }
+
             writer.WriteEndObject();
         }
 

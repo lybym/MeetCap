@@ -1,6 +1,7 @@
 using MeetCap.AudioPipeline;
 using MeetCap.AudioPipeline.Wave;
 using MeetCap.Core.Capture;
+using MeetCap.Core.Diagnostics;
 using MeetCap.Core.Sessions;
 using MeetCap.Persistence.Storage;
 using Xunit;
@@ -65,20 +66,223 @@ public class CaptureCommandTests
     }
 
     [Fact]
-    public void Start_WithOnlineMode_IsRejectedBeforeAnySessionIsCreated()
+    public async Task Start_WithOnlineMode_RecordsBothMicAndLoopbackTracks()
     {
         using var harness = CliHarness.Create();
-        harness.WriteCaptureConfig();
+        harness.WriteOnlineCaptureConfig(chunkSeconds: 1);
+        harness.Platform.Devices.SetRenderDevices(
+            new CaptureDeviceInfo("render-default", "Test Speakers", true));
 
-        var result = harness.Run("start", "Remote Review", "--mode", "online");
+        // `meetcap start --mode online` blocks while recording, so drive it from a
+        // background thread and stop it through the real `meetcap stop` command.
+        var startTask = Task.Run(() => harness.Run("start", "Remote Review", "--mode", "online"));
+
+        var sessionDirectory = WaitForSessionDirectory(harness.DataRoot);
+        Assert.NotNull(sessionDirectory);
+        WaitForActiveSession(harness.DataRoot);
+
+        var stop = harness.Run("stop");
+        var start = await AwaitBounded(
+            startTask,
+            TimeSpan.FromSeconds(60),
+            "meetcap start --mode online did not finish after meetcap stop");
+
+        Assert.Equal(0, stop.ExitCode);
+        Assert.Equal(0, start.ExitCode);
+        Assert.Contains("mode: online", start.Output);
+
+        // An online session creates independent mic and loopback chunk trees.
+        var micChunks = Directory.GetFiles(Path.Combine(sessionDirectory!, "audio", "mic"), "*.wav");
+        var loopbackChunks = Directory.GetFiles(Path.Combine(sessionDirectory!, "audio", "loopback"), "*.wav");
+        Assert.NotEmpty(micChunks);
+        Assert.NotEmpty(loopbackChunks);
+        Assert.Empty(Directory.GetFiles(Path.Combine(sessionDirectory!, "audio", "mic"), "*.part"));
+        Assert.Empty(Directory.GetFiles(Path.Combine(sessionDirectory!, "audio", "loopback"), "*.part"));
+
+        var manifest = File.ReadAllText(Path.Combine(sessionDirectory!, "session.json"));
+        Assert.Contains("\"mode\": \"online\"", manifest, StringComparison.Ordinal);
+        Assert.Contains("\"mic\"", manifest, StringComparison.Ordinal);
+        Assert.Contains("\"loopback\"", manifest, StringComparison.Ordinal);
+
+        var events = File.ReadAllText(Path.Combine(sessionDirectory!, "events.jsonl"));
+        // The event log is compact JSONL (no space after the colon), so the source labels
+        // appear as "source":"mic" / "source":"loopback".
+        Assert.Contains("\"source\":\"mic\"", events, StringComparison.Ordinal);
+        Assert.Contains("\"source\":\"loopback\"", events, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Start_WithOnlineMode_AndNoRenderDevice_FailsWithAnActionableMessage()
+    {
+        using var harness = CliHarness.Create();
+        harness.WriteOnlineCaptureConfig();
+        // No render device is offered, so loopback cannot start.
+        harness.Platform.Devices.SetRenderDevices();
+
+        var result = harness.Run("start", "No Loopback", "--mode", "online");
 
         Assert.Equal(1, result.ExitCode);
-        Assert.Contains("offline", result.Error);
-        Assert.Contains("M5", result.Error);
+        Assert.Contains("render device", result.Error, StringComparison.OrdinalIgnoreCase);
 
-        // No session directory may be created for a rejected mode.
+        // No session directory may be created when the render device cannot be resolved.
         var sessionsRoot = Path.Combine(harness.DataRoot, "sessions");
         Assert.True(!Directory.Exists(sessionsRoot) || Directory.GetDirectories(sessionsRoot).Length == 0);
+    }
+
+    [Fact]
+    public void Start_WithAnInvalidLoopbackMode_FailsBeforeAnySessionIsCreated()
+    {
+        using var harness = CliHarness.Create();
+        harness.WriteOnlineCaptureConfig(loopbackMode: "bogus");
+        harness.Platform.Devices.SetRenderDevices(
+            new CaptureDeviceInfo("render-default", "Test Speakers", true));
+
+        var result = harness.Run("start", "Bad Loopback", "--mode", "online");
+
+        Assert.Equal(1, result.ExitCode);
+        Assert.Contains("loopback_mode", result.Error, StringComparison.Ordinal);
+        Assert.Contains("bogus", result.Error, StringComparison.Ordinal);
+        Assert.Contains("system", result.Error, StringComparison.Ordinal);
+
+        // No session directory, manifest or audio/loopback/ may exist: the mode is part of
+        // "can this session record?", so it has to be answered before publication
+        // (docs/M1_WINDOWS_VALIDATION.md section 13).
+        var sessionsRoot = Path.Combine(harness.DataRoot, "sessions");
+        Assert.True(!Directory.Exists(sessionsRoot) || Directory.GetDirectories(sessionsRoot).Length == 0);
+    }
+
+    [Fact]
+    public void Start_WhenLoopbackCaptureCannotBeBuilt_PrintsTheActionableReasonOnStderr()
+    {
+        using var harness = CliHarness.Create();
+        harness.WriteOnlineCaptureConfig(loopbackMode: "process", processName: "WeMeet");
+        harness.Platform.Devices.SetRenderDevices(
+            new CaptureDeviceInfo("render-default", "Test Speakers", true));
+
+        // The process-loopback target is resolved by the platform boundary when it builds the
+        // capture source, which is after the session has been published. The operator still
+        // has to see why the start failed, not only a generic message: the session cannot
+        // report that reason anywhere except events.jsonl unless the CLI relays it.
+        var reason =
+            "Process loopback target 'WeMeet' is not currently running. " +
+            "Start the meeting application before beginning capture, or use the baseline 'system' loopback.";
+        harness.Platform.Sources.LoopbackFallback = _ => throw new DeviceUnavailableException(reason);
+
+        var result = harness.Run("start", "Process Loopback", "--mode", "online");
+
+        Assert.Equal(1, result.ExitCode);
+        Assert.Contains(reason, result.Error, StringComparison.Ordinal);
+
+        // This failure happens after publication, so the session is left INTERRUPTED with an
+        // empty loopback tree rather than not existing at all.
+        var sessionsRoot = Path.Combine(harness.DataRoot, "sessions");
+        var sessionDirectory = Directory.GetDirectories(sessionsRoot).Single();
+        var manifest = File.ReadAllText(Path.Combine(sessionDirectory, "session.json"));
+        Assert.Contains("\"status\": \"INTERRUPTED\"", manifest, StringComparison.Ordinal);
+        Assert.Contains("capture_start_failed", manifest, StringComparison.Ordinal);
+        Assert.Empty(Directory.GetFiles(Path.Combine(sessionDirectory, "audio", "loopback")));
+    }
+
+    [Fact]
+    public void Devices_ListsRenderEndpointsForTheLoopbackSource()
+    {
+        using var harness = CliHarness.Create();
+        harness.WriteOnlineCaptureConfig(loopbackMode: "process", processName: "WeMeet", renderDeviceId: "render-2");
+        harness.Platform.Devices.Replace(new CaptureDeviceInfo("mic-1", "USB Microphone", true));
+        harness.Platform.Devices.SetRenderDevices(
+            new CaptureDeviceInfo("render-1", "Studio Speakers", true),
+            new CaptureDeviceInfo("render-2", "Meeting Headset", false));
+
+        var result = harness.Run("devices");
+
+        Assert.Equal(0, result.ExitCode);
+
+        // The render endpoints are what system/process loopback captures from, so they are
+        // listed separately from the capture endpoints.
+        Assert.Contains("active render devices (loopback source):", result.Output, StringComparison.Ordinal);
+        Assert.Contains("Studio Speakers", result.Output, StringComparison.Ordinal);
+        Assert.Contains("Meeting Headset", result.Output, StringComparison.Ordinal);
+        Assert.Contains("render-1", result.Output, StringComparison.Ordinal);
+        Assert.Contains("render-2", result.Output, StringComparison.Ordinal);
+
+        // The configured loopback target is named, and the configured render endpoint is
+        // marked so an operator can see which one a recording would use.
+        Assert.Contains("configured loopback: mode=process", result.Output, StringComparison.Ordinal);
+        Assert.Contains("render device=render-2", result.Output, StringComparison.Ordinal);
+        Assert.Contains("process='WeMeet'", result.Output, StringComparison.Ordinal);
+        Assert.Contains("Meeting Headset  (configured)", result.Output, StringComparison.Ordinal);
+        Assert.Contains("Studio Speakers  (system default)", result.Output, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Devices_WithNoRenderEndpoint_SaysSoWithoutFailing()
+    {
+        using var harness = CliHarness.Create();
+        harness.WriteOnlineCaptureConfig();
+        harness.Platform.Devices.SetRenderDevices();
+
+        var result = harness.Run("devices");
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.Contains("no active render devices were found.", result.Output, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Start_WhenOneTrackIsLost_ExitsNonZeroAndReportsTheDegradedTrack()
+    {
+        // A lost track makes the session degraded, and `meetcap start` reserves exit 0 for a clean
+        // run (docs/DEVELOPMENT.md section 8). docs/M1_WINDOWS_VALIDATION.md checklist 13.3 is the
+        // manual step for exactly this scenario, so the exit code it tells a human to expect has to
+        // be pinned here.
+        using var harness = CliHarness.Create();
+        harness.WriteOnlineCaptureConfig(chunkSeconds: 1);
+        harness.Platform.Devices.SetRenderDevices(
+            new CaptureDeviceInfo("render-default", "Test Speakers", true));
+
+        var startTask = Task.Run(() => harness.Run("start", "Online Partial Loss", "--mode", "online"));
+
+        var sessionDirectory = WaitForSessionDirectory(harness.DataRoot);
+        Assert.NotNull(sessionDirectory);
+        WaitForActiveSession(harness.DataRoot);
+
+        var loopbackSource = await WaitForLoopbackSource(harness);
+        Assert.Equal(1, loopbackSource.StartCount);
+
+        // The render endpoint disappears and the loopback source stops: the track cannot recover
+        // (the endpoint is gone) and ends fatally, while the microphone track keeps recording.
+        harness.Platform.Devices.SetRenderDevices();
+        loopbackSource.Stop();
+
+        var eventsPath = Path.Combine(sessionDirectory!, "events.jsonl");
+        Assert.True(
+            await WaitForEvent(eventsPath, "capture.device_lost_fatal"),
+            $"the loopback track never reported a fatal loss; events: {ReadTextSharing(eventsPath)}");
+
+        // End the session now that the loss is recorded; the mic track stops cleanly.
+        harness.Run("stop");
+        var start = await AwaitBounded(
+            startTask,
+            TimeSpan.FromSeconds(90),
+            "meetcap start --mode online did not finish after one track was lost");
+
+        // The recording itself was otherwise clean — the mic track kept recording and every chunk
+        // is durable — but the lost track makes the session degraded, so the run is not "clean".
+        Assert.Equal(1, start.ExitCode);
+        Assert.Contains(
+            "the session ended with reported audio or storage problems",
+            start.Error,
+            StringComparison.Ordinal);
+        Assert.Contains("degraded: yes", start.Output, StringComparison.Ordinal);
+
+        // The per-track lines name the degraded track and its reason.
+        Assert.Contains("  mic: ", start.Output, StringComparison.Ordinal);
+        Assert.Contains("  loopback: ", start.Output, StringComparison.Ordinal);
+        Assert.Contains("degraded (device_lost)", start.Output, StringComparison.Ordinal);
+
+        // The healthy track's audio is still durable, and the failed track's tail was finalized.
+        Assert.NotEmpty(Directory.GetFiles(Path.Combine(sessionDirectory!, "audio", "mic"), "*.wav"));
+        Assert.Empty(Directory.GetFiles(Path.Combine(sessionDirectory!, "audio", "mic"), "*.part"));
+        Assert.Empty(Directory.GetFiles(Path.Combine(sessionDirectory!, "audio", "loopback"), "*.part"));
     }
 
     [Fact]
@@ -416,6 +620,69 @@ public class CaptureCommandTests
         Assert.Equal(1, result.ExitCode);
         Assert.Contains("was not found", result.Output);
         Assert.Contains("meetcap status", result.Error);
+    }
+
+    /// <summary>
+    /// Waits until the online session has built and started the loopback capture source, so a test
+    /// can fail that track without racing session startup.
+    /// </summary>
+    private static async Task<FakeCaptureSource> WaitForLoopbackSource(CliHarness harness)
+    {
+        var deadline = Environment.TickCount64 + 30_000;
+        while (Environment.TickCount64 < deadline)
+        {
+            var started = harness.Platform.Sources.LoopbackCreated.FirstOrDefault(s => s.StartCount == 1);
+            if (started is not null)
+            {
+                return started;
+            }
+
+            await Task.Delay(25).ConfigureAwait(false);
+        }
+
+        throw new TimeoutException("the online session never started a loopback capture source.");
+    }
+
+    /// <summary>Waits until <paramref name="eventName"/> appears in the session's event log.</summary>
+    private static async Task<bool> WaitForEvent(string eventsPath, string eventName)
+    {
+        var deadline = Environment.TickCount64 + 30_000;
+        while (Environment.TickCount64 < deadline)
+        {
+            if (ReadTextSharing(eventsPath).Contains($"\"{eventName}\"", StringComparison.Ordinal))
+            {
+                return true;
+            }
+
+            await Task.Delay(50).ConfigureAwait(false);
+        }
+
+        return false;
+    }
+
+    /// <summary>Reads a file the recorder still holds open, for diagnostics and event polling.</summary>
+    private static string ReadTextSharing(string path)
+    {
+        if (!File.Exists(path))
+        {
+            return string.Empty;
+        }
+
+        try
+        {
+            using var stream = new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            using var reader = new StreamReader(stream);
+            return reader.ReadToEnd();
+        }
+        catch (IOException)
+        {
+            // The recorder may be mid-write; the next poll will see more.
+            return string.Empty;
+        }
     }
 
     /// <summary>

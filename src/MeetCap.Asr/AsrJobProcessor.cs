@@ -552,14 +552,24 @@ public sealed class AsrJobProcessor
     }
 
     /// <summary>
-    /// Rebuilds <c>transcript/raw.jsonl</c> as the ordered concatenation of every job's
-    /// <c>normalized.jsonl</c> for the session.
+    /// Rebuilds <c>transcript/raw.jsonl</c> as the merged, session-relative timeline of
+    /// every job's <c>normalized.jsonl</c> for the session.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Deriving the session transcript from the per-job artifacts keeps the write
     /// idempotent: finishing the same job twice produces the same file, because the job's
     /// own contribution is replaced rather than appended. Appending would duplicate every
     /// segment after a crash between the transcript write and the terminal status update.
+    /// </para>
+    /// <para>
+    /// An online session transcribes the microphone and loopback tracks independently, so
+    /// the segments arrive from two per-track batch streams. They are merged onto one
+    /// session-relative timeline (sorted by <c>start_ms</c>) without deleting overlapping
+    /// speech and without losing the source each segment came from
+    /// (docs/ARCHITECTURE.md section 16, docs/ROADMAP.md M5). For a single-track session
+    /// the merge is a stable no-op because a track's segments are already ordered.
+    /// </para>
     /// </remarks>
     private void RebuildRawTranscript(SessionArtifactPaths paths, string sessionId)
     {
@@ -578,7 +588,8 @@ public sealed class AsrJobProcessor
             segments.AddRange(_transcripts.ReadJsonl(normalizedPath));
         }
 
-        _transcripts.WriteJsonl(paths.RawTranscriptJsonl, segments);
+        var merged = TranscriptMerger.Merge(segments);
+        _transcripts.WriteJsonl(paths.RawTranscriptJsonl, merged);
     }
 
     private AsrJobProcessResult HandleTransient(AsrJob job, string code, string message)

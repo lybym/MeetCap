@@ -382,7 +382,37 @@ section 9.2.
 A capture device that disappears ends only the current capture segment. The session
 closes the audio already captured, waits, re-resolves the configured endpoint, and
 restarts capture behind the same session; a device that cannot be recovered ends the
-session with everything already captured still closed and durable.
+session with everything already captured still closed and durable. In an online session
+that final part is per track: the unrecoverable track closes and indexes its own final
+chunk as it ends, and the other track keeps recording (section 7.2).
+
+### 7.2 M5 implementation: dual-track capture
+
+An online session runs the same boundary twice — once for the microphone track and once
+for the loopback track — through `IAudioDeviceEnumerator.EnumerateRenderDevices` /
+`GetDefaultRenderDevice` / `FindRenderDevice` (render endpoints) and
+`IAudioCaptureSourceFactory.CreateLoopback`. The loopback source is built with NAudio 3's
+`WasapiRecorderBuilder.WithLoopbackCapture` (system, the baseline) or
+`.WithProcessLoopback` (process, the additive option), which produces the same
+span-based `WasapiRecorder` the microphone uses, so the loopback track reuses the
+`NAudioCaptureSource` adapter and no raw `ActivateAudioInterfaceAsync` / COM plumbing is
+recreated (section 2).
+
+`RecordingSession` owns one `CaptureTrack` per source. Each `CaptureTrack` is a
+self-contained copy of the M1/M2 capture-consumer-recovery runtime: its own capture
+source, bounded queue, `ChunkSpool`, `CaptureTimeline`, `CaptureBacklogMonitor` and
+device-loss recovery. The microphone and loopback queues are independent, so one capture
+callback never waits for the other (docs/RELIABILITY.md section 3), and a track that
+loses its device and cannot recover ends only itself — the other track keeps recording
+(docs/RELIABILITY.md section 8). The session ends when every track has ended, a stop is
+requested, or a storage failure occurs; a single track's fatal loss marks that track
+degraded and records `end_reason` on its `track_health` entry without ending the session.
+
+The M4 batch builder already groups chunks per source, so each track is independently
+transcribed through file ASR and `asr/batches/<source>/` keeps the two tracks separate.
+`TranscriptMerger` (MeetCap.Core.Transcripts) merges the two tracks' normalized segments
+onto one session-relative timeline ordered by `start_ms`, preserving `source` and
+overlapping speech rather than deleting it (section 16).
 
 ---
 
@@ -707,9 +737,12 @@ Three properties of that ordering are deliberate:
   timeline without hiding it: the window closes on captured audio time, not on wall-clock span,
   so a device outage produces a batch whose declared span is longer than the audio inside it,
   and the manifest states where each chunk really sits.
-- **Recovery is idempotent.** The job id is derived from the batch artifact path
-  (`job_batch-NNNNNN`), so re-running recovery against a batch file that already has a job is a
-  no-op. `RecoverFinalizedBatches` re-queues a finalized batch whose job row is missing and
+- **Recovery is idempotent.** The job id is derived from the batch artifact path and its session
+  (`job_<session>_<source>_batch-NNNNNN`), so re-running recovery against a batch file that already
+  has a job is a no-op. The session is part of the identity because batch numbering restarts at 1
+  per track per session while `asr_jobs` is one table shared by every session in a data root; the
+  idempotency check itself matches `input_artifact` within the session, which also recognises rows
+  written before the id carried those scopes. `RecoverFinalizedBatches` re-queues a finalized batch whose job row is missing and
   discards any `.part` left by an unfinished batch; the chunks it would have contained are still
   durable and are picked up by the next window. It runs from both `meetcap start` and
   `meetcap asr resume`, because the documented restart entry point has to be able to see the whole

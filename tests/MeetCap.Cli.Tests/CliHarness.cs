@@ -111,6 +111,42 @@ internal sealed class CliHarness : IDisposable
             "enabled = false\n");
 
     /// <summary>
+    /// Writes an online (dual-track) capture configuration pointing at the temporary data
+    /// root, so a test can exercise the M5 microphone + loopback path through the real
+    /// command tree (docs/ROADMAP.md M5).
+    /// </summary>
+    public void WriteOnlineCaptureConfig(
+        int chunkSeconds = 1,
+        string loopbackMode = "system",
+        string renderDeviceId = "default",
+        string processName = "",
+        double minimumFreeSpaceGb = 1)
+        => WriteConfig(
+            "config_version = 1\n" +
+            "\n" +
+            "[app]\n" +
+            "default_title = \"Untitled Meeting\"\n" +
+            "\n" +
+            "[capture]\n" +
+            "default_mode = \"online\"\n" +
+            $"chunk_seconds = {chunkSeconds}\n" +
+            "buffer_seconds = 5\n" +
+            "flush_interval_ms = 200\n" +
+            "\n" +
+            "[capture.online]\n" +
+            "microphone_device_id = \"default\"\n" +
+            $"loopback_mode = \"{loopbackMode}\"\n" +
+            $"render_device_id = \"{renderDeviceId}\"\n" +
+            $"process_name = \"{processName}\"\n" +
+            "\n" +
+            "[storage]\n" +
+            $"data_root = '{DataRoot}'\n" +
+            $"minimum_free_space_gb = {minimumFreeSpaceGb}\n" +
+            "\n" +
+            "[asr]\n" +
+            "enabled = false\n");
+
+    /// <summary>
     /// Writes a capture configuration with M4 live file-ASR enabled, and installs a scripted
     /// provider stand-in so no test reaches the real Volcengine service.
     /// </summary>

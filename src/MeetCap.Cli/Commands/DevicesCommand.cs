@@ -21,14 +21,18 @@ internal static class DevicesCommand
         context.Secrets.UpdateFrom(load.Configuration);
 
         var configuredDeviceId = load.Configuration.Capture.Offline.MicrophoneDeviceId;
+        var online = load.Configuration.Capture.Online;
+        var configuredRenderId = online.RenderDeviceId;
 
         IReadOnlyList<CaptureDeviceInfo> devices;
+        IReadOnlyList<CaptureDeviceInfo> renderDevices;
+        var platform = context.CreateCapturePlatform();
         try
         {
             // Enumerating devices must not create a database or touch any session, so
             // this command talks to the platform directly.
-            devices = CaptureService.OrderDevices(
-                context.CreateCapturePlatform().Devices.EnumerateCaptureDevices());
+            devices = CaptureService.OrderDevices(platform.Devices.EnumerateCaptureDevices());
+            renderDevices = CaptureService.OrderDevices(platform.Devices.EnumerateRenderDevices());
         }
         catch (MeetCapException ex)
         {
@@ -46,31 +50,70 @@ internal static class DevicesCommand
         if (devices.Count == 0)
         {
             context.Out.WriteLine("no active capture devices were found.");
-            return Task.FromResult(0);
         }
-
-        context.Out.WriteLine();
-        context.Out.WriteLine("active capture devices:");
-
-        foreach (var device in devices)
+        else
         {
-            var markers = new List<string>();
-            if (device.IsDefault)
-            {
-                markers.Add("system default");
-            }
+            context.Out.WriteLine();
+            context.Out.WriteLine("active capture devices:");
 
-            if (IsConfigured(device, configuredDeviceId))
+            foreach (var device in devices)
             {
-                markers.Add("configured");
-            }
+                var markers = new List<string>();
+                if (device.IsDefault)
+                {
+                    markers.Add("system default");
+                }
 
-            var suffix = markers.Count == 0 ? string.Empty : "  (" + string.Join(", ", markers) + ")";
-            context.Out.WriteLine($"  {device.DisplayName}{suffix}");
-            context.Out.WriteLine($"      id: {device.Id}");
+                if (IsConfigured(device, configuredDeviceId))
+                {
+                    markers.Add("configured");
+                }
+
+                var suffix = markers.Count == 0 ? string.Empty : "  (" + string.Join(", ", markers) + ")";
+                context.Out.WriteLine($"  {device.DisplayName}{suffix}");
+                context.Out.WriteLine($"      id: {device.Id}");
+            }
         }
 
-        Logger(context).LogInformation("devices: {Count} active capture device(s)", devices.Count);
+        // Render endpoints are the source for system/process loopback capture
+        // (docs/ARCHITECTURE.md section 7, docs/ROADMAP.md M5).
+        context.Out.WriteLine();
+        context.Out.WriteLine(
+            $"configured loopback: mode={online.LoopbackMode}, " +
+            $"render device={Describe(configuredRenderId)}" +
+            (string.IsNullOrWhiteSpace(online.ProcessName) ? string.Empty : $", process='{online.ProcessName}'"));
+
+        if (renderDevices.Count == 0)
+        {
+            context.Out.WriteLine("no active render devices were found.");
+        }
+        else
+        {
+            context.Out.WriteLine("active render devices (loopback source):");
+
+            foreach (var device in renderDevices)
+            {
+                var markers = new List<string>();
+                if (device.IsDefault)
+                {
+                    markers.Add("system default");
+                }
+
+                if (IsConfigured(device, configuredRenderId))
+                {
+                    markers.Add("configured");
+                }
+
+                var suffix = markers.Count == 0 ? string.Empty : "  (" + string.Join(", ", markers) + ")";
+                context.Out.WriteLine($"  {device.DisplayName}{suffix}");
+                context.Out.WriteLine($"      id: {device.Id}");
+            }
+        }
+
+        Logger(context).LogInformation(
+            "devices: {Capture} active capture device(s), {Render} active render device(s)",
+            devices.Count,
+            renderDevices.Count);
         return Task.FromResult(0);
     }
 

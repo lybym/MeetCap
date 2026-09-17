@@ -170,8 +170,100 @@ public class CaptureServiceTests
     }
 
     [Fact]
+    public async Task PrepareSession_ForProcessLoopback_CarriesTheModeAndProcessTarget()
+    {
+        // `capture.online.loopback_mode = "process"` is the option that decides whether
+        // NAudioCaptureSourceFactory builds WithProcessLoopback or WithLoopbackCapture. That
+        // COM-bound branch cannot run in CI, but the wiring up to the request can and must:
+        // the mode and the process name have to survive from configuration into the
+        // LoopbackCaptureRequest, or process loopback would silently behave like system
+        // loopback (docs/ROADMAP.md M5, docs/CONFIGURATION.md).
+        using var harness = new SessionHarness(
+            mode: "online",
+            loopbackMode: LoopbackModes.Process,
+            loopbackProcessName: "WeMeet");
+        var factory = new RecordingLoopbackFactory();
+        harness.Sources.LoopbackFallback = factory.CreateLoopback;
+
+        var session = harness.Service.PrepareSession("Process Loopback");
+        using var cancellation = new CancellationTokenSource();
+        var run = session.RunAsync(cancellation.Token);
+
+        Assert.True(await Wait.UntilAsync(() => factory.Requests.Count > 0), "the loopback source was never requested");
+        cancellation.Cancel();
+        await Wait.ForAsync(run, timeoutMs: 60_000, "the process-loopback session");
+
+        var request = Assert.Single(factory.Requests);
+        Assert.Equal(LoopbackMode.Process, request.Mode);
+        Assert.True(request.IsProcessLoopback);
+        Assert.Equal("WeMeet", request.ProcessName);
+        Assert.Equal(harness.RenderDevice.Id, request.RenderDevice.Id);
+    }
+
+    [Fact]
+    public async Task PrepareSession_ForSystemLoopback_RequestsTheBaselineMode()
+    {
+        using var harness = new SessionHarness(mode: "online", loopbackMode: LoopbackModes.System);
+        var factory = new RecordingLoopbackFactory();
+        harness.Sources.LoopbackFallback = factory.CreateLoopback;
+
+        var session = harness.Service.PrepareSession("System Loopback");
+        using var cancellation = new CancellationTokenSource();
+        var run = session.RunAsync(cancellation.Token);
+
+        Assert.True(await Wait.UntilAsync(() => factory.Requests.Count > 0), "the baseline loopback source was never requested");
+        cancellation.Cancel();
+        await Wait.ForAsync(run, timeoutMs: 60_000, "the system-loopback session");
+
+        var request = Assert.Single(factory.Requests);
+        Assert.Equal(LoopbackMode.System, request.Mode);
+        Assert.False(request.IsProcessLoopback);
+        Assert.Empty(request.ProcessName);
+    }
+
+    [Fact]
+    public void PrepareSession_WithAnInvalidLoopbackMode_LeavesNoSessionBehind()
+    {
+        // An unusable capture.online.loopback_mode must be refused before the session
+        // directory, manifest, sessions row and audio/loopback/ exist, rather than after
+        // publication (docs/RELIABILITY.md section 16).
+        using var harness = new SessionHarness(mode: "online", loopbackMode: "bogus");
+        var sessionsRoot = Path.Combine(harness.DataRoot, "sessions");
+        var directoriesBefore = Directory.Exists(sessionsRoot) ? Directory.GetDirectories(sessionsRoot).Length : 0;
+        var rowsBefore = harness.Database.Sessions.ListIds().Count;
+
+        Assert.Throws<ArgumentException>(() => harness.Service.PrepareSession("Bad Loopback Mode"));
+
+        var directoriesAfter = Directory.Exists(sessionsRoot) ? Directory.GetDirectories(sessionsRoot).Length : 0;
+        Assert.Equal(directoriesBefore, directoriesAfter);
+        Assert.Equal(rowsBefore, harness.Database.Sessions.ListIds().Count);
+    }
+
+    [Fact]
     public void OrderDevices_HandlesAnEmptyList()
     {
         Assert.Empty(CaptureService.OrderDevices(Array.Empty<CaptureDeviceInfo>()));
+    }
+
+    /// <summary>
+    /// A capture-source factory that records the loopback requests it is asked to build, so a
+    /// test can assert what configuration reached the platform audio boundary. The fakes'
+    /// <c>LoopbackFallback</c> hook is internal to the test assembly, so this wraps it rather
+    /// than being settable directly.
+    /// </summary>
+    private sealed class RecordingLoopbackFactory : IAudioCaptureSourceFactory
+    {
+        private readonly List<LoopbackCaptureRequest> _requests = new();
+
+        public IReadOnlyList<LoopbackCaptureRequest> Requests => _requests;
+
+        public IAudioCaptureSource Create(AudioSource source, CaptureDeviceInfo device)
+            => throw new NotSupportedException("This fake records loopback requests only.");
+
+        public IAudioCaptureSource CreateLoopback(LoopbackCaptureRequest request)
+        {
+            _requests.Add(request);
+            return new FakeCaptureSource(TestAudio.Formats.Mono48kPcm, request.RenderDevice, AudioSource.Loopback);
+        }
     }
 }
