@@ -66,6 +66,7 @@ internal static class CommandTree
         var importCommand = BuildImport(secrets, loggerFactory, storeFactory, output, error, environment, asrHttpHandler);
         var asrCommand = BuildAsr(secrets, loggerFactory, storeFactory, output, error, environment, asrHttpHandler);
         var sessionCommand = BuildSession(secrets, loggerFactory, storeFactory, output, error, environment, platformFactory, asrHttpHandler);
+        var speakersCommand = BuildSpeakers(secrets, loggerFactory, storeFactory, output, error, environment, platformFactory, asrHttpHandler);
 
         root.Subcommands.Add(configCommand);
         root.Subcommands.Add(statusCommand);
@@ -75,11 +76,13 @@ internal static class CommandTree
         root.Subcommands.Add(importCommand);
         root.Subcommands.Add(asrCommand);
         root.Subcommands.Add(sessionCommand);
+        root.Subcommands.Add(speakersCommand);
 
         root.SetAction(parseResult => RequireVerb(parseResult, root, error));
         configCommand.SetAction(parseResult => RequireSubcommand(parseResult, configCommand, error));
         asrCommand.SetAction(parseResult => RequireSubcommand(parseResult, asrCommand, error));
         sessionCommand.SetAction(parseResult => RequireSubcommand(parseResult, sessionCommand, error));
+        speakersCommand.SetAction(parseResult => RequireSubcommand(parseResult, speakersCommand, error));
         statusCommand.SetAction((parseResult, _) =>
             StatusCommand.Run(CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory, asrHttpHandler)));
         devicesCommand.SetAction((parseResult, _) =>
@@ -233,6 +236,102 @@ internal static class CommandTree
 
         var command = new Command("session", "Repair and audit recorded sessions.");
         command.Subcommands.Add(repair);
+        return command;
+    }
+
+    /// <summary>Builds the <c>meetcap speakers</c> command family (M6/#8).</summary>
+    private static Command BuildSpeakers(
+        SecretRegistry secrets,
+        ILoggerFactory loggerFactory,
+        Func<string, IConfigurationStore> storeFactory,
+        TextWriter output,
+        TextWriter error,
+        CliEnvironment? environment,
+        ICapturePlatformFactory? platformFactory,
+        HttpMessageHandler? asrHttpHandler)
+    {
+        var list = new Command("list", "List enrolled speakers.");
+        list.SetAction(parseResult =>
+        {
+            var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory, asrHttpHandler);
+            return SpeakersCommand.List(context);
+        });
+
+        var nameArg = new Argument<string>("name")
+        {
+            Description = "Display name for the speaker (or an existing name to add another sample).",
+        };
+
+        var fileOpt = new Option<string?>("--file", "-f")
+        {
+            Description = "Path to a WAV file (16-bit PCM or 32-bit float) to enroll from.",
+        };
+
+        var enroll = new Command("enroll", "Enroll a named speaker from a WAV file.");
+        enroll.Arguments.Add(nameArg);
+        enroll.Options.Add(fileOpt);
+        enroll.SetAction((parseResult, cancellationToken) =>
+        {
+            var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory, asrHttpHandler);
+            return SpeakersCommand.EnrollAsync(
+                context,
+                parseResult.GetValue(nameArg) ?? string.Empty,
+                parseResult.GetValue(fileOpt) ?? string.Empty,
+                cancellationToken);
+        });
+
+        var assignSession = new Option<string>("--session", "-s")
+        {
+            Description = "The session whose speaker label is being assigned.",
+        };
+
+        var assignLabel = new Option<string>("--label", "-l")
+        {
+            Description = "The anonymous speaker label to bind (e.g. speaker_0).",
+        };
+
+        var assignName = new Option<string>("--name", "-n")
+        {
+            Description = "The enrolled speaker's display name to bind to this label.",
+        };
+
+        var assign = new Command("assign", "Manually bind an anonymous speaker label to an enrolled person (locked).");
+        assign.Options.Add(assignSession);
+        assign.Options.Add(assignLabel);
+        assign.Options.Add(assignName);
+        assign.SetAction(parseResult =>
+        {
+            var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory, asrHttpHandler);
+            return SpeakersCommand.Assign(
+                context,
+                parseResult.GetValue(assignSession) ?? string.Empty,
+                parseResult.GetValue(assignLabel) ?? string.Empty,
+                parseResult.GetValue(assignName) ?? string.Empty);
+        });
+
+        var attrSession = new Option<string>("--session", "-s")
+        {
+            Description = "The session to attribute speakers for.",
+        };
+
+        var attribute = new Command(
+            "attribute",
+            "Run the speaker attribution pipeline and write final.jsonl, final.md, and attribution.json.");
+        attribute.Options.Add(attrSession);
+        attribute.SetAction((parseResult, cancellationToken) =>
+        {
+            var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory, asrHttpHandler);
+            return SpeakersCommand.AttributeAsync(
+                context,
+                parseResult.GetValue(attrSession) ?? string.Empty,
+                cancellationToken);
+        });
+
+        var command = new Command("speakers", "Enroll, assign, and attribute speakers.");
+        command.Subcommands.Add(list);
+        command.Subcommands.Add(enroll);
+        command.Subcommands.Add(assign);
+        command.Subcommands.Add(attribute);
         return command;
     }
 

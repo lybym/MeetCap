@@ -470,6 +470,60 @@ Previously enrolled people appear as useful candidates in later recordings and m
 
 A local diarization pipeline is not required for MVP unless real-world validation demonstrates that Volcengine speaker separation is inadequate.
 
+## Implementation status
+
+Implemented (issue #8):
+
+- `MeetCap.Core.Speakers`: speaker entity, embedding, candidate, assignment, attribution
+  artifact, and the `ISpeakerIdentityProvider` / `ISpeakerStore` contracts. The
+  `SpeakerMatchingPolicy` is pure domain logic that applies the normative priority
+  `manual > high-confidence voiceprint > unknown` with configurable threshold and margin
+  (docs/ARCHITECTURE.md section 17.3);
+- `0004_speakers` migration (docs/DATA_MODEL.md section 14): creates the `speakers`,
+  `speaker_embeddings`, and `speaker_assignments` tables with `CHECK` constraints on
+  `source` and `active`, a `UNIQUE` on `display_name`, `ON DELETE CASCADE` for embeddings,
+  and `ON DELETE SET NULL` for assignments, plus a `UNIQUE (session_id, speaker_label)`
+  so upsert is idempotent;
+- `MeetCap.Speakers`: the registry workflow (enrollment stores multiple embeddings per
+  person), `CleanSampleSelector` (pure logic that groups adjacent segments into 5-15s
+  clean ranges), `SpeakerAttributionService` (resolves each anonymous label through
+  manual > voiceprint > unknown and produces attributed segments without modifying
+  `raw_text`), and the per-session `attribution.json` artifact;
+- `MeetCap.Speakers.SherpaOnnx`: the default local identity provider, backed by the
+  sherpa-onnx .NET runtime and the 3D-Speaker ERes2Net-base ONNX model. The default
+  Windows runtime does not require Python or PyTorch. A missing model is reported as a
+  configuration error before any session state is touched (docs/ARCHITECTURE.md section 20);
+- `meetcap speakers list`, `meetcap speakers enroll <name> --file <path>`,
+  `meetcap speakers assign --session --label --name`, and
+  `meetcap speakers attribute --session`: the CLI composition for enrollment, manual
+  assignment (locked), and the attribution pipeline that writes `transcript/final.jsonl`,
+  `transcript/final.md`, and `speakers/attribution.json`.
+
+Automated coverage:
+
+```text
+tests/MeetCap.Core.Tests/Speakers/SpeakerMatchingPolicyTests.cs
+tests/MeetCap.Persistence.Tests/Storage/SqliteSpeakerStoreTests.cs
+tests/MeetCap.Persistence.Tests/Storage/SpeakerMigrationTests.cs
+tests/MeetCap.Speakers.Tests/CosineSimilarityTests.cs
+tests/MeetCap.Speakers.Tests/CleanSampleSelectorTests.cs
+tests/MeetCap.Speakers.Tests/SpeakerRegistryTests.cs
+tests/MeetCap.Speakers.Tests/SpeakerAttributionServiceTests.cs
+tests/MeetCap.Cli.Tests/SpeakersCommandTests.cs
+```
+
+Not implemented in this milestone, and deliberately out of scope:
+
+- real-world voiceprint validation with the actual 3D-Speaker model and real meeting audio
+  (the CI environment has no model file, so the provider boundary is faked in tests;
+  docs/DEVELOPMENT.md section 7);
+- online-mode local-owner assumption / optional mic verification (the attribution service
+  accepts a sample extractor delegate so this can be wired by the CLI composition root
+  in a later iteration);
+- cloud speaker registry (explicitly a non-goal);
+- LLM correction or summary (M9);
+- streaming ASR (M8).
+
 ---
 
 # M7 - ASR quality controls

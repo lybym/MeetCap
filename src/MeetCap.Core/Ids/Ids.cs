@@ -9,12 +9,21 @@ public static class Ids
     public const string SessionPrefix = "ses_";
     public const string JobPrefix = "job_";
     public const string SegmentPrefix = "seg_";
+    public const string SpeakerPrefix = "person_";
+    public const string SpeakerEmbeddingPrefix = "emb_";
+    public const string SpeakerAssignmentPrefix = "asgn_";
 
     public static string NewSessionId() => SessionPrefix + NewToken();
 
     public static string NewJobId() => JobPrefix + NewToken();
 
     public static string NewSegmentId() => SegmentPrefix + NewToken();
+
+    public static string NewSpeakerId() => SpeakerPrefix + NewToken();
+
+    public static string NewSpeakerEmbeddingId() => SpeakerEmbeddingPrefix + NewToken();
+
+    public static string NewSpeakerAssignmentId() => SpeakerAssignmentPrefix + NewToken();
 
     public static string NewSegmentId(string jobId, int index)
     {

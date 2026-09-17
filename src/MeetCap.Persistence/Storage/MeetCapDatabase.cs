@@ -2,6 +2,7 @@ namespace MeetCap.Persistence.Storage;
 
 using MeetCap.Core.Asr;
 using MeetCap.Core.Sessions;
+using MeetCap.Core.Speakers;
 using Microsoft.Data.Sqlite;
 
 /// <summary>
@@ -37,6 +38,13 @@ public sealed class MeetCapDatabase
     /// (<c>docs/ROADMAP.md</c> M4).
     /// </summary>
     public IAsrQueueInspector AsrQueue => new SqliteAsrJobStore(DatabasePath);
+
+    /// <summary>
+    /// The local Speaker Registry (docs/DATA_MODEL.md sections 8-10, docs/ARCHITECTURE.md
+    /// section 17). Stores speakers, embeddings, and per-session assignments. Voiceprints
+    /// and name mappings are sensitive local data (docs/ARCHITECTURE.md section 22).
+    /// </summary>
+    public ISpeakerStore Speakers => new SqliteSpeakerStore(DatabasePath);
 
     /// <summary>True when the database file exists and has been migrated at least once.</summary>
     public bool IsInitialized()

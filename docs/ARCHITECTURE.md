@@ -157,7 +157,11 @@ AudioPipeline           bounded queue, chunk spool, session artifacts, recovery 
 Asr                     live ASR batching, the persistent job state machine driver,
                         transcript assembly, and recording import
 Asr.Volcengine          file-ASR adapter, provider JSON parsing, Polly inside HTTP
-Cli                     composition root: config, status, devices, start, stop, import, asr
+Speakers                speaker registry semantics: enrollment, clean sample selection,
+                        voiceprint attribution, and manual-lock policy coordination
+Speakers.SherpaOnnx     sherpa-onnx + 3D-Speaker ERes2Net-base identity provider
+Cli                     composition root: config, status, devices, start, stop, import,
+                        asr, session, speakers
 ```
 
 `MeetCap.AudioPipeline` sits above `Core` and `Persistence`: it owns the capture

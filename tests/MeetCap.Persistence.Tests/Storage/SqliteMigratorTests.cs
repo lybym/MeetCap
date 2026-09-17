@@ -114,6 +114,7 @@ public class SqliteMigratorTests
             Assert.Contains(1, migrator.SupportedVersions);
             Assert.Contains(2, migrator.SupportedVersions);
             Assert.Contains(3, migrator.SupportedVersions);
+            Assert.Contains(4, migrator.SupportedVersions);
         }
         finally
         {
@@ -126,14 +127,15 @@ public class SqliteMigratorTests
     {
         // Two scripts sharing a version would make the second one look already applied,
         // so its tables would never be created at runtime. This asserts the embedded set
-        // is well formed: 0001 (M0 sessions), 0002 (M1 audio_chunks) and 0003 (M3 asr_jobs)
-        // are all present and claim distinct versions.
+        // is well formed: 0001 (M0 sessions), 0002 (M1 audio_chunks), 0003 (M3 asr_jobs)
+        // and 0004 (M6 speakers) are all present and claim distinct versions.
         var versions = new SqliteMigrator().GetMigrations().Select(m => m.Version).ToArray();
 
         Assert.Equal(versions.Length, versions.Distinct().Count());
         Assert.Contains(1, versions);
         Assert.Contains(2, versions);
         Assert.Contains(3, versions);
+        Assert.Contains(4, versions);
     }
 
     [Fact]
