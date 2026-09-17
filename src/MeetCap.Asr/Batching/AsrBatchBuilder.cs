@@ -288,29 +288,34 @@ public sealed class AsrBatchBuilder
         foreach (var file in EnumerateBatchFiles(paths))
         {
             var relativePath = paths.ToRelative(file);
-            if (HasJobForArtifact(jobs, sessionId, relativePath))
+            var batch = TryReadBatchManifest(sessionId, file, relativePath);
+            if (batch is null)
             {
                 continue;
             }
 
-            var batch = TryReadBatchManifest(sessionId, file, relativePath);
-            if (batch is not null)
+            // The manifest names the source, so the job id can be derived from it. Checked
+            // after reading rather than before because the id no longer depends on the file
+            // name alone: two tracks can hold same-named batch files.
+            if (HasJobForArtifact(jobs, sessionId, batch.Source, relativePath))
             {
-                // The batch's own provider/tier, so a recovered orphan is queued for what the
-                // recording was actually configured with rather than for whatever the resuming
-                // process happens to be using. Falls back to the caller's options when the
-                // manifest predates the fields.
-                var provenance = options with
-                {
-                    ProviderName = batch.Provider ?? options.ProviderName,
-                    ServiceTier = batch.Tier ?? options.ServiceTier,
-                };
+                continue;
+            }
 
-                var queued = QueueJob(paths, batch, jobs, provenance, events, onQueued: null);
-                if (queued is not null)
-                {
-                    recovered.Add(queued);
-                }
+            // The batch's own provider/tier, so a recovered orphan is queued for what the
+            // recording was actually configured with rather than for whatever the resuming
+            // process happens to be using. Falls back to the caller's options when the
+            // manifest predates the fields.
+            var provenance = options with
+            {
+                ProviderName = batch.Provider ?? options.ProviderName,
+                ServiceTier = batch.Tier ?? options.ServiceTier,
+            };
+
+            var queued = QueueJob(paths, batch, jobs, provenance, events, onQueued: null);
+            if (queued is not null)
+            {
+                recovered.Add(queued);
             }
         }
 
@@ -707,7 +712,7 @@ public sealed class AsrBatchBuilder
         ISessionEventSink? events,
         Action? onQueued)
     {
-        if (HasJobForArtifact(jobs, batch.SessionId, batch.RelativePath))
+        if (HasJobForArtifact(jobs, batch.SessionId, batch.Source, batch.RelativePath))
         {
             // Idempotent: a job derived from this batch artifact already exists, so the audio
             // must not be queued (and therefore billed) a second time.
@@ -717,7 +722,7 @@ public sealed class AsrBatchBuilder
         var now = options.TimeProvider.GetUtcNow();
         var job = new AsrJob
         {
-            Id = JobIdFor(batch.RelativePath),
+            Id = JobIdFor(batch.Source, batch.RelativePath),
             SessionId = batch.SessionId,
             Source = batch.Source,
             Tier = options.ServiceTier,
@@ -785,9 +790,20 @@ public sealed class AsrBatchBuilder
         return batch;
     }
 
-    private static bool HasJobForArtifact(IAsrJobStore jobs, string sessionId, string relativePath)
+    /// <remarks>
+    /// Two lookups, deliberately. The id lookup finds a job this builder version derived. The
+    /// artifact lookup then also finds a job whose id was derived by the earlier
+    /// file-name-only scheme (<c>job_batch-NNNNNN</c>), so an M4-era row is still recognised as
+    /// "this batch is already queued" after the id gained its source qualifier. Without it,
+    /// recovery would queue the same audio again and bill it twice.
+    /// </remarks>
+    private static bool HasJobForArtifact(
+        IAsrJobStore jobs,
+        string sessionId,
+        string source,
+        string relativePath)
     {
-        if (jobs.Get(JobIdFor(relativePath)) is not null)
+        if (jobs.Get(JobIdFor(source, relativePath)) is not null)
         {
             return true;
         }
@@ -796,24 +812,37 @@ public sealed class AsrBatchBuilder
             .Any(job => string.Equals(job.InputArtifact, relativePath, StringComparison.Ordinal));
     }
 
-    private bool HasJobForArtifact(string sessionId, string relativePath) =>
-        HasJobForArtifact(_jobs, sessionId, relativePath);
+    private bool HasJobForArtifact(string sessionId, string source, string relativePath)
+        => HasJobForArtifact(_jobs, sessionId, source, relativePath);
 
     /// <summary>
-    /// Derives the job id from the batch artifact path, so a batch file and its job are
-    /// matched deterministically and re-running recovery cannot queue the same audio twice.
+    /// Derives the job id from the batch's source and artifact file name, so a batch file and
+    /// its job are matched deterministically and re-running recovery cannot queue the same
+    /// audio twice.
     /// </summary>
-    internal static string JobIdFor(string relativeBatchPath)
+    /// <remarks>
+    /// The source has to be part of the id. Batch numbering restarts at 1 for every track
+    /// (<see cref="NextBatchNumber"/>), so an online session produces both
+    /// <c>asr/batches/mic/batch-000001.wav</c> and
+    /// <c>asr/batches/loopback/batch-000001.wav</c>. Deriving the id from the file name alone
+    /// gave both the id <c>job_batch-000001</c>; because <c>asr_jobs.id</c> is the primary key,
+    /// the second track's job silently replaced the first, and one of the two tracks was never
+    /// transcribed (docs/ARCHITECTURE.md section 7.2, docs/ROADMAP.md M5).
+    /// </remarks>
+    internal static string JobIdFor(string source, string relativeBatchPath)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(source);
         ArgumentException.ThrowIfNullOrWhiteSpace(relativeBatchPath);
 
-        var name = Path.GetFileNameWithoutExtension(relativeBatchPath);
-        var sanitized = new string(name
+        var name = SanitizeForId(Path.GetFileNameWithoutExtension(relativeBatchPath));
+        var track = SanitizeForId(source);
+        return Ids.JobPrefix + track + "_" + name;
+    }
+
+    private static string SanitizeForId(string value)
+        => new(value
             .Select(c => char.IsLetterOrDigit(c) || c is '_' or '-' ? c : '_')
             .ToArray());
-
-        return Ids.JobPrefix + sanitized;
-    }
 
     private int NextBatchNumber(SessionArtifactPaths paths, string source)
     {

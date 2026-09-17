@@ -52,6 +52,17 @@ public sealed record RecordingSessionOutcome(
     /// session has one (docs/ROADMAP.md M5).
     /// </summary>
     public IReadOnlyList<TrackHealth> TrackHealth { get; init; } = Array.Empty<TrackHealth>();
+
+    /// <summary>
+    /// The actionable reason a session failed before capture started, when there was one.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="AbortBeforeStart"/> used to leave this only in <c>events.jsonl</c>, so
+    /// <c>meetcap start</c> could print nothing more useful than "the session did not
+    /// complete cleanly" for a failure whose whole point is that it is actionable
+    /// (docs/DEVELOPMENT.md section 8). Empty for every other outcome.
+    /// </remarks>
+    public string? StartFailureDetail { get; init; }
 }
 
 /// <summary>
@@ -606,6 +617,10 @@ public sealed class RecordingSession : IDisposable
             EndReason: "capture_start_failed")
         {
             CaptureHealth = new AudioBufferHealth { CapacityPackets = capacity },
+            // The session already had to be published before the per-track capture sources
+            // could be built, so this outcome is the only place the operator can still be
+            // told why the start failed (docs/DEVELOPMENT.md section 8).
+            StartFailureDetail = error.Message,
         };
     }
 
@@ -745,9 +760,17 @@ public sealed class RecordingSession : IDisposable
     /// The first non-null track end reason, when the session ended because its tracks
     /// ended on their own (device loss, format change) rather than through a stop request
     /// or a storage failure. The single-track device-loss path keeps its original
-    /// "device_lost" reason this way; a dual-track session whose tracks end independently
-    /// reports the first one that ended (docs/RELIABILITY.md section 8).
+    /// "device_lost" reason this way (docs/RELIABILITY.md section 8).
     /// </summary>
+    /// <remarks>
+    /// The scan follows <em>track-spec order</em>, which is the microphone first and the
+    /// loopback track second (see <c>CaptureService.BuildTrackSpecs</c>), not the order in
+    /// which the tracks actually ended. A dual-track session whose loopback track died
+    /// first but whose microphone also ended for its own reason therefore reports the
+    /// microphone's reason here. Per-track reasons are unaffected: each
+    /// <c>track_health</c> entry carries its own <c>end_reason</c>
+    /// (docs/DATA_MODEL.md section 3).
+    /// </remarks>
     private static string? DominantTrackEndReason(List<CaptureTrack> tracks)
     {
         foreach (var track in tracks)

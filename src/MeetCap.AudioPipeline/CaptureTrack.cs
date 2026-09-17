@@ -294,12 +294,14 @@ internal sealed class CaptureTrack : IDisposable
             {
                 WriteDeviceLostFatal(attempts);
                 EndTrack("device_lost");
+                CompleteWriter();
                 return;
             }
 
             if (replacement is null)
             {
                 // The session ended while capture was being recovered.
+                CompleteWriter();
                 return;
             }
 
@@ -308,6 +310,7 @@ internal sealed class CaptureTrack : IDisposable
                 WriteFormatChangedFatal(_format!, replacement.Format);
                 replacement.Dispose();
                 EndTrack("device_format_changed");
+                CompleteWriter();
                 return;
             }
 
@@ -315,7 +318,22 @@ internal sealed class CaptureTrack : IDisposable
         }
     }
 
-    /// <summary>Completes this track's packet writer so its consumer can drain to completion.</summary>
+    /// <summary>
+    /// Completes this track's packet writer so its consumer can drain to completion and
+    /// finalize the track's open chunk in its own <c>finally</c>.
+    /// </summary>
+    /// <remarks>
+    /// Called by the session once every capture loop has ended, and by
+    /// <see cref="RunCaptureSegmentsAsync"/> on the path where <em>this</em> track ends on
+    /// its own. It must be called on that path too: the fatal branch returns from the
+    /// capture loop, so no further packet can arrive for this track and
+    /// <c>ProcessPacket</c> can never run again. Without it the consumer stays parked
+    /// until every other track ends, leaving this track's tail as a <c>.part</c> with an
+    /// open index row and an unflushed <c>FileStream</c> buffer for the rest of the
+    /// session — which would make the "still closed and durable" claim in the fatal event
+    /// false (docs/RELIABILITY.md section 8, docs/ARCHITECTURE.md section 7.2). The spool
+    /// itself stays consumer-thread-only; this only signals that no more packets follow.
+    /// </remarks>
     public void CompleteWriter() => _channel?.Writer.TryComplete();
 
     /// <summary>The consumer drain for this track's bounded queue.</summary>

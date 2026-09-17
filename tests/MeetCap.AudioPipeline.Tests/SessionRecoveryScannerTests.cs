@@ -1169,15 +1169,61 @@ public class SessionRecoveryScannerTests
         Assert.Equal(2 * SecondBytes, report.RecoveredDataBytes);
     }
 
+    [Fact]
+    public void RecoveryRepairsBothTracksOfAnInterruptedOnlineSession()
+    {
+        // The M2 guarantee this PR relies on per track: a process killed mid-recording leaves
+        // an active .part per source, and startup recovery makes each one durable under its
+        // own source tree. The scanner is source-agnostic by construction, so this pins that
+        // an online session's loopback tree is repaired too, not only audio/mic/.
+        using var workspace = new TempWorkspace(sessionStatus: SessionStatus.Recording);
+        WriteChunk(workspace.Paths, AudioSource.Mic, sequence: 1, dataBytes: 2 * SecondBytes, close: false);
+        WriteChunk(workspace.Paths, AudioSource.Loopback, sequence: 1, dataBytes: 3 * SecondBytes, close: false);
+
+        // A finalized WAV whose index row is still `open` — the crash window between the
+        // atomic rename and the closed-index upsert (SessionGapAuditor/CloseCurrentChunk).
+        WriteFinalWavWithOpenRow(workspace.Paths, workspace.Database, AudioSource.Loopback, sequence: 2, dataBytes: SecondBytes);
+        WriteManifest(workspace.Paths, SessionStatus.Recording);
+
+        var report = new SessionRecoveryScanner(workspace.Database, new FakeClock()).Scan(workspace.DataRoot);
+
+        Assert.Equal(1, report.RecoveredSessions);
+        Assert.False(report.RecoveryIncomplete);
+
+        // Both .part files became durable WAVs in their own source tree, and neither is left
+        // behind for a later scan to re-repair.
+        Assert.False(File.Exists(workspace.Paths.ChunkPartPath(AudioSource.Mic, 1)));
+        Assert.False(File.Exists(workspace.Paths.ChunkPartPath(AudioSource.Loopback, 1)));
+        Assert.True(File.Exists(workspace.Paths.ChunkFinalPath(AudioSource.Mic, 1)));
+        Assert.True(File.Exists(workspace.Paths.ChunkFinalPath(AudioSource.Loopback, 1)));
+        Assert.True(File.Exists(workspace.Paths.ChunkFinalPath(AudioSource.Loopback, 2)));
+
+        // The index keeps the two sources distinct: each repaired chunk carries its own
+        // source, and the renamed loopback chunk is no longer reported as open.
+        var chunks = workspace.Database.Chunks.ListForSession(workspace.SessionId);
+        var mic = chunks.Single(c => c.Source == AudioSource.Mic);
+        Assert.Equal(ChunkStates.Recovered, mic.Status);
+
+        var loopback = chunks.Where(c => c.Source == AudioSource.Loopback).OrderBy(c => c.Sequence).ToList();
+        Assert.Equal(2, loopback.Count);
+        Assert.All(loopback, c => Assert.NotEqual(ChunkStates.Open, c.Status));
+
+        // The session stopped pretending to be recording.
+        Assert.Equal(SessionStatus.Interrupted, workspace.Database.Sessions.Find(workspace.SessionId)!.Status);
+    }
+
     /// <summary>
     /// Writes a chunk the way the pipeline does: <c>close: true</c> finalizes it,
     /// <c>close: false</c> leaves the <c>.part</c> behind exactly as a process kill would.
     /// </summary>
     private static void WriteChunk(SessionPaths paths, int sequence, int dataBytes, bool close)
+        => WriteChunk(paths, AudioSource.Mic, sequence, dataBytes, close);
+
+    private static void WriteChunk(SessionPaths paths, AudioSource source, int sequence, int dataBytes, bool close)
     {
         var writer = new WaveChunkWriter(
-            paths.ChunkPartPath(AudioSource.Mic, sequence),
-            paths.ChunkFinalPath(AudioSource.Mic, sequence),
+            paths.ChunkPartPath(source, sequence),
+            paths.ChunkFinalPath(source, sequence),
             Format,
             capacityBytes: 60L * SecondBytes,
             sequence);
@@ -1220,10 +1266,14 @@ public class SessionRecoveryScannerTests
     /// </summary>
     private static void WriteFinalWavWithOpenRow(
         SessionPaths paths, MeetCapDatabase database, int sequence, int dataBytes)
+        => WriteFinalWavWithOpenRow(paths, database, AudioSource.Mic, sequence, dataBytes);
+
+    private static void WriteFinalWavWithOpenRow(
+        SessionPaths paths, MeetCapDatabase database, AudioSource source, int sequence, int dataBytes)
     {
         var writer = new WaveChunkWriter(
-            paths.ChunkPartPath(AudioSource.Mic, sequence),
-            paths.ChunkFinalPath(AudioSource.Mic, sequence),
+            paths.ChunkPartPath(source, sequence),
+            paths.ChunkFinalPath(source, sequence),
             Format,
             capacityBytes: 60L * SecondBytes,
             sequence);
@@ -1233,11 +1283,11 @@ public class SessionRecoveryScannerTests
 
         database.Chunks.Upsert(new AudioChunkRecord
         {
-            Id = AudioChunkRecord.BuildId(paths.SessionId, AudioSource.Mic, sequence),
+            Id = AudioChunkRecord.BuildId(paths.SessionId, source, sequence),
             SessionId = paths.SessionId,
-            Source = AudioSource.Mic,
+            Source = source,
             Sequence = sequence,
-            RelativePath = paths.RelativeChunkPath(AudioSource.Mic, sequence),
+            RelativePath = paths.RelativeChunkPath(source, sequence),
             StartMs = 0,
             EndMs = 0,
             Format = Format,

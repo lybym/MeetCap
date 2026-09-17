@@ -52,6 +52,17 @@ internal static class StartCommand
             ? load.Configuration.App.DefaultTitle
             : title;
 
+        // Validate the loopback mode the session would use before any session is prepared.
+        // `CaptureService.PrepareSession` also refuses an unparseable mode, but only after a
+        // session directory, manifest and index row would be needed, so checking here keeps
+        // the promise in docs/M1_WINDOWS_VALIDATION.md section 13 that an unusable
+        // loopback_mode fails before any session is created (docs/DEVELOPMENT.md section 8).
+        if (TryDescribeInvalidLoopbackMode(load.Configuration, effectiveMode, out var loopbackError))
+        {
+            context.Error.WriteLine($"meetcap start: {loopbackError}");
+            return 1;
+        }
+
         string dataRoot;
         CaptureSettings settings;
         CaptureService service;
@@ -357,7 +368,52 @@ internal static class StartCommand
             outcome.Status == SessionStatus.Interrupted
                 ? "meetcap start: the session did not complete cleanly; see the session event log."
                 : "meetcap start: the session ended with reported audio or storage problems.");
+
+        // A start that failed before capture began already knows its reason (a missing
+        // process-loopback target, an endpoint that could not be opened). Repeating it here
+        // is what makes the failure actionable from the terminal rather than only from
+        // events.jsonl (docs/DEVELOPMENT.md section 8).
+        if (!string.IsNullOrWhiteSpace(outcome.StartFailureDetail))
+        {
+            context.Error.WriteLine($"meetcap start: {outcome.StartFailureDetail}");
+        }
+
         return 1;
+    }
+
+    /// <summary>
+    /// Reports whether <c>capture.online.loopback_mode</c> would be rejected when an online
+    /// session built its track specs.
+    /// </summary>
+    /// <remarks>
+    /// Only meaningful for an online start: the key configures the loopback track, which an
+    /// offline start never creates. The check mirrors
+    /// <c>CaptureService.BuildTrackSpecs</c>, which parses the same value, so the command and
+    /// the pipeline cannot disagree about which modes are valid.
+    /// </remarks>
+    private static bool TryDescribeInvalidLoopbackMode(
+        MeetCapConfiguration configuration,
+        string effectiveMode,
+        out string error)
+    {
+        error = string.Empty;
+
+        if (!string.Equals(effectiveMode, SessionModes.Online, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var configured = configuration.Capture.Online.LoopbackMode;
+        if (LoopbackModes.TryParse(configured, out _))
+        {
+            return false;
+        }
+
+        error =
+            $"capture.online.loopback_mode='{configured}' is invalid. " +
+            $"Allowed: {LoopbackModes.System} (the baseline) or {LoopbackModes.Process}. " +
+            "Use 'offline' for a single microphone track.";
+        return true;
     }
 
     private static string FormatDuration(long milliseconds)

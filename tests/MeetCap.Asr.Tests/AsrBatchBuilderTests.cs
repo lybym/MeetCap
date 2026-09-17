@@ -4,6 +4,7 @@ using MeetCap.AudioPipeline;
 using MeetCap.AudioPipeline.Wave;
 using MeetCap.Core.Asr;
 using MeetCap.Core.Capture;
+using MeetCap.Core.Ids;
 using MeetCap.Core.Sessions;
 using Xunit;
 
@@ -62,10 +63,11 @@ public class AsrBatchBuilderTests : IDisposable
         long startMs,
         long durationMs,
         byte fill = 0x7f,
-        AudioFormat? format = null)
+        AudioFormat? format = null,
+        string source = AudioSources.Mic)
     {
         var effectiveFormat = format ?? s_format;
-        var relativePath = Path.Combine("audio", "mic", $"{sequence:D6}.wav").Replace('\\', '/');
+        var relativePath = Path.Combine("audio", source, $"{sequence:D6}.wav").Replace('\\', '/');
         var finalPath = Paths.ResolveRelative(relativePath);
         var partPath = finalPath + ".part";
 
@@ -84,7 +86,7 @@ public class AsrBatchBuilderTests : IDisposable
         return new ClosedAudioChunk
         {
             SessionId = SessionId,
-            Source = "mic",
+            Source = source,
             Sequence = sequence,
             FilePath = finalPath,
             RelativePath = relativePath,
@@ -200,6 +202,88 @@ public class AsrBatchBuilderTests : IDisposable
     }
 
     [Fact]
+    public void TwoConcurrentSourcesAreBatchedIndependentlyPerSource()
+    {
+        // An online session closes mic and loopback chunks concurrently, so the builder has to
+        // keep one open window per source and complete them independently: a loopback chunk
+        // must neither advance nor truncate the microphone's window, and each source's batch
+        // artifact and job must name its own source (docs/ARCHITECTURE.md section 7.2,
+        // docs/ROADMAP.md M5).
+        var builder = CreateBuilder(batchSeconds: 20);
+
+        // Interleaved arrival, both tracks starting at session-relative 0.
+        Assert.Null(builder.OnChunkClosed(CreateChunk(1, 0, 10_000, source: AudioSources.Mic)));
+        Assert.Null(builder.OnChunkClosed(CreateChunk(1, 0, 10_000, source: AudioSources.Loopback)));
+
+        // The microphone window reaches 20 s of its own audio, so it closes on the mic chunk
+        // alone — the interleaved loopback chunks contributed nothing to it.
+        var micBatch = builder.OnChunkClosed(CreateChunk(2, 10_000, 10_000, source: AudioSources.Mic));
+
+        Assert.NotNull(micBatch);
+        Assert.Equal(AudioSources.Mic, micBatch!.Source);
+        Assert.StartsWith("asr/batches/mic/", micBatch.RelativePath, StringComparison.Ordinal);
+        Assert.Equal(0, micBatch.StartMs);
+        Assert.Equal(20_000, micBatch.EndMs);
+        Assert.Equal(new[] { "mic", "mic" }, micBatch.Chunks.Select(c => c.Source));
+        Assert.True(File.Exists(micBatch.FilePath), $"expected the batch artifact at {micBatch.FilePath}");
+
+        // One more mic chunk starts a fresh window. Closing the loopback window must not
+        // touch it.
+        Assert.Null(builder.OnChunkClosed(CreateChunk(3, 20_000, 10_000, source: AudioSources.Mic)));
+
+        // The loopback window is separate: it closes on the loopback chunk, to the same
+        // session-relative span but its own artifact and its own numbering.
+        var loopbackBatch = builder.OnChunkClosed(CreateChunk(2, 10_000, 10_000, source: AudioSources.Loopback));
+
+        Assert.NotNull(loopbackBatch);
+        Assert.Equal(AudioSources.Loopback, loopbackBatch!.Source);
+        Assert.StartsWith("asr/batches/loopback/", loopbackBatch.RelativePath, StringComparison.Ordinal);
+        Assert.Equal(0, loopbackBatch.StartMs);
+        Assert.Equal(20_000, loopbackBatch.EndMs);
+        Assert.Equal(new[] { "loopback", "loopback" }, loopbackBatch.Chunks.Select(c => c.Source));
+        Assert.NotEqual(micBatch.RelativePath, loopbackBatch.RelativePath);
+        Assert.True(File.Exists(loopbackBatch.FilePath), $"expected the batch artifact at {loopbackBatch.FilePath}");
+
+        // Two batches are queued — one per source — and the microphone's fresh window did not
+        // absorb the loopback chunks: it still holds exactly its own single chunk.
+        Assert.Equal(2, builder.BatchesQueued);
+        Assert.Equal(1, builder.PendingChunkCount);
+
+        // The remaining partial window is flushed as that source's own batch, never merged
+        // across tracks.
+        var flushed = builder.FlushPendingBatches();
+
+        Assert.Equal(3, builder.BatchesQueued);
+        var flushedMic = Assert.Single(flushed);
+        Assert.Equal(AudioSources.Mic, flushedMic.Source);
+        Assert.Equal(20_000, flushedMic.StartMs);
+        Assert.Equal(30_000, flushedMic.EndMs);
+        Assert.All(flushedMic.Chunks, c => Assert.Equal(AudioSources.Mic, c.Source));
+
+        // One queued job per (source, window), each pointing at that source's artifact, and
+        // each with its own job id. Batch numbering restarts at 1 per track, so a job id
+        // derived from the batch file name alone would collide here and the second track's job
+        // would silently replace the first (asr_jobs.id is the primary key), leaving one track
+        // never transcribed at all.
+        var jobs = _jobs.ListBySession(SessionId);
+        Assert.Equal(3, jobs.Count);
+        Assert.Equal(2, jobs.Count(j => j.Source == AudioSources.Mic));
+        Assert.Equal(1, jobs.Count(j => j.Source == AudioSources.Loopback));
+        Assert.Equal(3, jobs.Select(j => j.Id).Distinct(StringComparer.Ordinal).Count());
+        Assert.All(jobs.Where(j => j.Source == AudioSources.Mic), j => Assert.StartsWith("asr/batches/mic/", j.InputArtifact, StringComparison.Ordinal));
+        Assert.All(jobs.Where(j => j.Source == AudioSources.Loopback), j => Assert.StartsWith("asr/batches/loopback/", j.InputArtifact, StringComparison.Ordinal));
+
+        // The two tracks' first windows are both numbered 1 but must not share an id.
+        var micFirst = jobs.Single(j => j.Source == AudioSources.Mic && j.InputArtifact.EndsWith("batch-000001.wav", StringComparison.Ordinal));
+        var loopbackFirst = jobs.Single(j => j.Source == AudioSources.Loopback && j.InputArtifact.EndsWith("batch-000001.wav", StringComparison.Ordinal));
+        Assert.NotEqual(micFirst.Id, loopbackFirst.Id);
+
+        // Each job still points at a batch artifact that exists, so nothing was overwritten.
+        Assert.True(File.Exists(Paths.ResolveRelative(micFirst.InputArtifact)));
+        Assert.True(File.Exists(Paths.ResolveRelative(loopbackFirst.InputArtifact)));
+    }
+
+    [Fact]
     public void FlushingQueuesThePartialBatchSoAudioAfterTheLastFullWindowStillReachesTheProvider()
     {
         var builder = CreateBuilder(batchSeconds: 300);
@@ -220,6 +304,61 @@ public class AsrBatchBuilderTests : IDisposable
 
         // A second flush has nothing left to queue, so a stop cannot double-bill the window.
         Assert.Empty(builder.FlushPendingBatches());
+        Assert.Single(_jobs.ListBySession(SessionId));
+    }
+
+    [Fact]
+    public void JobIdFor_IsUniquePerTrackWhenBothTracksUseTheSameBatchNumber()
+    {
+        // Batch numbers restart at 1 for every track, so mic and loopback both produce
+        // batch-000001.wav. The id has to carry the source or the two jobs collide on
+        // asr_jobs.id (a primary key) and one track is silently never transcribed.
+        var mic = AsrBatchBuilder.JobIdFor(AudioSources.Mic, "asr/batches/mic/batch-000001.wav");
+        var loopback = AsrBatchBuilder.JobIdFor(AudioSources.Loopback, "asr/batches/loopback/batch-000001.wav");
+
+        Assert.NotEqual(mic, loopback);
+        Assert.Contains(AudioSources.Mic, mic, StringComparison.Ordinal);
+        Assert.Contains(AudioSources.Loopback, loopback, StringComparison.Ordinal);
+
+        // Deterministic, so the same artifact always maps to the same job.
+        Assert.Equal(mic, AsrBatchBuilder.JobIdFor(AudioSources.Mic, "asr/batches/mic/batch-000001.wav"));
+    }
+
+    [Fact]
+    public void RecoveryStillRecognisesAJobQueuedBeforeTheIdCarriedItsSource()
+    {
+        // An M4-era row was derived from the batch file name alone (job_batch-000001). After
+        // the id gained its source qualifier, recovery must still see that batch as already
+        // queued — otherwise it would queue (and bill) the same audio a second time.
+        var builder = CreateBuilder(batchSeconds: 20);
+        builder.OnChunkClosed(CreateChunk(1, 0, 10_000));
+        var batch = builder.OnChunkClosed(CreateChunk(2, 10_000, 10_000))!;
+
+        // Replace the modern job with one carrying the legacy id, exactly as an existing data
+        // root from M4 would hold it.
+        foreach (var job in _jobs.ListBySession(SessionId))
+        {
+            _jobs.Remove(job.Id);
+        }
+
+        _jobs.Create(new AsrJob
+        {
+            Id = Ids.JobPrefix + "batch-000001",
+            SessionId = SessionId,
+            Source = AudioSources.Mic,
+            Tier = "standard",
+            Provider = "volcengine",
+            StartMs = batch.StartMs,
+            EndMs = batch.EndMs,
+            InputArtifact = batch.RelativePath,
+            Status = AsrJobStatus.Pending,
+            ProviderRequestId = "legacy-request-id",
+            DurationMs = 20_000,
+            CreatedAt = s_now,
+            UpdatedAt = s_now,
+        });
+
+        Assert.Empty(builder.RecoverFinalizedBatches(SessionId));
         Assert.Single(_jobs.ListBySession(SessionId));
     }
 

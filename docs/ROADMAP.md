@@ -381,8 +381,11 @@ Implemented (issue #7):
 - separate chunk trees persist under `audio/mic/` and `audio/loopback/`; the M4 batch
   builder already groups per source, so each track is independently transcribed through
   file ASR and `asr/batches/<source>/` keeps them separate;
-- per-track health/degraded state is recorded as `track_health` in `session.json` and the
-  `session.stopped`/`asr batches:` lines report both tracks (docs/DATA_MODEL.md section 3);
+- per-track health/degraded state is recorded as `track_health` in `session.json`, and
+  `meetcap start` prints one line per track when the session ran more than one. The
+  `session.stopped` event and the `asr batches:` summary stay session-wide totals with no
+  source dimension, so per-track state is read from `session.json`, not from those lines
+  (docs/DATA_MODEL.md section 3);
 - `TranscriptMerger` merges the two tracks' segments onto one session-relative timeline
   ordered by `start_ms`, preserving `source` and overlapping speech rather than deleting
   it (docs/ARCHITECTURE.md section 16).

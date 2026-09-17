@@ -387,7 +387,8 @@ session with everything already captured still closed and durable.
 ### 7.2 M5 implementation: dual-track capture
 
 An online session runs the same boundary twice — once for the microphone track and once
-for the loopback track — through `IAudioRenderEnumerator` (render endpoints) and
+for the loopback track — through `IAudioDeviceEnumerator.EnumerateRenderDevices` /
+`GetDefaultRenderDevice` / `FindRenderDevice` (render endpoints) and
 `IAudioCaptureSourceFactory.CreateLoopback`. The loopback source is built with NAudio 3's
 `WasapiRecorderBuilder.WithLoopbackCapture` (system, the baseline) or
 `.WithProcessLoopback` (process, the additive option), which produces the same

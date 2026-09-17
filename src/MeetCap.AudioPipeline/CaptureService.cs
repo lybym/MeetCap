@@ -169,8 +169,8 @@ public sealed class CaptureService
 
     /// <summary>
     /// Creates the session directory, manifest and index row, then returns the runner
-    /// for it. Everything that can fail before recording — device resolution and the
-    /// free-space check — fails here, before any artifact is written.
+    /// for it. Everything that can fail before recording — device resolution, the
+    /// free-space check and the loopback mode — fails here, before any artifact is written.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -185,9 +185,18 @@ public sealed class CaptureService
     /// </para>
     /// <para>
     /// An offline session resolves one microphone track; an online session resolves the
-    /// microphone and a loopback track (docs/ROADMAP.md M5). Both device resolutions
-    /// happen before the session exists, so an unavailable endpoint fails with an
-    /// actionable error rather than leaving a half-written session behind.
+    /// microphone and a loopback track (docs/ROADMAP.md M5). The endpoints, the free-space
+    /// level and <c>capture.online.loopback_mode</c> are all resolved and validated before
+    /// the session exists, so those failures leave nothing behind.
+    /// </para>
+    /// <para>
+    /// The capture <em>sources</em> are built later, by
+    /// <see cref="RecordingSession.RunAsync"/>, because the process-loopback target cannot
+    /// be resolved until the platform audio boundary constructs the source. A target that
+    /// is not running therefore still fails after publication: the session is marked
+    /// <c>INTERRUPTED</c> with <c>capture_start_failed</c> and the actionable reason
+    /// surfaces on <see cref="RecordingSessionOutcome.StartFailureDetail"/>, which
+    /// <c>meetcap start</c> prints to stderr (docs/RELIABILITY.md section 16).
     /// </para>
     /// </remarks>
     /// <param name="title">Session title recorded in the manifest and the index row.</param>
@@ -209,6 +218,13 @@ public sealed class CaptureService
 
         new DiskSpaceMonitor(_platform.DiskSpace, _settings.MinimumFreeSpaceBytes)
             .EnsureSufficientAtStart(_settings.DataRoot);
+
+        // Validate the loopback mode before publishing anything. The mode is parsed again
+        // when the track specs are built below, but that happens inside the publication
+        // block, so an invalid mode would otherwise surface only after the session
+        // directory, manifest, sessions row and audio/loopback/ already existed
+        // (docs/M1_WINDOWS_VALIDATION.md section 13, docs/RELIABILITY.md section 16).
+        ValidateLoopbackMode();
 
         var now = _platform.Clock.UtcNow;
         var sessionId = SessionIds.Create(now);
@@ -301,6 +317,9 @@ public sealed class CaptureService
 
         if (_settings.IsOnline && _settings.Online is { } online && renderDevice is not null)
         {
+            // The mode and the process name were validated before the session was published
+            // (see ValidateLoopbackMode). Parsing again here keeps the spec the single
+            // source of truth for the request the loopback track is built from.
             var loopbackMode = LoopbackModes.Parse(online.LoopbackMode);
             var processName = online.ProcessName;
             var renderDeviceId = online.RenderDeviceId;
@@ -314,6 +333,28 @@ public sealed class CaptureService
         }
 
         return specs;
+    }
+
+    /// <summary>
+    /// Rejects an unusable <c>capture.online.loopback_mode</c> before the session is
+    /// published, so the failure leaves no session artifacts behind.
+    /// </summary>
+    /// <remarks>
+    /// Only meaningful for an online session: the key configures the loopback track, which
+    /// an offline session never builds. <c>start</c> reports the same problem from
+    /// configuration validation, but the pipeline owns the value it actually parses, so it
+    /// refuses it here too rather than trusting every caller
+    /// (docs/DEVELOPMENT.md section 8).
+    /// </remarks>
+    /// <exception cref="ArgumentException">
+    /// <c>capture.online.loopback_mode</c> is not one of the documented modes.
+    /// </exception>
+    private void ValidateLoopbackMode()
+    {
+        if (_settings.Online is { } online)
+        {
+            LoopbackModes.Parse(online.LoopbackMode);
+        }
     }
 
     private static SessionRecordingLock AcquireRecordingLock(SessionPaths paths)

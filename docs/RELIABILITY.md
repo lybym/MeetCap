@@ -341,8 +341,13 @@ Known limits of this milestone, stated rather than implied:
   validation (`docs/DEVELOPMENT.md` section 7).
 - **Process loopback depends on the running Windows/NAudio combination.** The
   `WithProcessLoopback` path is implemented through NAudio and not exercised against a real
-  meeting application here; a machine that does not support process loopback fails the start with
-  an actionable message rather than silently degrading to system loopback.
+  meeting application here; a machine that does not support process loopback, or whose
+  configured target process is not running, fails the start with an actionable message on
+  stderr rather than silently degrading to system loopback. The process target is resolved
+  when the loopback capture source is constructed, which is after the session is published,
+  so that particular failure leaves an `INTERRUPTED` session with `end_reason:
+  capture_start_failed` behind rather than failing before the session exists. An invalid
+  `capture.online.loopback_mode` is different: it is rejected before any session is created.
 - **No echo-duplicate detection.** The same words can appear on both tracks (a local speaker
   picked up by the microphone and again by the loopback); the merger preserves both rather than
   deleting either, and marking probable echo duplicates is left to a later milestone

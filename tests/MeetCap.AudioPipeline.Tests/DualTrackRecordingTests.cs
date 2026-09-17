@@ -1,5 +1,6 @@
 using System.Text.Json;
 using MeetCap.AudioPipeline.Tests.TestSupport;
+using MeetCap.AudioPipeline.Wave;
 using MeetCap.Core.Capture;
 using MeetCap.Core.Diagnostics;
 using MeetCap.Core.Sessions;
@@ -170,6 +171,81 @@ public class DualTrackRecordingTests
         // Each track numbers its chunks from 1 independently.
         Assert.Equal(1, micChunks[0].Sequence);
         Assert.Equal(1, loopbackChunks[0].Sequence);
+    }
+
+    [Fact]
+    public async Task AFatallyEndedTrackFinalizesItsPartialChunkWhileTheOtherTrackKeepsRecording()
+    {
+        // The loopback render endpoint disappears while its chunk is still partial (10 s of
+        // a 30 s chunk). Recovery cannot find it, so the loopback track ends fatally — but
+        // the microphone track keeps recording, so the session does not end.
+        //
+        // The failed track's tail must still become durable the moment that track ends: its
+        // capture loop has returned, so no further packet can ever arrive for it and
+        // ProcessPacket can never close the chunk. Without finalizing on the fatal path the
+        // chunk would stay `NNNNNN.wav.part` with an open index row, and its FileStream
+        // buffer unflushed, for the rest of the session, contradicting the fatal event's own
+        // "the audio already captured still closed" claim (docs/RELIABILITY.md section 8).
+        using var harness = new SessionHarness(
+            chunkSeconds: 30,
+            maxDeviceRecoveryAttempts: 1,
+            mode: "online");
+        var micSource = new FakeCaptureSource(Format, harness.Device, AudioSource.Mic);
+        var loopbackSource = new FakeCaptureSource(Format, harness.RenderDevice, AudioSource.Loopback);
+        harness.Sources.Enqueue(micSource);
+        harness.Sources.EnqueueLoopback(loopbackSource);
+
+        var session = harness.Service.PrepareSession("Online Fatal Partial Chunk");
+        var paths = new SessionPaths(harness.DataRoot, session.SessionId);
+
+        using var cancellation = new CancellationTokenSource();
+        var run = session.RunAsync(cancellation.Token);
+
+        Assert.True(await Wait.UntilAsync(() => micSource.StartCount == 1 && loopbackSource.StartCount == 1),
+            "both tracks did not start");
+
+        // 10 s into a 30 s chunk, so a partial chunk is open on the loopback track. The mic
+        // track stays silent so its own chunk state cannot mask the loopback assertion.
+        TestAudio.EmitSeconds(loopbackSource, Format, 0, milliseconds: 10_000);
+
+        harness.Devices.SetRenderDevices();
+        loopbackSource.Fail(new InvalidOperationException("render endpoint unplugged"));
+
+        Assert.True(await Wait.UntilAsync(() => HasEvent(paths, SessionEventNames.CaptureDeviceLostFatal), timeoutMs: 15_000),
+            "the loopback track did not report a fatal device loss");
+
+        // The failed track's tail is finalized without waiting for the session to end. The
+        // mic track is deliberately still recording here: the session is not over.
+        Assert.True(
+            await Wait.UntilAsync(() => WavNames(paths, AudioSource.Loopback).Length == 1),
+            $"the fatally ended loopback track left its partial chunk unfinalized: " +
+            $"{string.Join(", ", Directory.GetFiles(paths.AudioDirectory(AudioSource.Loopback)))}");
+        Assert.Empty(Directory.GetFiles(paths.AudioDirectory(AudioSource.Loopback), "*.part"));
+
+        // The index agrees: the chunk is durable, carries the audio that was captured, and
+        // is no longer reported as open.
+        var loopbackChunks = harness.Database.Chunks.ListForSession(session.SessionId)
+            .Where(c => c.Source == AudioSource.Loopback).ToList();
+        var closed = Assert.Single(loopbackChunks);
+        Assert.Equal(ChunkStates.Closed, closed.Status);
+        Assert.Equal(10_000, closed.EndMs);
+        Assert.True(closed.ByteLength > 0, "the finalized chunk carried no audio");
+
+        // The audio is a real, independently readable WAV at the track format.
+        var validation = WaveChunkValidator.ValidateClosedFile(
+            paths.ChunkFinalPath(AudioSource.Loopback, 1),
+            Format);
+        Assert.True(validation.IsValid, validation.Error);
+        Assert.Equal(closed.ByteLength, validation.DataBytes);
+
+        // Only now does the healthy track end.
+        cancellation.Cancel();
+        var outcome = await Finish(run);
+
+        Assert.True(outcome.Degraded);
+        var loopbackHealth = ReadManifest(paths).TrackHealth.Single(h => h.Source == AudioSources.Loopback);
+        Assert.Equal("device_lost", loopbackHealth.EndReason);
+        Assert.Equal(1, loopbackHealth.ChunksClosed);
     }
 
     private static Task<RecordingSessionOutcome> Finish(Task<RecordingSessionOutcome> run)

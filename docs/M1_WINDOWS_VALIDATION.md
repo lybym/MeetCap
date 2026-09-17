@@ -434,10 +434,10 @@ sources. It lives in `tests/MeetCap.AudioPipeline.Tests/DualTrackRecordingTests.
 `tests/MeetCap.Core.Tests/Capture/AudioDeviceResolverTests.cs` (render resolution) and
 `tests/MeetCap.Cli.Tests/CaptureCommandTests.cs` (`start --mode online`).
 
-Prerequisites on top of section 2: a machine with an active render endpoint, and (for 14.5)
+Prerequisites on top of section 2: a machine with an active render endpoint, and (for 13.5)
 a meeting application whose process name is set as `capture.online.process_name`.
 
-### 14.1 System loopback records both tracks
+### 13.1 System loopback records both tracks
 
 ```powershell
 meetcap start "M5 online check" --mode online
@@ -454,14 +454,14 @@ meetcap start "M5 online check" --mode online
       stop.
 - [ ] `meetcap start` exits `0` and prints a per-track line for each track.
 
-### 14.2 Overlapping speech is preserved
+### 13.2 Overlapping speech is preserved
 
 - [ ] Speak while remote audio is playing. The merged `transcript/raw.jsonl` contains both a
       `mic` and a `loopback` segment covering the same `start_ms`; neither is deleted
       (docs/ARCHITECTURE.md section 16).
 - [ ] The merged timeline is ordered by `start_ms` across both tracks.
 
-### 14.3 One track degrades without corrupting the other
+### 13.3 One track degrades without corrupting the other
 
 - [ ] While recording, disable/remove the render endpoint (or unplug headphones) so loopback
       loses its source. The loopback track reports `capture.device_lost_fatal` and ends
@@ -472,7 +472,7 @@ meetcap start "M5 online check" --mode online
       the mic entry stays healthy.
 - [ ] `meetcap start` still exits `0` when the recording itself was otherwise clean.
 
-### 14.4 Headphones vs speakers (acoustic duplicate pickup)
+### 13.4 Headphones vs speakers (acoustic duplicate pickup)
 
 - [ ] With **headphones**, the loopback track carries remote audio only; the microphone carries
       local speech only (no acoustic bleed). Document the expectation.
@@ -480,7 +480,7 @@ meetcap start "M5 online check" --mode online
       appears on the loopback track. Confirm this is preserved (both tracks keep it) rather than
       silently deduplicated; echo marking is a later milestone.
 
-### 14.5 Process loopback (supported systems only)
+### 13.5 Process loopback (supported systems only)
 
 ```powershell
 # capture.online.loopback_mode = "process", capture.online.process_name = "WeMeet"
@@ -491,8 +491,13 @@ meetcap start "M5 process loopback" --mode online
       appears on the loopback track; other system audio does not.
 - [ ] Process loopback does not create a new meeting mode — it is the same `online` session,
       just a different `loopback_mode`.
-- [ ] If the target process is not running, `meetcap start` fails with an actionable message
-      before any session is created (no `audio/loopback/` is written).
+- [ ] An invalid `capture.online.loopback_mode` value fails `meetcap start` before any
+      session is created (no session directory, manifest or `audio/loopback/` is written).
+- [ ] If the target process is not running, `meetcap start` exits `1` and prints the
+      actionable reason on stderr (`Process loopback target '<name>' is not currently
+      running ...`). The session *is* created first — the process target is resolved when the
+      loopback source is built, after publication — so it is left `INTERRUPTED` with
+      `end_reason: capture_start_failed` and an empty `audio/loopback/`.
 - [ ] If the running Windows/NAudio combination does not support process loopback, the failure
       is actionable, not a silent fallback to system loopback.
 
