@@ -198,6 +198,20 @@ public class DualTrackRecordingTests
         var session = harness.Service.PrepareSession("Online Fatal Partial Chunk");
         var paths = new SessionPaths(harness.DataRoot, session.SessionId);
 
+        // ChunkClosed fires on the consumer thread after the chunk is durably closed, its index
+        // row is written and it has been renamed out of .part. Waiting on it is a deterministic
+        // signal that the failed track's tail was finalized — polling the filesystem instead
+        // races the rename against the index update.
+        var loopbackChunkClosed = new TaskCompletionSource<ClosedAudioChunk>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        session.ChunkClosed += chunk =>
+        {
+            if (chunk.Source == AudioSources.Loopback)
+            {
+                loopbackChunkClosed.TrySetResult(chunk);
+            }
+        };
+
         using var cancellation = new CancellationTokenSource();
         var run = session.RunAsync(cancellation.Token);
 
@@ -214,12 +228,18 @@ public class DualTrackRecordingTests
         Assert.True(await Wait.UntilAsync(() => HasEvent(paths, SessionEventNames.CaptureDeviceLostFatal), timeoutMs: 15_000),
             "the loopback track did not report a fatal device loss");
 
-        // The failed track's tail is finalized without waiting for the session to end. The
-        // mic track is deliberately still recording here: the session is not over.
-        Assert.True(
-            await Wait.UntilAsync(() => WavNames(paths, AudioSource.Loopback).Length == 1),
-            $"the fatally ended loopback track left its partial chunk unfinalized: " +
-            $"{string.Join(", ", Directory.GetFiles(paths.AudioDirectory(AudioSource.Loopback)))}");
+        // The failed track's tail is finalized without waiting for the session to end. The mic
+        // track is deliberately still recording here: the session is not over. Without
+        // finalizing on the fatal path this never completes and the chunk stays .part.
+        var finalized = await Wait.ForAsync(
+            loopbackChunkClosed.Task,
+            timeoutMs: 15_000,
+            "the fatally ended loopback track to finalize its partial chunk while the mic track kept recording");
+
+        Assert.Equal(AudioSources.Loopback, finalized.Source);
+        Assert.Equal(1, finalized.Sequence);
+        Assert.Equal(10_000, finalized.EndMs);
+        Assert.True(finalized.DataBytes > 0, "the finalized chunk carried no audio");
         Assert.Empty(Directory.GetFiles(paths.AudioDirectory(AudioSource.Loopback), "*.part"));
 
         // The index agrees: the chunk is durable, carries the audio that was captured, and
@@ -229,7 +249,7 @@ public class DualTrackRecordingTests
         var closed = Assert.Single(loopbackChunks);
         Assert.Equal(ChunkStates.Closed, closed.Status);
         Assert.Equal(10_000, closed.EndMs);
-        Assert.True(closed.ByteLength > 0, "the finalized chunk carried no audio");
+        Assert.Equal(finalized.DataBytes, closed.ByteLength);
 
         // The audio is a real, independently readable WAV at the track format.
         var validation = WaveChunkValidator.ValidateClosedFile(
