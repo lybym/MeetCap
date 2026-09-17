@@ -382,7 +382,9 @@ section 9.2.
 A capture device that disappears ends only the current capture segment. The session
 closes the audio already captured, waits, re-resolves the configured endpoint, and
 restarts capture behind the same session; a device that cannot be recovered ends the
-session with everything already captured still closed and durable.
+session with everything already captured still closed and durable. In an online session
+that final part is per track: the unrecoverable track closes and indexes its own final
+chunk as it ends, and the other track keeps recording (section 7.2).
 
 ### 7.2 M5 implementation: dual-track capture
 

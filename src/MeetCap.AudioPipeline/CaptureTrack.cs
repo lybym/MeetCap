@@ -330,9 +330,9 @@ internal sealed class CaptureTrack : IDisposable
     /// <c>ProcessPacket</c> can never run again. Without it the consumer stays parked
     /// until every other track ends, leaving this track's tail as a <c>.part</c> with an
     /// open index row and an unflushed <c>FileStream</c> buffer for the rest of the
-    /// session — which would make the "still closed and durable" claim in the fatal event
-    /// false (docs/RELIABILITY.md section 8, docs/ARCHITECTURE.md section 7.2). The spool
-    /// itself stays consumer-thread-only; this only signals that no more packets follow.
+    /// session — so the fatal event's "its final chunk is closed and indexed as it ends"
+    /// would be false (docs/RELIABILITY.md section 8, docs/ARCHITECTURE.md section 7.2). The
+    /// spool itself stays consumer-thread-only; this only signals that no more packets follow.
     /// </remarks>
     public void CompleteWriter() => _channel?.Writer.TryComplete();
 
