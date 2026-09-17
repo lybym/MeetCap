@@ -66,11 +66,12 @@ public class AsrJobProcessorTests : IDisposable
         AsrJobStatus status = AsrJobStatus.Pending,
         int attempts = 0,
         DateTimeOffset? nextRetryAt = null,
-        string provider = "volcengine")
+        string provider = "volcengine",
+        string jobId = "job_1")
     {
         var job = new AsrJob
         {
-            Id = "job_1",
+            Id = jobId,
             SessionId = "ses_1",
             Source = AudioTrackName.Import,
             Tier = "standard",
@@ -79,7 +80,7 @@ public class AsrJobProcessorTests : IDisposable
             EndMs = 754_000,
             InputArtifact = "audio/import/normalized.wav",
             Status = status,
-            ProviderRequestId = "req-0001",
+            ProviderRequestId = jobId == "job_1" ? "req-0001" : "req-" + jobId,
             AttemptCount = attempts,
             NextRetryAt = nextRetryAt,
             DurationMs = 754_000,
@@ -343,6 +344,90 @@ public class AsrJobProcessorTests : IDisposable
     }
 
     [Fact]
+    public async Task RunDue_ForceProcessesAJobWaitingOutItsRetryBackoff()
+    {
+        // `meetcap asr resume --force` is the operator saying the reason for the backoff is
+        // over, so a job with a durable next_retry_at in the future is processed now.
+        var job = CreateJob(
+            status: AsrJobStatus.RetryWait,
+            attempts: 1,
+            nextRetryAt: DateTimeOffset.UtcNow.AddHours(1));
+        _provider.EnqueuePoll(Completed());
+
+        var processor = CreateProcessor();
+
+        // Without the flag the schedule is respected.
+        Assert.Empty(await processor.RunDueAsync(10));
+
+        var results = await processor.RunDueAsync(10, sessionId: null, ignoreRetrySchedule: true);
+
+        var result = Assert.Single(results);
+        Assert.Equal(AsrJobOutcome.Succeeded, result.Outcome);
+        Assert.Equal(AsrJobStatus.Succeeded, _jobs.Get(job.Id)!.Status);
+    }
+
+    [Fact]
+    public async Task RunDue_FinishesAJobThatIsWaitingAtTheSubmittedStep()
+    {
+        // A job can legitimately be found in `submitted`: the provider accepted the task, the
+        // row was persisted, and the process moved on before it polled. A drain must carry that
+        // job through to its result rather than reporting "no work" and leaving the audio
+        // submitted but never collected (docs/ARCHITECTURE.md section 12).
+        var job = CreateJob(status: AsrJobStatus.Submitted, attempts: 1);
+        _provider.EnqueuePoll(Completed());
+
+        var results = await CreateProcessor().RunDueAsync(10);
+
+        var result = Assert.Single(results);
+        Assert.Equal(AsrJobOutcome.Succeeded, result.Outcome);
+        Assert.Equal(AsrJobStatus.Succeeded, _jobs.Get(job.Id)!.Status);
+        Assert.True(File.Exists(Paths.RawTranscriptJsonl));
+    }
+
+    [Fact]
+    public async Task RunDue_ResumesSubmittingJobsAfterAProviderIsReachableAgain()
+    {
+        // A lost network stops the drain early, but nothing is dropped: the job keeps its durable
+        // state and its retry schedule, and the queue resumes as soon as the provider answers
+        // (docs/RELIABILITY.md section 9).
+        var pending = CreateJob();
+        _provider.OnSubmit = _ => throw new AsrTransientException("http.503", "network is down");
+
+        var processor = CreateProcessor();
+        var offline = await processor.RunDueAsync(10);
+
+        Assert.True(processor.ProviderUnreachable);
+        var attempted = Assert.Single(offline);
+        Assert.Equal(AsrJobStatus.RetryWait, attempted.Job.Status);
+        Assert.Equal(1, attempted.Job.AttemptCount);
+
+        // The network returns and the durable backoff has come due.
+        _jobs.Update(_jobs.Get(pending.Id)! with { NextRetryAt = null });
+        _provider.OnSubmit = null;
+        _provider.EnqueuePoll(Completed());
+
+        var resumed = await processor.RunDueAsync(10);
+
+        var result = Assert.Single(resumed);
+        Assert.Equal(AsrJobOutcome.Succeeded, result.Outcome);
+        Assert.Equal(AsrJobStatus.Succeeded, _jobs.Get(pending.Id)!.Status);
+        Assert.False(processor.ProviderUnreachable);
+    }
+
+    [Fact]
+    public async Task RunDue_ReportsNoWorkWhenThereIsNothingToDoAfterADrain()
+    {
+        var job = CreateJob(status: AsrJobStatus.Submitted, attempts: 1);
+        _provider.EnqueuePoll(Completed());
+
+        var processor = CreateProcessor();
+        await processor.RunDueAsync(10);
+
+        Assert.Equal(AsrJobStatus.Succeeded, _jobs.Get(job.Id)!.Status);
+        Assert.Empty(await processor.RunDueAsync(10));
+    }
+
+    [Fact]
     public async Task CrashBetweenArtifactWriteAndStatusWrite_DoesNotDuplicateOrDoubleReport()
     {
         // The window P1-2 is about: the transcript artifacts are written, then the terminal
@@ -426,6 +511,64 @@ public class AsrJobProcessorTests : IDisposable
         Assert.Equal(2, segments.Count);
         Assert.Equal("seg_1", segments[0].SegmentId);
         Assert.Equal("seg_job2", segments[1].SegmentId);
+    }
+
+    [Fact]
+    public async Task OutOfOrderCompletion_StillProducesTheTranscriptInJobOrderWithoutDuplicates()
+    {
+        // A later window can finish before an earlier one (different provider latency, a retry).
+        // `raw.jsonl` is rebuilt from every job's artifact in job order, so the transcript is
+        // ordered by the session timeline rather than by completion time, and finishing the
+        // earlier job afterwards replaces its contribution instead of appending it.
+        var first = CreateJob(jobId: "job_1");
+        var second = CreateJob(jobId: "job_2");
+        _jobs.Update(second with { CreatedAt = s_now.AddMinutes(1), UpdatedAt = s_now.AddMinutes(1) });
+
+        _normalizer.OnNormalize = (_, context) => new AsrNormalizationResult
+        {
+            Segments = new[]
+            {
+                new TranscriptSegment
+                {
+                    SegmentId = "seg_" + context.JobId,
+                    SessionId = context.SessionId,
+                    Source = context.Source,
+                    StartMs = context.JobId == "job_1" ? 0 : 300_000,
+                    EndMs = context.JobId == "job_1" ? 1000 : 301_000,
+                    RawText = context.JobId,
+                    ProviderJobId = context.JobId,
+                },
+            },
+            SpeakerInfoReturned = false,
+        };
+
+        // The later job completes first.
+        _provider.EnqueuePoll(Completed());
+        var processedSecond = await CreateProcessor().ProcessAsync(_jobs.Get("job_2")!);
+        Assert.Equal(AsrJobOutcome.Succeeded, processedSecond.Outcome);
+
+        var afterSecond = _transcripts.ReadJsonl(Paths.RawTranscriptJsonl);
+        Assert.Equal(new[] { "seg_job_2" }, afterSecond.Select(s => s.SegmentId));
+
+        // Then the earlier one.
+        _provider.EnqueuePoll(Completed());
+        var processedFirst = await CreateProcessor().ProcessAsync(_jobs.Get("job_1")!);
+        Assert.Equal(AsrJobOutcome.Succeeded, processedFirst.Outcome);
+
+        var segments = _transcripts.ReadJsonl(Paths.RawTranscriptJsonl);
+
+        // Job order, not completion order, and no duplicated contribution.
+        Assert.Equal(new[] { "seg_job_1", "seg_job_2" }, segments.Select(s => s.SegmentId));
+        Assert.Equal(new long[] { 0, 300_000 }, segments.Select(s => s.StartMs));
+
+        // Re-completing the earlier job again cannot duplicate its segments either.
+        _jobs.Update(_jobs.Get("job_1")! with { Status = AsrJobStatus.Polling, CompletedAt = null });
+        _provider.EnqueuePoll(Completed());
+        await CreateProcessor().ProcessAsync(_jobs.Get("job_1")!);
+
+        Assert.Equal(
+            new[] { "seg_job_1", "seg_job_2" },
+            _transcripts.ReadJsonl(Paths.RawTranscriptJsonl).Select(s => s.SegmentId));
     }
 
     [Fact]

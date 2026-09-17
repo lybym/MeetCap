@@ -64,6 +64,56 @@ public class VolcengineResponseNormalizerTests
     }
 
     [Fact]
+    public void BatchOffset_MovesProviderTimestampsOntoTheSessionTimeline()
+    {
+        // A live ASR batch is one window of a longer recording, so the provider's
+        // file-relative timestamps only land where the speech actually happened once the
+        // batch's start position is added (docs/DATA_MODEL.md section 6).
+        const string raw = """
+        {"result":{"text":"later","utterances":[
+          {"text":"later","start_time":400,"end_time":1900,"speaker":"1"}
+        ]}}
+        """;
+
+        var batchContext = Context with { JobId = "job_batch_2", StartOffsetMs = 300_000 };
+        var segment = Assert.Single(Normalizer.Normalize(raw, batchContext).Segments);
+
+        Assert.Equal(300_400, segment.StartMs);
+        Assert.Equal(301_900, segment.EndMs);
+        Assert.Equal("later", segment.RawText);
+        Assert.Equal("speaker_1", segment.SpeakerLabel);
+        Assert.Equal("job_batch_2", segment.ProviderJobId);
+    }
+
+    [Fact]
+    public void NoOffset_LeavesWholeSessionTimestampsUnchanged()
+    {
+        const string raw = """
+        {"result":{"text":"whole","utterances":[
+          {"text":"whole","start_time":400,"end_time":1900}
+        ]}}
+        """;
+
+        // An import (or any artifact that is the whole session) declares no offset, so M3's
+        // behaviour is unchanged.
+        var segment = Assert.Single(Normalizer.Normalize(raw, Context).Segments);
+        Assert.Equal(400, segment.StartMs);
+        Assert.Equal(1900, segment.EndMs);
+    }
+
+    [Fact]
+    public void BatchOffset_AlsoAppliesToTheWholeRecordingFallbackSegment()
+    {
+        const string raw = """{"result":{"text":"no utterances","audio_info":{"duration":2000}}}""";
+
+        var batchContext = Context with { StartOffsetMs = 60_000 };
+        var segment = Assert.Single(Normalizer.Normalize(raw, batchContext).Segments);
+
+        Assert.Equal(60_000, segment.StartMs);
+        Assert.Equal(62_000, segment.EndMs);
+    }
+
+    [Fact]
     public void ExistingSpeakerPrefixedLabels_ArePreserved()
     {
         const string raw = """

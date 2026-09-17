@@ -87,7 +87,16 @@ public sealed class FileSessionArtifactWriter : ISessionArtifactWriter
             }
         }
 
-        using var stream = new FileStream(paths.EventsJsonl, FileMode.Append, FileAccess.Write, FileShare.Read);
+        // The sharing mode has to be at least as permissive as the one the running recording
+        // holds `events.jsonl` open with (ReadWrite | Delete): a writer that asked only for
+        // Share.Read could not open the file at all while a session was live, which would turn
+        // an ASR job's own event into an IOException in the middle of a meeting
+        // (docs/DATA_MODEL.md section 4).
+        using var stream = new FileStream(
+            paths.EventsJsonl,
+            FileMode.Append,
+            FileAccess.Write,
+            FileShare.ReadWrite | FileShare.Delete);
         using var writer = new StreamWriter(stream, s_utf8);
         writer.WriteLine(json.ToJsonString());
     }

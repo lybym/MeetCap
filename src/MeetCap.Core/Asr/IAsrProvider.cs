@@ -20,6 +20,17 @@ public sealed record AsrFileRequest
     /// <summary>Provider format label for the artifact, e.g. <c>wav</c>, <c>m4a</c>.</summary>
     public required string AudioFormat { get; init; }
 
+    /// <summary>
+    /// Where this artifact begins on the session timeline, in milliseconds.
+    /// </summary>
+    /// <remarks>
+    /// A provider reports timestamps relative to the audio it was given. An imported file
+    /// starts at zero, but a live ASR batch is a window into a longer recording, so its
+    /// segments only land on the session timeline once this offset is added
+    /// (<c>docs/DATA_MODEL.md</c> section 6). Zero for anything that is the whole session.
+    /// </remarks>
+    public long StartOffsetMs { get; init; }
+
     public int DurationMs { get; init; }
 
     /// <summary>

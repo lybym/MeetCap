@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net10.0-windows</TargetFramework>
@@ -11,6 +11,9 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\MeetCap.Asr\MeetCap.Asr.csproj" />
     <ProjectReference Include="..\..\src\MeetCap.Core\MeetCap.Core.csproj" />
+    <!-- M4: the live batch builder consumes the recording artifact contract (the WAV chunk
+         writer and the session event sink), so this test assembly needs that reference. -->
+    <ProjectReference Include="..\..\src\MeetCap.AudioPipeline\MeetCap.AudioPipeline.csproj" />
   </ItemGroup>
 
   <ItemGroup>

@@ -31,6 +31,13 @@ public sealed class MeetCapDatabase
     /// <summary>The persistent ASR job queue (docs/ARCHITECTURE.md section 12).</summary>
     public IAsrJobStore AsrJobs => new SqliteAsrJobStore(DatabasePath);
 
+    /// <summary>
+    /// The same queue seen as reporting state, so <c>meetcap status</c> can describe depth
+    /// and degradation without depending on a concrete store type
+    /// (<c>docs/ROADMAP.md</c> M4).
+    /// </summary>
+    public IAsrQueueInspector AsrQueue => new SqliteAsrJobStore(DatabasePath);
+
     /// <summary>True when the database file exists and has been migrated at least once.</summary>
     public bool IsInitialized()
     {

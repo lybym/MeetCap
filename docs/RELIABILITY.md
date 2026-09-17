@@ -215,3 +215,87 @@ Still not verified on real hardware:
 
 M2 is therefore **implemented and automatically covered**, not verified end to end
 (`docs/DEVELOPMENT.md` section 7).
+
+---
+
+## 15. M4 status
+
+This section records implementation status. It adds no requirement and weakens none of the
+sections above.
+
+Implemented, and covered by the automated suite that runs in CI (`.github/workflows/ci.yml`,
+`dotnet test` on `windows-latest`):
+
+- **Network loss is a queue condition, not a recording failure (sections 1 and 9).**
+  `meetcap start` runs file-ASR submission and polling on its own task, never on the capture
+  callback. A transport failure is classified inside the provider adapter and lands in the
+  durable `retry_wait` state with a `next_retry_at`; the recording is untouched, the batch
+  artifacts stay on disk, and the queue resumes when the provider answers. A failed ASR job does
+  not change `meetcap start`'s exit code, which stays reserved for the recording
+  (`docs/ARCHITECTURE.md` sections 12.1 and 21.1). Covered by
+  `tests/MeetCap.Cli.Tests/LiveTranscriptionCommandTests.cs`
+  (`NetworkLoss_DoesNotStopRecordingAndTheQueueResumesAfterwards`) and
+  `tests/MeetCap.Asr.Tests/AsrJobProcessorTests.cs`.
+- **Crash recovery covers the batch hand-off (section 6).** The batch WAV is durable before its
+  job row exists, so a crash can leave an orphaned batch but never a queued job whose audio is
+  missing. `AsrBatchBuilder.RecoverFinalizedBatches` re-queues a finalized batch with no job and
+  discards the `.part` of an unfinished one, using a job id derived from the batch artifact path
+  so recovery is idempotent. It runs from both commands an operator would try — `meetcap start`
+  and the documented restart entry point `meetcap asr resume`. Covered by
+  `tests/MeetCap.Asr.Tests/AsrBatchBuilderTests.cs` and, through the CLI resume path, by
+  `tests/MeetCap.Cli.Tests/LiveTranscriptionCommandTests.AsrResume_RecoversABatchThatWasFinalizedBeforeItsJobRowExisted`.
+- **A batch window that cannot be built does not stop the track (section 4).** Every failure of the
+  materialization path is contained and recorded as an explicit `asr.batch.failed`; no exception
+  leaves `CompleteBatch`, so a transcript-layer write can never mark the recording degraded or
+  interrupted. An unreadable chunk is dropped and the rest of its window is retried, so one bad
+  chunk cannot block later windows. A write failure drops nothing: the window stays pending and is
+  retried. Covered by
+  `tests/MeetCap.Asr.Tests/AsrBatchBuilderTests.ABatchWindowThatCannotBeMaterializedDoesNotBlockLaterWindows`
+  (chunk branch, `reason=chunk_unreadable`),
+  `...RepeatedMaterializationFailureLeavesThePendingWindowBounded` (chunk branch, 20 windows),
+  `...AManifestThatCannotBeWrittenIsContainedLikeAnyOtherWriteFailure` (manifest write branch,
+  `reason=batch_write_failed`, and the same window is queued once the write site recovers) and
+  `...APersistentWriteFailureKeepsEveryChunkAndSpansTheWholeFailedStretch` (write branch, 10
+  windows: nothing dropped, no exception, and the accumulated window recovered afterwards).
+  Boundedness is stated precisely rather than generally: the chunk branch leaves at most one
+  `file_batch_seconds` window pending, while the write branch deliberately retains the window and
+  therefore grows by the chunks that close between attempts — bounded by the number of chunks the
+  recording produced (per-chunk metadata only, never audio), with the doc'd consequence that
+  recovery submits the accumulated stretch as one request
+  (`docs/ARCHITECTURE.md` section 10.2).
+- **A closed chunk cannot be announced before it is durable (section 5).**
+  `RecordingSession.ChunkClosed` is raised after the header patch, flush, validation and rename,
+  and a subscriber's failure is reported as an explicit `capture.discontinuity` event instead of
+  reaching the recording: the announcement runs outside the block whose failure is classified as
+  a storage failure. Covered by
+  `tests/MeetCap.AudioPipeline.Tests/ChunkClosedSubscriberTests.cs`
+  (`RunAsync_AThrowingSubscriberCannotFailTheRecording` and
+  `RunAsync_AThrowingSubscriberDoesNotStopLaterChunksFromBeingClosed`).
+- **Audio capture is structurally independent of the ASR path (section 1).**
+  `MeetCap.AudioPipeline` still references no ASR, cloud, HTTP or speaker assembly: the new
+  hand-off is a Core-owned `ClosedAudioChunk` event. The direction of the new
+  `MeetCap.Asr -> MeetCap.AudioPipeline` reference is asserted from the `MeetCap.Asr` side by
+  `tests/MeetCap.Asr.Tests/MeetCap.Asr.Tests.csproj`'s declared references plus
+  `tests/MeetCap.Asr.Tests/BatchReferenceDirectionTests.cs`; the opposite direction (a cycle)
+  is asserted by
+  `tests/MeetCap.AudioPipeline.Tests/CaptureIndependenceTests.cs`.
+
+Known limits of this milestone, stated rather than implied:
+
+- **No soak test has been run.** The issue's required validation — a two-hour offline meeting with
+  ongoing five-minute batches, and a thirty-minute outage inside it — is exercised in CI against
+  a scripted capture source and a scripted provider transport, not against a real microphone,
+  a real network outage, or the real Volcengine service. `docs/M1_WINDOWS_VALIDATION.md` holds the
+  M4 checklist as section 12 and it has **not been run**: the 12.2–12.4 and 12.6 rows additionally
+  need a real credential, which this environment does not have. This is automated coverage, not
+  real-world validation (`docs/DEVELOPMENT.md` section 7).
+- **A ten-minute-plus poll still ends a command.** `poll_timeout_seconds` (default 900) bounds how
+  long one invocation polls a single job. A batch whose provider task runs longer leaves the job
+  in `polling` with its state persisted, and the next `meetcap asr resume` continues it.
+- **Retry pacing depends on the drain running.** A process that is killed mid-outage leaves jobs in
+  `retry_wait`; nothing resumes them until `meetcap asr resume` runs. That is the documented
+  behaviour (section 9 and `docs/ARCHITECTURE.md` section 12) rather than an omission, but it does
+  mean the transcript does not advance while MeetCap is not running.
+- **The batch artifact is not deleted after its job succeeds.** An M4 session therefore keeps both
+  its capture chunks and its batch WAVs. Disk-space policy (section 10) covers the failure mode,
+  and reclaiming the intermediate artifacts is left to a later milestone.

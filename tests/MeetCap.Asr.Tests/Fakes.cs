@@ -104,6 +104,12 @@ internal sealed class InMemoryAsrJobStore : IAsrJobStore
 
     public void Create(AsrJob job) => _jobs[job.Id] = job;
 
+    /// <summary>
+    /// Drops a job row. Used by tests that model a process which died before a job existed,
+    /// so a later recovery pass sees exactly what a fresh process would see.
+    /// </summary>
+    public void Remove(string jobId) => _jobs.Remove(jobId);
+
     public AsrJob? Get(string jobId) => _jobs.TryGetValue(jobId, out var job) ? job : null;
 
     public IReadOnlyList<AsrJob> ListBySession(string sessionId) =>

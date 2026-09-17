@@ -114,11 +114,24 @@ public sealed class SessionRepository : ISessionStore
 
     /// <summary>
     /// The session the CLI should consider "the recording in progress": the newest
-    /// session that is created or recording. Finalizing sessions are excluded because
-    /// they are already on their way out.
+    /// session that is created, recording, or finalizing.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Finalizing is included because the recorder may still be closing its last chunk, and
+    /// <c>meetcap stop</c> has to keep waiting for that session rather than report "no active
+    /// session" while the audio is being finalized.
+    /// </para>
+    /// <para>
+    /// <c>PROCESSING</c> is deliberately excluded. Since M4 it means "capture is over and ASR
+    /// work is outstanding", which no recording process owns any more: including it would make
+    /// <c>meetcap stop</c> wait for a transcription queue and would let
+    /// <c>SessionRecoveryScanner</c>'s liveness rules treat a finished recording as live
+    /// (<c>docs/ARCHITECTURE.md</c> sections 9.1 and 20).
+    /// </para>
+    /// </remarks>
     public SessionRecord? FindActiveSession()
-        => ListByStatuses(new[] { SessionStatus.Created, SessionStatus.Recording }).LastOrDefault();
+        => ListByStatuses(SessionStatus.RecordingOwned).LastOrDefault();
 
     /// <summary>All session ids, newest first. Used by recovery to find orphan directories.</summary>
     public IReadOnlyList<string> ListIds()

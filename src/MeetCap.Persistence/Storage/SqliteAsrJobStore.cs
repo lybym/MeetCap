@@ -8,7 +8,7 @@ using Microsoft.Data.Sqlite;
 /// SQLite-backed persistent ASR job queue. This is the authoritative queue across
 /// process restarts (<c>docs/ARCHITECTURE.md</c> section 12).
 /// </summary>
-public sealed class SqliteAsrJobStore : IAsrJobStore
+public sealed class SqliteAsrJobStore : IAsrJobStore, IAsrQueueInspector
 {
     private const string SelectColumns =
         "id, session_id, source, tier, provider, start_ms, end_ms, input_artifact, status, " +
@@ -186,6 +186,75 @@ public sealed class SqliteAsrJobStore : IAsrJobStore
         using var cmd = new SqliteCommand("SELECT COUNT(*) FROM asr_jobs WHERE status = @status", conn);
         cmd.Parameters.AddWithValue("@status", AsrJobStatuses.ToWire(status));
         return Convert.ToInt32(cmd.ExecuteScalar());
+    }
+
+    /// <summary>Counts every job by status group (docs/ROADMAP.md M4 status reporting).</summary>
+    public AsrQueueStatus Inspect() => Count(null);
+
+    /// <summary>Counts one session's jobs by status group.</summary>
+    public AsrQueueStatus InspectSession(string sessionId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(sessionId);
+        return Count(sessionId);
+    }
+
+    private AsrQueueStatus Count(string? sessionId)
+    {
+        using var conn = SqliteConnectionFactory.Open(_dbPath);
+        if (!SqliteConnectionFactory.TableExists(conn, "asr_jobs"))
+        {
+            return AsrQueueStatus.Empty;
+        }
+
+        var sql = "SELECT status, COUNT(*) FROM asr_jobs";
+        if (sessionId is not null)
+        {
+            sql += " WHERE session_id = @sessionId";
+        }
+
+        sql += " GROUP BY status";
+
+        var counts = new Dictionary<string, int>(StringComparer.Ordinal);
+        using (var cmd = new SqliteCommand(sql, conn))
+        {
+            if (sessionId is not null)
+            {
+                cmd.Parameters.AddWithValue("@sessionId", sessionId);
+            }
+
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                counts[reader.GetString(0)] = reader.GetInt32(1);
+            }
+        }
+
+        var activeSessions = 0;
+        if (sessionId is null)
+        {
+            using var sessions = new SqliteCommand(
+                "SELECT COUNT(DISTINCT session_id) FROM asr_jobs WHERE status IN (@pending, @submitting, " +
+                "@submitted, @polling, @retryWait)",
+                conn);
+            sessions.Parameters.AddWithValue("@pending", AsrJobStatuses.ToWire(AsrJobStatus.Pending));
+            sessions.Parameters.AddWithValue("@submitting", AsrJobStatuses.ToWire(AsrJobStatus.Submitting));
+            sessions.Parameters.AddWithValue("@submitted", AsrJobStatuses.ToWire(AsrJobStatus.Submitted));
+            sessions.Parameters.AddWithValue("@polling", AsrJobStatuses.ToWire(AsrJobStatus.Polling));
+            sessions.Parameters.AddWithValue("@retryWait", AsrJobStatuses.ToWire(AsrJobStatus.RetryWait));
+            activeSessions = Convert.ToInt32(sessions.ExecuteScalar());
+        }
+
+        int Get(AsrJobStatus status) =>
+            counts.TryGetValue(AsrJobStatuses.ToWire(status), out var value) ? value : 0;
+
+        return new AsrQueueStatus(
+            Pending: Get(AsrJobStatus.Pending),
+            InFlight: Get(AsrJobStatus.Submitting) + Get(AsrJobStatus.Submitted) + Get(AsrJobStatus.Polling),
+            Retrying: Get(AsrJobStatus.RetryWait),
+            Succeeded: Get(AsrJobStatus.Succeeded),
+            Failed: Get(AsrJobStatus.Failed),
+            Cancelled: Get(AsrJobStatus.Cancelled),
+            Active: activeSessions);
     }
 
     private static void EnsureProviderRequestId(AsrJob job)
