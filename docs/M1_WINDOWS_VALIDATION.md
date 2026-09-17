@@ -424,7 +424,81 @@ Point `[asr.volcengine] credential` at a wrong token and run the 12.2 scenario.
 
 ---
 
-## 13. Result
+## 13. M5 additions — online dual-track capture
+
+Issue #7 (M5, *online meeting dual-track WASAPI capture*) adds behaviour that needs a **real
+render endpoint** (speakers/headphones) and, for the process row, a **running meeting
+application**. The automated coverage substitutes both boundaries with scripted capture
+sources. It lives in `tests/MeetCap.AudioPipeline.Tests/DualTrackRecordingTests.cs`,
+`tests/MeetCap.Core.Tests/Transcripts/TranscriptMergerTests.cs`,
+`tests/MeetCap.Core.Tests/Capture/AudioDeviceResolverTests.cs` (render resolution) and
+`tests/MeetCap.Cli.Tests/CaptureCommandTests.cs` (`start --mode online`).
+
+Prerequisites on top of section 2: a machine with an active render endpoint, and (for 14.5)
+a meeting application whose process name is set as `capture.online.process_name`.
+
+### 14.1 System loopback records both tracks
+
+```powershell
+meetcap start "M5 online check" --mode online
+# join an online meeting; speak into the mic while remote audio plays through the speakers
+# for about three minutes, then `meetcap stop` from another shell
+```
+
+- [ ] `session.json` records `mode: online` and `tracks: ["mic", "loopback"]`.
+- [ ] Independent chunk trees exist: `audio/mic/*.wav` and `audio/loopback/*.wav`, with no
+      `.part` left behind.
+- [ ] Each track's chunks are independently readable WAVs at the track's native format.
+- [ ] `events.jsonl` carries `source: mic` and `source: loopback` chunk events.
+- [ ] `track_health` in `session.json` has one entry per track; neither is degraded on a clean
+      stop.
+- [ ] `meetcap start` exits `0` and prints a per-track line for each track.
+
+### 14.2 Overlapping speech is preserved
+
+- [ ] Speak while remote audio is playing. The merged `transcript/raw.jsonl` contains both a
+      `mic` and a `loopback` segment covering the same `start_ms`; neither is deleted
+      (docs/ARCHITECTURE.md section 16).
+- [ ] The merged timeline is ordered by `start_ms` across both tracks.
+
+### 14.3 One track degrades without corrupting the other
+
+- [ ] While recording, disable/remove the render endpoint (or unplug headphones) so loopback
+      loses its source. The loopback track reports `capture.device_lost_fatal` and ends
+      degraded; the microphone track keeps recording.
+- [ ] The microphone chunks after the loss are still durable; the loopback chunks before the
+      loss are still durable.
+- [ ] `track_health` marks only the loopback entry `degraded` with `end_reason: device_lost`;
+      the mic entry stays healthy.
+- [ ] `meetcap start` still exits `0` when the recording itself was otherwise clean.
+
+### 14.4 Headphones vs speakers (acoustic duplicate pickup)
+
+- [ ] With **headphones**, the loopback track carries remote audio only; the microphone carries
+      local speech only (no acoustic bleed). Document the expectation.
+- [ ] **Without headphones** (speakers), the microphone may pick up the remote audio that also
+      appears on the loopback track. Confirm this is preserved (both tracks keep it) rather than
+      silently deduplicated; echo marking is a later milestone.
+
+### 14.5 Process loopback (supported systems only)
+
+```powershell
+# capture.online.loopback_mode = "process", capture.online.process_name = "WeMeet"
+meetcap start "M5 process loopback" --mode online
+```
+
+- [ ] On a supported Windows/NAudio environment, only the named meeting application's audio
+      appears on the loopback track; other system audio does not.
+- [ ] Process loopback does not create a new meeting mode — it is the same `online` session,
+      just a different `loopback_mode`.
+- [ ] If the target process is not running, `meetcap start` fails with an actionable message
+      before any session is created (no `audio/loopback/` is written).
+- [ ] If the running Windows/NAudio combination does not support process loopback, the failure
+      is actionable, not a silent fallback to system loopback.
+
+---
+
+## 14. Result
 
 | Scenario | Result | Notes |
 | --- | --- | --- |
@@ -444,6 +518,11 @@ Point `[asr.volcengine] credential` at a wrong token and run the 12.2 scenario.
 | 12.5 M4 unreadable chunk | | |
 | 12.6 M4 provider rejection | | |
 | 12.7 M4 artifact footprint | | |
+| 13.1 M5 system loopback | | |
+| 13.2 M5 overlapping speech | | |
+| 13.3 M5 one track degrades | | |
+| 13.4 M5 headphones vs speakers | | |
+| 13.5 M5 process loopback | | |
 
 M1, M2 and M4 may be described as verified on real hardware only when every row above is filled
 in and passing, or when the residual failure is written down here as a known limitation. The M4

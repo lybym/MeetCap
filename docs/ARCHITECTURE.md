@@ -384,6 +384,33 @@ closes the audio already captured, waits, re-resolves the configured endpoint, a
 restarts capture behind the same session; a device that cannot be recovered ends the
 session with everything already captured still closed and durable.
 
+### 7.2 M5 implementation: dual-track capture
+
+An online session runs the same boundary twice — once for the microphone track and once
+for the loopback track — through `IAudioRenderEnumerator` (render endpoints) and
+`IAudioCaptureSourceFactory.CreateLoopback`. The loopback source is built with NAudio 3's
+`WasapiRecorderBuilder.WithLoopbackCapture` (system, the baseline) or
+`.WithProcessLoopback` (process, the additive option), which produces the same
+span-based `WasapiRecorder` the microphone uses, so the loopback track reuses the
+`NAudioCaptureSource` adapter and no raw `ActivateAudioInterfaceAsync` / COM plumbing is
+recreated (section 2).
+
+`RecordingSession` owns one `CaptureTrack` per source. Each `CaptureTrack` is a
+self-contained copy of the M1/M2 capture-consumer-recovery runtime: its own capture
+source, bounded queue, `ChunkSpool`, `CaptureTimeline`, `CaptureBacklogMonitor` and
+device-loss recovery. The microphone and loopback queues are independent, so one capture
+callback never waits for the other (docs/RELIABILITY.md section 3), and a track that
+loses its device and cannot recover ends only itself — the other track keeps recording
+(docs/RELIABILITY.md section 8). The session ends when every track has ended, a stop is
+requested, or a storage failure occurs; a single track's fatal loss marks that track
+degraded and records `end_reason` on its `track_health` entry without ending the session.
+
+The M4 batch builder already groups chunks per source, so each track is independently
+transcribed through file ASR and `asr/batches/<source>/` keeps the two tracks separate.
+`TranscriptMerger` (MeetCap.Core.Transcripts) merges the two tracks' normalized segments
+onto one session-relative timeline ordered by `start_ms`, preserving `source` and
+overlapping speech rather than deleting it (section 16).
+
 ---
 
 ## 8. Timing

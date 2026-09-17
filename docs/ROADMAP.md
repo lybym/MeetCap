@@ -358,6 +358,59 @@ No hybrid mode is introduced.
 
 Process-specific loopback does not create a new meeting mode and should reuse NAudio support rather than custom raw WASAPI activation code where practical.
 
+## Implementation status
+
+Implemented (issue #7):
+
+- `meetcap start --mode online` resolves the configured microphone and a render endpoint
+  and runs both as independent capture tracks; `meetcap devices` lists render endpoints
+  alongside capture endpoints so `capture.online.render_device_id` is discoverable;
+- `IAudioDeviceEnumerator` exposes render endpoints and `AudioDeviceResolver.ResolveRender`
+  resolves them, so loopback device selection mirrors microphone selection;
+- `MeetCap.WindowsAudio.NAudioCaptureSourceFactory.CreateLoopback` builds the loopback
+  source through NAudio 3's `WasapiRecorderBuilder.WithLoopbackCapture` (system, the
+  baseline) and `.WithProcessLoopback` (process, the additive option), reusing the same
+  span-based `WasapiRecorder` callback and the same MeetCap-owned `NAudioCaptureSource`
+  adapter the microphone uses — no raw `ActivateAudioInterfaceAsync` / COM plumbing
+  (docs/ARCHITECTURE.md section 2);
+- `RecordingSession` orchestrates one `CaptureTrack` per source (mic for offline; mic +
+  loopback for online). Each track owns its own capture callback, bounded queue, chunk
+  spool, timeline and device-loss recovery, so one capture callback never waits for the
+  other and a track that loses its device ends only itself while the other keeps
+  recording (docs/RELIABILITY.md section 8);
+- separate chunk trees persist under `audio/mic/` and `audio/loopback/`; the M4 batch
+  builder already groups per source, so each track is independently transcribed through
+  file ASR and `asr/batches/<source>/` keeps them separate;
+- per-track health/degraded state is recorded as `track_health` in `session.json` and the
+  `session.stopped`/`asr batches:` lines report both tracks (docs/DATA_MODEL.md section 3);
+- `TranscriptMerger` merges the two tracks' segments onto one session-relative timeline
+  ordered by `start_ms`, preserving `source` and overlapping speech rather than deleting
+  it (docs/ARCHITECTURE.md section 16).
+
+No SQLite schema change: the M1 `audio_chunks` `CHECK` already allowed `mic|loopback`, the
+`sessions` `mode` `CHECK` already allowed `online`, and per-track health lives in
+`session.json`. No new configuration key: `[capture.online]` was declared from M0 and is
+now implemented.
+
+Not implemented in this milestone, and deliberately out of scope:
+
+- streaming ASR of any kind (M8);
+- speaker identity matching / voiceprint (M6/#8);
+- LLM correction or summary (M9);
+- echo-duplicate detection across mic/loopback — the merger preserves overlapping speech
+  and may mark probable echo duplicates later (docs/ARCHITECTURE.md section 16 step 6);
+- advanced AEC; the `WasapiRecorderBuilder.WithEchoCancellationReferenceEndpoint` knob is
+  left for a later milestone rather than turned on by default.
+
+Real-world validation has not been performed: the dual-track behaviour is exercised in CI
+against scripted mic + loopback capture sources, not against a real online meeting, a real
+render endpoint, or real process loopback. The manual Windows checklist for M5 is
+`docs/M1_WINDOWS_VALIDATION.md` section 13, and it has not been run (its rows need a real
+machine with a render endpoint and, for the process row, a running meeting application).
+The process-loopback path uses NAudio's `WithProcessLoopback`, so a real Windows/NAudio
+environment is required to confirm it can target a meeting application's process tree
+(`docs/DEVELOPMENT.md` section 7).
+
 ---
 
 # M6 - Speaker registry and voiceprint matching

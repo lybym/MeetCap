@@ -65,18 +65,65 @@ public class CaptureCommandTests
     }
 
     [Fact]
-    public void Start_WithOnlineMode_IsRejectedBeforeAnySessionIsCreated()
+    public async Task Start_WithOnlineMode_RecordsBothMicAndLoopbackTracks()
     {
         using var harness = CliHarness.Create();
-        harness.WriteCaptureConfig();
+        harness.WriteOnlineCaptureConfig(chunkSeconds: 1);
+        harness.Platform.Devices.SetRenderDevices(
+            new CaptureDeviceInfo("render-default", "Test Speakers", true));
 
-        var result = harness.Run("start", "Remote Review", "--mode", "online");
+        // `meetcap start --mode online` blocks while recording, so drive it from a
+        // background thread and stop it through the real `meetcap stop` command.
+        var startTask = Task.Run(() => harness.Run("start", "Remote Review", "--mode", "online"));
+
+        var sessionDirectory = WaitForSessionDirectory(harness.DataRoot);
+        Assert.NotNull(sessionDirectory);
+        WaitForActiveSession(harness.DataRoot);
+
+        var stop = harness.Run("stop");
+        var start = await AwaitBounded(
+            startTask,
+            TimeSpan.FromSeconds(60),
+            "meetcap start --mode online did not finish after meetcap stop");
+
+        Assert.Equal(0, stop.ExitCode);
+        Assert.Equal(0, start.ExitCode);
+        Assert.Contains("mode: online", start.Output);
+
+        // An online session creates independent mic and loopback chunk trees.
+        var micChunks = Directory.GetFiles(Path.Combine(sessionDirectory!, "audio", "mic"), "*.wav");
+        var loopbackChunks = Directory.GetFiles(Path.Combine(sessionDirectory!, "audio", "loopback"), "*.wav");
+        Assert.NotEmpty(micChunks);
+        Assert.NotEmpty(loopbackChunks);
+        Assert.Empty(Directory.GetFiles(Path.Combine(sessionDirectory!, "audio", "mic"), "*.part"));
+        Assert.Empty(Directory.GetFiles(Path.Combine(sessionDirectory!, "audio", "loopback"), "*.part"));
+
+        var manifest = File.ReadAllText(Path.Combine(sessionDirectory!, "session.json"));
+        Assert.Contains("\"mode\": \"online\"", manifest, StringComparison.Ordinal);
+        Assert.Contains("\"mic\"", manifest, StringComparison.Ordinal);
+        Assert.Contains("\"loopback\"", manifest, StringComparison.Ordinal);
+
+        var events = File.ReadAllText(Path.Combine(sessionDirectory!, "events.jsonl"));
+        // The event log is compact JSONL (no space after the colon), so the source labels
+        // appear as "source":"mic" / "source":"loopback".
+        Assert.Contains("\"source\":\"mic\"", events, StringComparison.Ordinal);
+        Assert.Contains("\"source\":\"loopback\"", events, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Start_WithOnlineMode_AndNoRenderDevice_FailsWithAnActionableMessage()
+    {
+        using var harness = CliHarness.Create();
+        harness.WriteOnlineCaptureConfig();
+        // No render device is offered, so loopback cannot start.
+        harness.Platform.Devices.SetRenderDevices();
+
+        var result = harness.Run("start", "No Loopback", "--mode", "online");
 
         Assert.Equal(1, result.ExitCode);
-        Assert.Contains("offline", result.Error);
-        Assert.Contains("M5", result.Error);
+        Assert.Contains("render device", result.Error, StringComparison.OrdinalIgnoreCase);
 
-        // No session directory may be created for a rejected mode.
+        // No session directory may be created when the render device cannot be resolved.
         var sessionsRoot = Path.Combine(harness.DataRoot, "sessions");
         Assert.True(!Directory.Exists(sessionsRoot) || Directory.GetDirectories(sessionsRoot).Length == 0);
     }

@@ -173,6 +173,28 @@ before M2 — or by a recording that never reached its teardown — simply lacks
     "gap_count": 1,
     "is_degraded": true
   },
+  "track_health": [
+    {
+      "source": "mic",
+      "buffer_health": { "capacity_packets": 500, "peak_queued_packets": 20, "dropped_packets": 0, "overflow_events": 0, "longest_stall_ms": 0, "stall_events": 0, "gap_total_ms": 0, "gap_count": 0, "is_degraded": false },
+      "gap_total_ms": 0,
+      "gap_count": 0,
+      "degraded": false,
+      "end_reason": null,
+      "chunks_closed": 4,
+      "closed_data_bytes": 11520000
+    },
+    {
+      "source": "loopback",
+      "buffer_health": { "capacity_packets": 500, "peak_queued_packets": 37, "dropped_packets": 0, "overflow_events": 0, "longest_stall_ms": 0, "stall_events": 0, "gap_total_ms": 1250, "gap_count": 1, "is_degraded": true },
+      "gap_total_ms": 1250,
+      "gap_count": 1,
+      "degraded": true,
+      "end_reason": "device_lost",
+      "chunks_closed": 3,
+      "closed_data_bytes": 8640000
+    }
+  ],
   "gaps_remain": false,
   "gap_details": []
 }
@@ -190,7 +212,15 @@ before M2 — or by a recording that never reached its teardown — simply lacks
   computed from those counts and written anyway so a reader does not have to re-derive it. The
   record's property names are the on-disk names, because the manifest serializer writes the
   record directly and there is no second hand-written JSON form to drift from them. It is
-  written when the recording session writes its final manifest.
+  written when the recording session writes its final manifest. For a dual-track (online)
+  session `capture_health` is the aggregate across tracks; the per-track breakdown is
+  `track_health` (docs/ROADMAP.md M5).
+- `track_health` is one entry per captured track (mic, and loopback for an online session).
+  Each entry carries the track's own `buffer_health`, gap totals, `degraded` verdict,
+  `end_reason`, `chunks_closed` and `closed_data_bytes`. The loss or degradation of one track
+  is explicit here and never silently folded into the other
+  (docs/RELIABILITY.md section 8). A reader that wants the simple "is anything wrong" verdict
+  reads `capture_health.is_degraded`; a reader that wants "which track" reads `track_health`.
 - `gaps_remain` and `gap_details` are always present, defaulting to `false` and `[]`; startup
   recovery and `meetcap session repair` set them after auditing the session: `gaps_remain` is
   true while the timeline still holds a provable gap after every repair that could be

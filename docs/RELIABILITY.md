@@ -299,3 +299,51 @@ Known limits of this milestone, stated rather than implied:
 - **The batch artifact is not deleted after its job succeeds.** An M4 session therefore keeps both
   its capture chunks and its batch WAVs. Disk-space policy (section 10) covers the failure mode,
   and reclaiming the intermediate artifacts is left to a later milestone.
+
+---
+
+## 16. M5 status
+
+This section records implementation status. It adds no requirement and weakens none of the
+sections above.
+
+Implemented, and covered by the automated suite that runs in CI (`.github/workflows/ci.yml`,
+`dotnet test` on `windows-latest`):
+
+- **One capture callback never waits for the other track (section 3).** Each online track is a
+  `CaptureTrack` with its own capture source, bounded packet queue, consumer, chunk spool,
+  timeline and device-loss recovery. The microphone and loopback queues are independent, so a
+  slow or failed loopback track cannot stall the microphone track and vice versa. Covered by
+  `tests/MeetCap.AudioPipeline.Tests/DualTrackRecordingTests.cs`.
+- **Loss/degradation of one track is explicit and does not corrupt the other (section 8).** A
+  track that loses its device and cannot recover ends only itself: it records the loss, marks
+  itself degraded, and returns from its capture loop. The session keeps recording the healthy
+  track, and the closed chunks of both stay durable. The per-track `track_health` in
+  `session.json` names which track was degraded and why, so the loss is never silently folded
+  into the other track. Covered by
+  `DualTrackRecordingTests.OneTrackDeviceLoss_DoesNotCorruptTheOtherTrack`.
+- **Independent timing metadata per source (section 7).** Each track has its own
+  `CaptureTimeline`; the microphone and loopback chunk trees carry independent 1-based sequences
+  and session-relative spans. Covered by
+  `DualTrackRecordingTests.OnlineSession_PreservesSessionRelativeTimelinePerTrack`.
+- **Tracks are never mixed before ASR (section 1, docs/ARCHITECTURE.md section 6).** The merger
+  orders the two tracks' segments by `start_ms` and preserves `source` and overlapping speech; it
+  never combines audio. Covered by `tests/MeetCap.Core.Tests/Transcripts/TranscriptMergerTests.cs`.
+
+Known limits of this milestone, stated rather than implied:
+
+- **No soak test has been run.** The issue's required validation — a two-hour online meeting on
+  real Windows hardware using system loopback, both tracks staying readable, source labels
+  correct, a network outage affecting ASR only, and process loopback on a supported system — is
+  exercised in CI against scripted capture sources, not against a real online meeting, a real
+  render endpoint, or the real Volcengine service. `docs/M1_WINDOWS_VALIDATION.md` holds the M5
+  checklist as section 13 and it has not been run. This is automated coverage, not real-world
+  validation (`docs/DEVELOPMENT.md` section 7).
+- **Process loopback depends on the running Windows/NAudio combination.** The
+  `WithProcessLoopback` path is implemented through NAudio and not exercised against a real
+  meeting application here; a machine that does not support process loopback fails the start with
+  an actionable message rather than silently degrading to system loopback.
+- **No echo-duplicate detection.** The same words can appear on both tracks (a local speaker
+  picked up by the microphone and again by the loopback); the merger preserves both rather than
+  deleting either, and marking probable echo duplicates is left to a later milestone
+  (docs/ARCHITECTURE.md section 16 step 6).

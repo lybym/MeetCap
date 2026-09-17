@@ -34,6 +34,35 @@ public sealed record CaptureTrackInfo(
 }
 
 /// <summary>
+/// The durable, per-track health snapshot recorded in <c>session.json</c> for an online
+/// session (docs/ROADMAP.md M5). Each track's bounded-buffer accounting, gap totals and
+/// degraded verdict are kept separate so the loss of one track is explicit and never
+/// folded into the other (docs/RELIABILITY.md section 8).
+/// </summary>
+public sealed record TrackHealth(
+    string Source,
+    AudioBufferHealth BufferHealth,
+    long GapTotalMs,
+    int GapCount,
+    bool Degraded,
+    string? EndReason,
+    int ChunksClosed,
+    long ClosedDataBytes)
+{
+    public TrackHealth() : this(
+        string.Empty,
+        AudioBufferHealth.Empty,
+        0,
+        0,
+        false,
+        null,
+        0,
+        0)
+    {
+    }
+}
+
+/// <summary>
 /// Durable session description written to <c>sessions/&lt;id&gt;/session.json</c>
 /// (docs/DATA_MODEL.md section 3).
 /// </summary>
@@ -90,7 +119,19 @@ public sealed class SessionManifest
     /// packets the bound refused, and how long a stalled consumer held a backlog
     /// (docs/RELIABILITY.md section 4).
     /// </summary>
+    /// <remarks>
+    /// For a dual-track (online) session this is the aggregate across tracks; the
+    /// per-track breakdown is in <see cref="TrackHealth"/> (docs/ROADMAP.md M5).
+    /// </remarks>
     public AudioBufferHealth? CaptureHealth { get; set; }
+
+    /// <summary>
+    /// Per-track capture health and degraded state. An online session has one entry per
+    /// track (mic and loopback); an offline session has one entry. Loss or degradation of
+    /// one track is explicit here and never silently folded into the other track
+    /// (docs/ROADMAP.md M5, docs/RELIABILITY.md section 8).
+    /// </summary>
+    public IReadOnlyList<TrackHealth> TrackHealth { get; set; } = Array.Empty<TrackHealth>();
 
     /// <summary>
     /// Set by startup recovery or <c>meetcap session repair</c> when the session's

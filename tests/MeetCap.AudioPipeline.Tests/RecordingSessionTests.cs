@@ -492,7 +492,7 @@ public class RecordingSessionTests
             harness.Platform,
             harness.Database,
             new JsonlSessionEventSink(paths.EventsPath),
-            harness.Device,
+            harness.MicTrackSpecs(),
             harness.Clock,
             ReadManifest(paths),
             maxDeviceRecoveryAttempts: 0,

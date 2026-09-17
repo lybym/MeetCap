@@ -61,10 +61,19 @@ public sealed class SessionPaths
         => Path.Combine(SessionDirectory, AudioFolderName, source.ToWireName());
 
     /// <summary>Creates the session directory tree. Safe to call repeatedly.</summary>
-    public void CreateDirectories()
+    /// <param name="includeLoopback">
+    /// When true, also creates <c>audio/loopback/</c> for an online session. Offline
+    /// sessions omit it (docs/DATA_MODEL.md section 2: for offline mode,
+    /// <c>audio/loopback/</c> is absent).
+    /// </param>
+    public void CreateDirectories(bool includeLoopback = false)
     {
         Directory.CreateDirectory(SessionDirectory);
         Directory.CreateDirectory(AudioDirectory(AudioSource.Mic));
+        if (includeLoopback)
+        {
+            Directory.CreateDirectory(AudioDirectory(AudioSource.Loopback));
+        }
     }
 
     /// <summary>The durable chunk name, e.g. <c>000001.wav</c>.</summary>

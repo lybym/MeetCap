@@ -2,6 +2,21 @@ namespace MeetCap.Core.Capture;
 
 using MeetCap.Core.Configuration;
 using MeetCap.Core.Diagnostics;
+using MeetCap.Core.Sessions;
+
+/// <summary>
+/// The resolved, session-scoped capture settings for the loopback track of an online
+/// session (docs/ARCHITECTURE.md section 5, docs/ROADMAP.md M5). Carried as a
+/// MeetCap-owned value so no NAudio type crosses the assembly boundary.
+/// </summary>
+public sealed record OnlineCaptureSettings(
+    string MicrophoneDeviceId,
+    string LoopbackMode,
+    string RenderDeviceId,
+    string ProcessName)
+{
+    public string ProcessName { get; } = ProcessName ?? string.Empty;
+}
 
 /// <summary>
 /// The resolved, session-scoped capture settings. A session uses the configuration
@@ -24,7 +39,9 @@ public sealed class CaptureSettings
         int flushIntervalMs,
         double minimumFreeSpaceGb,
         string microphoneDeviceId,
-        int configVersion)
+        int configVersion,
+        string mode = SessionModes.Offline,
+        OnlineCaptureSettings? online = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(dataRoot);
 
@@ -51,6 +68,21 @@ public sealed class CaptureSettings
                 "Minimum free space must be greater than 0.");
         }
 
+        if (!SessionModes.IsKnown(mode))
+        {
+            throw new ArgumentException(
+                $"Unknown session mode '{mode}'. Allowed: {SessionModes.Offline}, {SessionModes.Online}.",
+                nameof(mode));
+        }
+
+        if (online is not null && !string.Equals(mode, SessionModes.Online, StringComparison.Ordinal))
+        {
+            throw new ArgumentException(
+                "Online capture settings were supplied for a non-online session mode. " +
+                $"Mode is '{mode}'; online settings are only valid for '{SessionModes.Online}'.",
+                nameof(online));
+        }
+
         DataRoot = dataRoot;
         ChunkSeconds = chunkSeconds;
         BufferSeconds = bufferSeconds;
@@ -58,6 +90,8 @@ public sealed class CaptureSettings
         MinimumFreeSpaceGb = minimumFreeSpaceGb;
         MicrophoneDeviceId = microphoneDeviceId ?? string.Empty;
         ConfigVersion = configVersion;
+        Mode = mode;
+        Online = online;
     }
 
     public string DataRoot { get; }
@@ -74,6 +108,23 @@ public sealed class CaptureSettings
 
     public int ConfigVersion { get; }
 
+    /// <summary>
+    /// The session mode these settings started a recording in: <c>offline</c> or
+    /// <c>online</c> (docs/PRD.md section 4). The loopback track is captured only when
+    /// this is <c>online</c>.
+    /// </summary>
+    public string Mode { get; }
+
+    /// <summary>
+    /// Loopback capture configuration for an online session. <c>null</c> for offline,
+    /// in which case only the microphone track is captured (docs/ARCHITECTURE.md
+    /// section 5).
+    /// </summary>
+    public OnlineCaptureSettings? Online { get; }
+
+    /// <summary>True when this session captures both the microphone and loopback tracks.</summary>
+    public bool IsOnline => string.Equals(Mode, SessionModes.Online, StringComparison.Ordinal);
+
     /// <summary>The configured warning threshold in bytes.</summary>
     public long MinimumFreeSpaceBytes => (long)(MinimumFreeSpaceGb * 1024 * 1024 * 1024);
 
@@ -82,22 +133,53 @@ public sealed class CaptureSettings
     /// resolved data root (which may come from the one-shot <c>--data-root</c>
     /// override rather than the file).
     /// </summary>
-    public static CaptureSettings FromConfiguration(MeetCapConfiguration configuration, string dataRoot)
+    /// <param name="mode">
+    /// The effective session mode (the <c>--mode</c> override when supplied, otherwise
+    /// <c>capture.default_mode</c>). When <c>null</c> or empty, the configured default
+    /// mode is used.
+    /// </param>
+    public static CaptureSettings FromConfiguration(
+        MeetCapConfiguration configuration,
+        string dataRoot,
+        string? mode = null)
     {
         ArgumentNullException.ThrowIfNull(configuration);
         ArgumentException.ThrowIfNullOrWhiteSpace(dataRoot);
 
         var capture = configuration.Capture;
+        var effectiveMode = string.IsNullOrWhiteSpace(mode)
+            ? capture.DefaultMode
+            : mode;
+
+        OnlineCaptureSettings? online = null;
+        if (string.Equals(effectiveMode, SessionModes.Online, StringComparison.Ordinal))
+        {
+            online = new OnlineCaptureSettings(
+                capture.Online.MicrophoneDeviceId,
+                capture.Online.LoopbackMode,
+                capture.Online.RenderDeviceId,
+                capture.Online.ProcessName);
+        }
+
         try
         {
+            // The microphone device id is mode-specific: an online session uses the
+            // online microphone setting; an offline session uses the offline one. The
+            // pipeline resolves whichever one applies from the mode.
+            var microphoneDeviceId = online is not null
+                ? online.MicrophoneDeviceId
+                : capture.Offline.MicrophoneDeviceId;
+
             return new CaptureSettings(
                 dataRoot,
                 capture.ChunkSeconds,
                 capture.BufferSeconds,
                 capture.FlushIntervalMs,
                 configuration.Storage.MinimumFreeSpaceGb,
-                capture.Offline.MicrophoneDeviceId,
-                configuration.ConfigVersion);
+                microphoneDeviceId,
+                configuration.ConfigVersion,
+                effectiveMode,
+                online);
         }
         catch (ArgumentOutOfRangeException ex)
         {

@@ -38,12 +38,13 @@ internal static class StartCommand
             ? load.Configuration.Capture.DefaultMode
             : mode;
 
-        if (!string.Equals(effectiveMode, SessionModes.Offline, StringComparison.Ordinal))
+        if (!string.Equals(effectiveMode, SessionModes.Offline, StringComparison.Ordinal) &&
+            !string.Equals(effectiveMode, SessionModes.Online, StringComparison.Ordinal))
         {
             context.Error.WriteLine(
                 $"meetcap start: mode '{effectiveMode}' is not available. " +
-                "M1 records offline sessions only; online (loopback) capture arrives with M5 and " +
-                "hybrid meetings are explicitly out of scope.");
+                "Use 'offline' for a single microphone track or 'online' for a microphone + " +
+                "loopback dual-track capture; hybrid meetings are out of scope.");
             return 1;
         }
 
@@ -57,7 +58,7 @@ internal static class StartCommand
         try
         {
             dataRoot = context.ResolveDataRoot(load.Configuration);
-            settings = CaptureSettings.FromConfiguration(load.Configuration, dataRoot);
+            settings = CaptureSettings.FromConfiguration(load.Configuration, dataRoot, effectiveMode);
             service = context.CreateCaptureService(settings);
         }
         catch (MeetCapException ex)
@@ -122,7 +123,7 @@ internal static class StartCommand
 
             context.Out.WriteLine($"session: {session.SessionId}");
             context.Out.WriteLine($"title: {effectiveTitle}");
-            context.Out.WriteLine($"mode: {SessionModes.Offline}");
+            context.Out.WriteLine($"mode: {effectiveMode}");
             context.Out.WriteLine($"output: {session.SessionDirectory}");
             if (transcription is not null)
             {
@@ -267,6 +268,23 @@ internal static class StartCommand
         context.Out.WriteLine($"session: {outcome.SessionId} ({outcome.Status})");
         context.Out.WriteLine($"duration: {FormatDuration(outcome.DurationMs)}");
         context.Out.WriteLine($"chunks closed: {outcome.ChunksClosed} ({outcome.ClosedDataBytes / 1024 / 1024} MB)");
+
+        // Per-track health is reported when the session captured more than one track, so
+        // the loss or degradation of one track is visible rather than folded into the
+        // other (docs/ROADMAP.md M5, docs/RELIABILITY.md section 8).
+        if (outcome.TrackHealth.Count > 1)
+        {
+            foreach (var track in outcome.TrackHealth)
+            {
+                var trackNote = track.Degraded
+                    ? $"degraded ({track.EndReason ?? "unknown"})"
+                    : "healthy";
+                context.Out.WriteLine(
+                    $"  {track.Source}: {track.ChunksClosed} chunk(s), " +
+                    $"{track.BufferHealth.PeakQueuedPackets}/{track.BufferHealth.CapacityPackets} peak packets, " +
+                    $"dropped {track.BufferHealth.DroppedPackets}, {trackNote}");
+            }
+        }
 
         // The bounded-buffer accounting is reported on a clean run too: "the queue never
         // came close to its bound" is the evidence docs/RELIABILITY.md section 4 asks for,
