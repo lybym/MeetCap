@@ -504,6 +504,27 @@ meetcap start "M5 process loopback" --mode online
 - [ ] If the running Windows/NAudio combination does not support process loopback, the failure
       is actionable, not a silent fallback to system loopback.
 
+### 13.6 Two sessions into one data root both get their transcript
+
+Record one online meeting, let it finish, then record a second one into the **same** data root with
+`asr.enabled = true` and the same provider configuration. Batch numbering restarts per session while
+`asr_jobs` is one table shared by every session, so this is the case where two sessions can collide
+on one job primary key.
+
+- [ ] The first session's stop summary reports its jobs advanced, and its `transcript/raw.jsonl`
+      holds both `mic` and `loopback` segments.
+- [ ] The **second** session's stop summary also reports jobs advanced — not
+      `N queued, 0 job(s) advanced` — and its own `transcript/raw.jsonl` is written.
+- [ ] Both sessions' `asr/jobs/` directories hold their own job artifacts, and each session's
+      `session.json` reaches `COMPLETED`.
+- [ ] Every row of `select id, session_id, input_artifact from asr_jobs;` belongs to the session
+      whose `asr/batches/` tree holds that `input_artifact`. A batch counted as queued with no job
+      row of its own is the silent-loss failure mode this check exists for
+      (`docs/ARCHITECTURE.md` section 7.2).
+- [ ] If a session still reported batches queued with no job, `meetcap asr resume --session <id>
+      --force` either transcribes them or fails visibly; a `COMPLETED` session with no transcript
+      and no explanation is a defect.
+
 ---
 
 ## 14. Result
@@ -531,6 +552,7 @@ meetcap start "M5 process loopback" --mode online
 | 13.3 M5 one track degrades | | |
 | 13.4 M5 headphones vs speakers | | |
 | 13.5 M5 process loopback | | |
+| 13.6 M5 two sessions, one data root | | |
 
 M1, M2 and M4 may be described as verified on real hardware only when every row above is filled
 in and passing, or when the residual failure is written down here as a known limitation. The M4
