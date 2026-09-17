@@ -735,9 +735,12 @@ Three properties of that ordering are deliberate:
   timeline without hiding it: the window closes on captured audio time, not on wall-clock span,
   so a device outage produces a batch whose declared span is longer than the audio inside it,
   and the manifest states where each chunk really sits.
-- **Recovery is idempotent.** The job id is derived from the batch artifact path
-  (`job_batch-NNNNNN`), so re-running recovery against a batch file that already has a job is a
-  no-op. `RecoverFinalizedBatches` re-queues a finalized batch whose job row is missing and
+- **Recovery is idempotent.** The job id is derived from the batch artifact path and its session
+  (`job_<session>_<source>_batch-NNNNNN`), so re-running recovery against a batch file that already
+  has a job is a no-op. The session is part of the identity because batch numbering restarts at 1
+  per track per session while `asr_jobs` is one table shared by every session in a data root; the
+  idempotency check itself matches `input_artifact` within the session, which also recognises rows
+  written before the id carried those scopes. `RecoverFinalizedBatches` re-queues a finalized batch whose job row is missing and
   discards any `.part` left by an unfinished batch; the chunks it would have contained are still
   durable and are picked up by the next window. It runs from both `meetcap start` and
   `meetcap asr resume`, because the documented restart entry point has to be able to see the whole

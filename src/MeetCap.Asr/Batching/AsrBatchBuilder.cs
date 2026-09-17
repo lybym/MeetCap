@@ -294,10 +294,10 @@ public sealed class AsrBatchBuilder
                 continue;
             }
 
-            // The manifest names the source, so the job id can be derived from it. Checked
-            // after reading rather than before because the id no longer depends on the file
-            // name alone: two tracks can hold same-named batch files.
-            if (HasJobForArtifact(jobs, sessionId, batch.Source, relativePath))
+            // The manifest names the source, so the job id can be derived from it. Checked after
+            // reading rather than before because the id needs the source and the idempotency
+            // check is scoped to this session's jobs.
+            if (HasJobForArtifact(jobs, sessionId, relativePath))
             {
                 continue;
             }
@@ -712,17 +712,17 @@ public sealed class AsrBatchBuilder
         ISessionEventSink? events,
         Action? onQueued)
     {
-        if (HasJobForArtifact(jobs, batch.SessionId, batch.Source, batch.RelativePath))
+        if (HasJobForArtifact(jobs, batch.SessionId, batch.RelativePath))
         {
-            // Idempotent: a job derived from this batch artifact already exists, so the audio
-            // must not be queued (and therefore billed) a second time.
+            // Idempotent: a job derived from this batch artifact already exists in this session,
+            // so the audio must not be queued (and therefore billed) a second time.
             return batch;
         }
 
         var now = options.TimeProvider.GetUtcNow();
         var job = new AsrJob
         {
-            Id = JobIdFor(batch.Source, batch.RelativePath),
+            Id = JobIdFor(batch.SessionId, batch.Source, batch.RelativePath),
             SessionId = batch.SessionId,
             Source = batch.Source,
             Tier = options.ServiceTier,
@@ -791,52 +791,64 @@ public sealed class AsrBatchBuilder
     }
 
     /// <remarks>
-    /// Two lookups, deliberately. The id lookup finds a job this builder version derived. The
-    /// artifact lookup then also finds a job whose id was derived by the earlier
-    /// file-name-only scheme (<c>job_batch-NNNNNN</c>), so an M4-era row is still recognised as
-    /// "this batch is already queued" after the id gained its source qualifier. Without it,
-    /// recovery would queue the same audio again and bill it twice.
+    /// Deliberately scoped to this session. The artifact path is unique only inside one
+    /// session's <c>asr/batches/</c> tree — every session numbers its batches from 1 again — while
+    /// <c>asr_jobs</c> is one table shared by every session in the data root and keyed on
+    /// <c>id</c>. An unscoped id lookup therefore found a previous session's job for the same
+    /// (source, batch number), took the idempotency branch, and created no row and no event at
+    /// all, while the caller still counted the batch as queued: the session finished COMPLETED
+    /// with no transcript and `meetcap asr resume` could not repair it. Matching on
+    /// <c>input_artifact</c> within the session is exact for every job this builder creates,
+    /// because each one stores the session-relative batch path it was built from.
     /// </remarks>
     private static bool HasJobForArtifact(
         IAsrJobStore jobs,
         string sessionId,
-        string source,
         string relativePath)
-    {
-        if (jobs.Get(JobIdFor(source, relativePath)) is not null)
-        {
-            return true;
-        }
-
-        return jobs.ListBySession(sessionId)
+        => jobs.ListBySession(sessionId)
             .Any(job => string.Equals(job.InputArtifact, relativePath, StringComparison.Ordinal));
-    }
-
-    private bool HasJobForArtifact(string sessionId, string source, string relativePath)
-        => HasJobForArtifact(_jobs, sessionId, source, relativePath);
 
     /// <summary>
-    /// Derives the job id from the batch's source and artifact file name, so a batch file and
-    /// its job are matched deterministically and re-running recovery cannot queue the same
-    /// audio twice.
+    /// Derives the job id from the batch's session, source and artifact file name, so a batch
+    /// file and its job are matched deterministically and re-running recovery cannot queue the
+    /// same audio twice.
     /// </summary>
     /// <remarks>
-    /// The source has to be part of the id. Batch numbering restarts at 1 for every track
-    /// (<see cref="NextBatchNumber"/>), so an online session produces both
-    /// <c>asr/batches/mic/batch-000001.wav</c> and
-    /// <c>asr/batches/loopback/batch-000001.wav</c>. Deriving the id from the file name alone
-    /// gave both the id <c>job_batch-000001</c>; because <c>asr_jobs.id</c> is the primary key,
-    /// the second track's job silently replaced the first, and one of the two tracks was never
-    /// transcribed (docs/ARCHITECTURE.md section 7.2, docs/ROADMAP.md M5).
+    /// <para>
+    /// The id must carry every scope in which the artifact name is only locally unique, because
+    /// <c>asr_jobs.id</c> is the primary key of one table shared by every session in a data root.
+    /// Batch numbering restarts at 1 per track <em>per session</em>
+    /// (<see cref="NextBatchNumber"/> counts inside the session's own <c>asr/batches/</c> tree),
+    /// so the file-name-only scheme gave every session's first microphone batch the id
+    /// <c>job_batch-000001</c>, and adding only the source still collided across sessions
+    /// (<c>job_mic_batch-000001</c>).
+    /// </para>
+    /// <para>
+    /// The silent failure mode a colliding id produces is <em>suppression</em>, not replacement:
+    /// the dedup check finds the other session's job and returns without creating a row or writing
+    /// an event at all, while the caller still counts the batch as queued — so the session finishes
+    /// COMPLETED with no job, no transcript and nothing for <c>meetcap asr resume</c> to repair.
+    /// Replacement is only reachable when two callbacks race past the guard and the second
+    /// <c>INSERT</c> hits the duplicate primary key, which <c>CaptureTrack.AnnounceClosedChunk</c>
+    /// contains as a <c>capture.discontinuity</c> event. Suppression is the outcome that matters: it
+    /// is deterministic and invisible.
+    /// </para>
+    /// <para>
+    /// With the session in the id, two sessions cannot collide, and the job id stays a pure
+    /// function of (session, source, batch number), so recovery re-derives the same id and the
+    /// session-scoped artifact lookup above recognises the row as already queued.
+    /// </para>
     /// </remarks>
-    internal static string JobIdFor(string source, string relativeBatchPath)
+    internal static string JobIdFor(string sessionId, string source, string relativeBatchPath)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(sessionId);
         ArgumentException.ThrowIfNullOrWhiteSpace(source);
         ArgumentException.ThrowIfNullOrWhiteSpace(relativeBatchPath);
 
         var name = SanitizeForId(Path.GetFileNameWithoutExtension(relativeBatchPath));
         var track = SanitizeForId(source);
-        return Ids.JobPrefix + track + "_" + name;
+        var session = SanitizeForId(sessionId);
+        return Ids.JobPrefix + session + "_" + track + "_" + name;
     }
 
     private static string SanitizeForId(string value)

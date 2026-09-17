@@ -590,7 +590,8 @@ internal sealed class CaptureTrack : IDisposable
             Source = _source.ToWireName(),
             Detail =
                 $"capture on the '{_source.ToWireName()}' track could not be resumed at the session format; " +
-                "the track ends with the audio already captured still closed. The other track is unaffected.",
+                "the track is ending and its final chunk is closed and indexed as it ends. " +
+                "The other track is unaffected.",
         });
     }
 
@@ -601,8 +602,8 @@ internal sealed class CaptureTrack : IDisposable
             Source = _source.ToWireName(),
             Count = attempts,
             Detail =
-                $"capture on the '{_source.ToWireName()}' track could not be recovered; the track ends with " +
-                "the audio already captured still closed. The other track is unaffected.",
+                $"capture on the '{_source.ToWireName()}' track could not be recovered; the track is " +
+                "ending and its final chunk is closed and indexed as it ends. The other track is unaffected.",
         });
     }
 

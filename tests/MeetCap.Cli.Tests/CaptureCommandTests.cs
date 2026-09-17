@@ -228,6 +228,64 @@ public class CaptureCommandTests
     }
 
     [Fact]
+    public async Task Start_WhenOneTrackIsLost_ExitsNonZeroAndReportsTheDegradedTrack()
+    {
+        // A lost track makes the session degraded, and `meetcap start` reserves exit 0 for a clean
+        // run (docs/DEVELOPMENT.md section 8). docs/M1_WINDOWS_VALIDATION.md checklist 13.3 is the
+        // manual step for exactly this scenario, so the exit code it tells a human to expect has to
+        // be pinned here.
+        using var harness = CliHarness.Create();
+        harness.WriteOnlineCaptureConfig(chunkSeconds: 1);
+        harness.Platform.Devices.SetRenderDevices(
+            new CaptureDeviceInfo("render-default", "Test Speakers", true));
+
+        var startTask = Task.Run(() => harness.Run("start", "Online Partial Loss", "--mode", "online"));
+
+        var sessionDirectory = WaitForSessionDirectory(harness.DataRoot);
+        Assert.NotNull(sessionDirectory);
+        WaitForActiveSession(harness.DataRoot);
+
+        var loopbackSource = await WaitForLoopbackSource(harness);
+        Assert.Equal(1, loopbackSource.StartCount);
+
+        // The render endpoint disappears and the loopback source stops: the track cannot recover
+        // (the endpoint is gone) and ends fatally, while the microphone track keeps recording.
+        harness.Platform.Devices.SetRenderDevices();
+        loopbackSource.Stop();
+
+        var eventsPath = Path.Combine(sessionDirectory!, "events.jsonl");
+        Assert.True(
+            await WaitForEvent(eventsPath, "capture.device_lost_fatal"),
+            $"the loopback track never reported a fatal loss; events: {ReadTextSharing(eventsPath)}");
+
+        // End the session now that the loss is recorded; the mic track stops cleanly.
+        harness.Run("stop");
+        var start = await AwaitBounded(
+            startTask,
+            TimeSpan.FromSeconds(90),
+            "meetcap start --mode online did not finish after one track was lost");
+
+        // The recording itself was otherwise clean — the mic track kept recording and every chunk
+        // is durable — but the lost track makes the session degraded, so the run is not "clean".
+        Assert.Equal(1, start.ExitCode);
+        Assert.Contains(
+            "the session ended with reported audio or storage problems",
+            start.Error,
+            StringComparison.Ordinal);
+        Assert.Contains("degraded: yes", start.Output, StringComparison.Ordinal);
+
+        // The per-track lines name the degraded track and its reason.
+        Assert.Contains("  mic: ", start.Output, StringComparison.Ordinal);
+        Assert.Contains("  loopback: ", start.Output, StringComparison.Ordinal);
+        Assert.Contains("degraded (device_lost)", start.Output, StringComparison.Ordinal);
+
+        // The healthy track's audio is still durable, and the failed track's tail was finalized.
+        Assert.NotEmpty(Directory.GetFiles(Path.Combine(sessionDirectory!, "audio", "mic"), "*.wav"));
+        Assert.Empty(Directory.GetFiles(Path.Combine(sessionDirectory!, "audio", "mic"), "*.part"));
+        Assert.Empty(Directory.GetFiles(Path.Combine(sessionDirectory!, "audio", "loopback"), "*.part"));
+    }
+
+    [Fact]
     public void Start_WithAnUnknownMode_IsRejected()
     {
         using var harness = CliHarness.Create();
@@ -562,6 +620,69 @@ public class CaptureCommandTests
         Assert.Equal(1, result.ExitCode);
         Assert.Contains("was not found", result.Output);
         Assert.Contains("meetcap status", result.Error);
+    }
+
+    /// <summary>
+    /// Waits until the online session has built and started the loopback capture source, so a test
+    /// can fail that track without racing session startup.
+    /// </summary>
+    private static async Task<FakeCaptureSource> WaitForLoopbackSource(CliHarness harness)
+    {
+        var deadline = Environment.TickCount64 + 30_000;
+        while (Environment.TickCount64 < deadline)
+        {
+            var started = harness.Platform.Sources.LoopbackCreated.FirstOrDefault(s => s.StartCount == 1);
+            if (started is not null)
+            {
+                return started;
+            }
+
+            await Task.Delay(25).ConfigureAwait(false);
+        }
+
+        throw new TimeoutException("the online session never started a loopback capture source.");
+    }
+
+    /// <summary>Waits until <paramref name="eventName"/> appears in the session's event log.</summary>
+    private static async Task<bool> WaitForEvent(string eventsPath, string eventName)
+    {
+        var deadline = Environment.TickCount64 + 30_000;
+        while (Environment.TickCount64 < deadline)
+        {
+            if (ReadTextSharing(eventsPath).Contains($"\"{eventName}\"", StringComparison.Ordinal))
+            {
+                return true;
+            }
+
+            await Task.Delay(50).ConfigureAwait(false);
+        }
+
+        return false;
+    }
+
+    /// <summary>Reads a file the recorder still holds open, for diagnostics and event polling.</summary>
+    private static string ReadTextSharing(string path)
+    {
+        if (!File.Exists(path))
+        {
+            return string.Empty;
+        }
+
+        try
+        {
+            using var stream = new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            using var reader = new StreamReader(stream);
+            return reader.ReadToEnd();
+        }
+        catch (IOException)
+        {
+            // The recorder may be mid-write; the next poll will see more.
+            return string.Empty;
+        }
     }
 
     /// <summary>

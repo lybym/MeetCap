@@ -470,7 +470,10 @@ meetcap start "M5 online check" --mode online
       loss are still durable.
 - [ ] `track_health` marks only the loopback entry `degraded` with `end_reason: device_lost`;
       the mic entry stays healthy.
-- [ ] `meetcap start` still exits `0` when the recording itself was otherwise clean.
+- [ ] `meetcap start` exits `1` and prints the per-track degraded line for the loopback track
+      (`  loopback: N chunk(s), ... degraded (device_lost)`). A lost track makes the session
+      degraded, so the run is not reported as clean (`docs/DEVELOPMENT.md` section 8); the
+      microphone track's own chunks stay durable and the recording is otherwise intact.
 
 ### 13.4 Headphones vs speakers (acoustic duplicate pickup)
 

@@ -57,8 +57,13 @@ public class AsrBatchBuilderTests : IDisposable
                 TimeProvider = TimeProvider.System,
             });
 
-    /// <summary>Writes a real durable chunk file and describes it the way the recorder does.</summary>
+    /// <summary>
+    /// Writes a real durable chunk file for <paramref name="sessionId"/> and describes it the way
+    /// the recorder does. A second session id is what makes a cross-session job-id collision
+    /// observable, so the session is a parameter rather than always <see cref="SessionId"/>.
+    /// </summary>
     private ClosedAudioChunk CreateChunk(
+        string sessionId,
         int sequence,
         long startMs,
         long durationMs,
@@ -67,8 +72,9 @@ public class AsrBatchBuilderTests : IDisposable
         string source = AudioSources.Mic)
     {
         var effectiveFormat = format ?? s_format;
+        var paths = new SessionArtifactPaths(_dataRoot, sessionId);
         var relativePath = Path.Combine("audio", source, $"{sequence:D6}.wav").Replace('\\', '/');
-        var finalPath = Paths.ResolveRelative(relativePath);
+        var finalPath = paths.ResolveRelative(relativePath);
         var partPath = finalPath + ".part";
 
         Directory.CreateDirectory(Path.GetDirectoryName(finalPath)!);
@@ -85,7 +91,7 @@ public class AsrBatchBuilderTests : IDisposable
 
         return new ClosedAudioChunk
         {
-            SessionId = SessionId,
+            SessionId = sessionId,
             Source = source,
             Sequence = sequence,
             FilePath = finalPath,
@@ -96,6 +102,16 @@ public class AsrBatchBuilderTests : IDisposable
             Format = effectiveFormat,
         };
     }
+
+    /// <summary>Writes a chunk for this test's default session.</summary>
+    private ClosedAudioChunk CreateChunk(
+        int sequence,
+        long startMs,
+        long durationMs,
+        byte fill = 0x7f,
+        AudioFormat? format = null,
+        string source = AudioSources.Mic)
+        => CreateChunk(SessionId, sequence, startMs, durationMs, fill, format, source);
 
     [Fact]
     public void BatchStaysOpenUntilTheConfiguredWindowIsCovered()
@@ -308,28 +324,99 @@ public class AsrBatchBuilderTests : IDisposable
     }
 
     [Fact]
-    public void JobIdFor_IsUniquePerTrackWhenBothTracksUseTheSameBatchNumber()
+    public void JobIdFor_IsUniquePerSessionAndPerTrackWhenBothUseTheSameBatchNumber()
     {
-        // Batch numbers restart at 1 for every track, so mic and loopback both produce
-        // batch-000001.wav. The id has to carry the source or the two jobs collide on
-        // asr_jobs.id (a primary key) and one track is silently never transcribed.
-        var mic = AsrBatchBuilder.JobIdFor(AudioSources.Mic, "asr/batches/mic/batch-000001.wav");
-        var loopback = AsrBatchBuilder.JobIdFor(AudioSources.Loopback, "asr/batches/loopback/batch-000001.wav");
+        // Batch numbers restart at 1 for every track *and* for every session, while asr_jobs.id
+        // is the primary key of one table shared by all sessions in a data root. The id
+        // therefore has to carry both scopes, or two sessions collide on the same row.
+        var mic = AsrBatchBuilder.JobIdFor(SessionId, AudioSources.Mic, "asr/batches/mic/batch-000001.wav");
+        var loopback = AsrBatchBuilder.JobIdFor(SessionId, AudioSources.Loopback, "asr/batches/loopback/batch-000001.wav");
+        var otherSession = AsrBatchBuilder.JobIdFor("ses_other_1", AudioSources.Mic, "asr/batches/mic/batch-000001.wav");
 
         Assert.NotEqual(mic, loopback);
+        Assert.NotEqual(mic, otherSession);
         Assert.Contains(AudioSources.Mic, mic, StringComparison.Ordinal);
         Assert.Contains(AudioSources.Loopback, loopback, StringComparison.Ordinal);
+        Assert.Contains(SessionId, mic, StringComparison.Ordinal);
+        Assert.Contains("ses_other_1", otherSession, StringComparison.Ordinal);
 
         // Deterministic, so the same artifact always maps to the same job.
-        Assert.Equal(mic, AsrBatchBuilder.JobIdFor(AudioSources.Mic, "asr/batches/mic/batch-000001.wav"));
+        Assert.Equal(mic, AsrBatchBuilder.JobIdFor(SessionId, AudioSources.Mic, "asr/batches/mic/batch-000001.wav"));
+    }
+
+    [Fact]
+    public void ASecondSessionInTheSameDataRootStillQueuesItsOwnBatchOne()
+    {
+        // The regression test for the cross-session collision. Every other batching test uses one
+        // session id, so an id that is unique per (source, batch number) but not per session looks
+        // correct. Here two sessions share one job store — exactly what the single meetcap.db
+        // does — and each must end up with its own job for its own batch-000001.
+        //
+        // Each session gets its own builder, as production does: a builder is constructed per
+        // recording/batch region, and its batch counter is per (builder, source).
+        const string alpha = "ses_alpha_1";
+        const string beta = "ses_beta_1";
+
+        var alphaBuilder = CreateBuilder(batchSeconds: 20);
+        var alphaBatch = QueueOneWindow(alphaBuilder, alpha, AudioSources.Mic, fill: 0x11);
+
+        var betaBuilder = CreateBuilder(batchSeconds: 20);
+        var betaBatch = QueueOneWindow(betaBuilder, beta, AudioSources.Mic, fill: 0x22);
+
+        // Both sessions produced their own batch-000001 — the artifact name is only unique within
+        // a session — and both batches were reported as queued.
+        Assert.NotNull(alphaBatch);
+        Assert.NotNull(betaBatch);
+        Assert.Equal("asr/batches/mic/batch-000001.wav", alphaBatch!.RelativePath);
+        Assert.Equal(alphaBatch.RelativePath, betaBatch!.RelativePath);
+        Assert.NotEqual(alphaBatch.FilePath, betaBatch.FilePath);
+
+        // ...and each session really has its own job, pointing at its own artifact. Before the id
+        // carried the session, beta's lookup found alpha's row, took the idempotency branch, and
+        // left beta with no job at all while still counting the batch as queued.
+        var alphaJob = Assert.Single(_jobs.ListBySession(alpha));
+        var betaJob = Assert.Single(_jobs.ListBySession(beta));
+        Assert.NotEqual(alphaJob.Id, betaJob.Id);
+        Assert.Equal(alpha, alphaJob.SessionId);
+        Assert.Equal(beta, betaJob.SessionId);
+        Assert.Equal(alphaBatch.RelativePath, alphaJob.InputArtifact);
+        Assert.Equal(betaBatch.RelativePath, betaJob.InputArtifact);
+        Assert.Equal(AsrJobStatus.Pending, alphaJob.Status);
+        Assert.Equal(AsrJobStatus.Pending, betaJob.Status);
+
+        // Each job's durable batch artifact is the one its own session built.
+        Assert.True(File.Exists(alphaBatch.FilePath));
+        Assert.True(File.Exists(betaBatch.FilePath));
+        Assert.NotEqual(alphaBatch.FilePath, betaBatch.FilePath);
+
+        // Recovery stays idempotent for both: a re-run queues nothing and removes no row.
+        Assert.Empty(alphaBuilder.RecoverFinalizedBatches(alpha));
+        Assert.Empty(betaBuilder.RecoverFinalizedBatches(beta));
+        Assert.Single(_jobs.ListBySession(alpha));
+        Assert.Single(_jobs.ListBySession(beta));
+    }
+
+    /// <summary>
+    /// Closes one 20 s batch window for <paramref name="sessionId"/> and returns the batch the
+    /// builder reported as queued.
+    /// </summary>
+    private AsrBatch? QueueOneWindow(
+        AsrBatchBuilder builder,
+        string sessionId,
+        string source,
+        byte fill)
+    {
+        builder.OnChunkClosed(CreateChunk(sessionId, 1, 0, 10_000, fill: fill, source: source));
+        return builder.OnChunkClosed(CreateChunk(sessionId, 2, 10_000, 10_000, fill: fill, source: source));
     }
 
     [Fact]
     public void RecoveryStillRecognisesAJobQueuedBeforeTheIdCarriedItsSource()
     {
-        // An M4-era row was derived from the batch file name alone (job_batch-000001). After
-        // the id gained its source qualifier, recovery must still see that batch as already
-        // queued — otherwise it would queue (and bill) the same audio a second time.
+        // An M4-era row was derived from the batch file name alone (job_batch-000001). Recovery
+        // must still see that batch as already queued — otherwise it would queue (and bill) the
+        // same audio a second time. This is a back-compatibility test: the dedup works through
+        // the session-scoped input_artifact match, not through the id.
         var builder = CreateBuilder(batchSeconds: 20);
         builder.OnChunkClosed(CreateChunk(1, 0, 10_000));
         var batch = builder.OnChunkClosed(CreateChunk(2, 10_000, 10_000))!;

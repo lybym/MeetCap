@@ -580,8 +580,13 @@ timestamps (`docs/RELIABILITY.md` section 7).
 `asr_jobs.input_artifact` stores the session-relative batch path, and the job's `start_ms` is the
 batch's start position: that is the offset the normalizer adds to every provider timestamp so the
 segments of the third batch land where they were spoken rather than at the start of the meeting
-(section 7). The job id is derived from the batch artifact path (`job_batch-NNNNNN`), so recovery
-can tell whether a durable batch already has a job without inventing a second billable task.
+(section 7). The job id is derived from the batch artifact path **and its session**
+(`job_<session>_<source>_batch-NNNNNN`), so recovery can tell whether a durable batch already has a
+job without inventing a second billable task. Batch numbering restarts at 1 per track per session
+while `asr_jobs` is one table shared by every session in a data root, so the session is part of the
+identity: without it, a later session would match an earlier session's row by id and queue nothing.
+Idempotency itself is decided by the session-scoped `input_artifact` match, which also recognises
+rows written before the id carried the source or the session.
 
 The batch WAV is an intermediate artifact, not the durable record. Its capture chunks, the
 retained raw provider response and the job's `normalized.jsonl` are what the session keeps, and
