@@ -127,14 +127,24 @@ public sealed class FileTranscriptStore : ITranscriptStore
                 builder.Append('`').Append(segment.Source).Append('`');
             }
 
-            if (options.IncludeSpeakerLabels && !string.IsNullOrEmpty(segment.SpeakerLabel))
+            if (options.IncludeSpeakerLabels)
             {
-                if (options.IncludeSource || options.IncludeTimestamps)
+                // Prefer the resolved persistent identity for the human-readable
+                // transcript; fall back to the anonymous provider label for raw/live
+                // transcripts where no identity has been resolved yet (PRD section 11:
+                // final.md is the speaker-attributed reading surface).
+                var speaker = !string.IsNullOrEmpty(segment.SpeakerName)
+                    ? segment.SpeakerName
+                    : segment.SpeakerLabel;
+                if (!string.IsNullOrEmpty(speaker))
                 {
-                    builder.Append(" · ");
-                }
+                    if (options.IncludeSource || options.IncludeTimestamps)
+                    {
+                        builder.Append(" · ");
+                    }
 
-                builder.Append('`').Append(segment.SpeakerLabel).Append('`');
+                    builder.Append('`').Append(speaker).Append('`');
+                }
             }
 
             builder.AppendLine("**");

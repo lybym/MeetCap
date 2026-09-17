@@ -1,5 +1,7 @@
 using MeetCap.Core.Asr;
 using MeetCap.Core.Media;
+using MeetCap.Core.Speakers;
+using MeetCap.Speakers;
 using System.Text.Json.Nodes;
 
 namespace MeetCap.IntegrationTests;
@@ -142,4 +144,88 @@ internal sealed class FakeAsrProvider : IAsrProvider
         PollCount++;
         return Task.FromResult(_polls.Count > 0 ? _polls.Dequeue() : AsrPollResult.Pending());
     }
+}
+
+/// <summary>
+/// Speaker identity provider boundary stub. Real sherpa-onnx + 3D-Speaker validation is
+/// NOT verified in CI: the environment has no model file, and <c>docs/DEVELOPMENT.md</c>
+/// section 7 forbids claiming otherwise. This fake produces deterministic embeddings and
+/// ranks enrolled speakers by cosine similarity, so the attribution pipeline can be
+/// driven end-to-end against ASR-produced transcripts without the native runtime.
+/// </summary>
+internal sealed class FakeSpeakerIdentityProvider : ISpeakerIdentityProvider
+{
+    private readonly Func<SpeakerAudioSample, float[]> _extract;
+
+    public FakeSpeakerIdentityProvider(Func<SpeakerAudioSample, float[]>? extract = null)
+    {
+        _extract = extract ?? DefaultExtract;
+    }
+
+    public string Name => "fake";
+    public string ModelName => "fake-model";
+    public string ModelVersion => "1";
+    public int EmbeddingDimension => 4;
+
+    public Task<ExtractedEmbedding> ExtractAsync(
+        SpeakerAudioSample sample,
+        CancellationToken cancellationToken = default)
+    {
+        var values = _extract(sample);
+        return Task.FromResult(new ExtractedEmbedding
+        {
+            Values = values,
+            ModelName = ModelName,
+            ModelVersion = ModelVersion,
+        });
+    }
+
+    public Task<IReadOnlyList<SpeakerCandidate>> IdentifyAsync(
+        ExtractedEmbedding probe,
+        IReadOnlyList<EnrolledSpeaker> enrolled,
+        CancellationToken cancellationToken = default)
+    {
+        var candidates = new List<SpeakerCandidate>(enrolled.Count);
+        foreach (var speaker in enrolled)
+        {
+            var best = 0.0;
+            foreach (var emb in speaker.Embeddings)
+            {
+                var score = CosineSimilarity.Compute(probe.Values, emb.Values);
+                if (score > best) best = score;
+            }
+
+            candidates.Add(new SpeakerCandidate
+            {
+                SpeakerId = speaker.SpeakerId,
+                DisplayName = speaker.DisplayName,
+                Score = best,
+            });
+        }
+
+        candidates.Sort((a, b) => b.Score.CompareTo(a.Score));
+        return Task.FromResult<IReadOnlyList<SpeakerCandidate>>(candidates);
+    }
+
+    /// <summary>
+    /// Default extraction: produces a deterministic 4-dim embedding by hashing the sample
+    /// bytes. Two samples from the same source produce the same direction, so cosine
+    /// similarity is meaningful for tests.
+    /// </summary>
+    private static float[] DefaultExtract(SpeakerAudioSample sample)
+    {
+        var sum = 0f;
+        foreach (var v in sample.Samples) sum += v;
+        var len = (float)Math.Sqrt(sample.Samples.Length);
+        var norm = len > 0 ? sum / len : 0;
+        var seed = (int)(norm * 1000) ^ sample.Samples.Length;
+        var rand = new Random(seed);
+        var values = new float[4];
+        for (var i = 0; i < 4; i++) values[i] = (float)(rand.NextDouble() * 2 - 1);
+        return values;
+    }
+
+    /// <summary>Produces a provider that extracts a fixed embedding regardless of input.</summary>
+    public static FakeSpeakerIdentityProvider WithFixedEmbedding(float[] embedding) =>
+        new(_ => embedding);
 }
