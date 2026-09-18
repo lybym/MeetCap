@@ -244,7 +244,9 @@ current Volcengine interface until #26 is complete.
 Not implemented in this milestone, and deliberately out of scope:
 
 - legacy console authentication, recording-file 1.0, idle routing, and flash/turbo routing are explicitly removed by #26 rather than promoted into supported modes;
-- splitting an import that exceeds the provider's single-request or inline-upload limit;
+- issue #29 large-file TOS transport is intentionally post-M3: it keeps one provider request
+  but moves >20 MiB inputs through private TOS + presigned `audio.url`;
+- automatic splitting of an import that exceeds the provider's actual file/duration limit remains out of scope;
 - hotword tables (M7);
 - any live-capture ASR batching (M4), loopback capture (M5), identity matching (M6),
   streaming ASR (M8), or LLM post-processing (M9).
@@ -535,6 +537,46 @@ Not implemented in this milestone, and deliberately out of scope:
 
 ---
 
+# P1 - TOS large-file ASR transport (#29)
+
+## Status
+
+Planned on a separate branch; not part of the M0-M6 MVP release gate.
+
+## Goal
+
+Keep ordinary file ASR inline while giving oversized inputs a crash-safe, private object-storage
+transport that follows the official Volcengine TOS .NET SDK contract.
+
+## Deliverables
+
+- fixed transport decision: <=20 MiB `audio.data`, >20 MiB TOS `audio.url`;
+- official TOS .NET SDK for `PutObject(FileStream)`, presigned GET URL, and `DeleteObject`;
+- private bucket/object only; no public-read fallback;
+- optional `[asr.tos]` configuration with secret-resolver-backed AK/SK;
+- randomized `meetcap-asr/` object keys;
+- durable bucket/object-key state; never persist a presigned URL;
+- new forward SQLite migration for TOS transport/cleanup state;
+- idempotent terminal cleanup; cleanup failure does not fail a successful transcript;
+- documented three-day lifecycle expiration safety net on the TOS prefix;
+- contract tests with mocked TOS and a manual real-credential smoke-test checklist.
+
+## Non-goals
+
+- TOS for every ASR job;
+- replacing local durable recordings;
+- multipart upload;
+- automatic provider-limit audio splitting;
+- streaming ASR;
+- automatic bucket/IAM/lifecycle provisioning.
+
+## Exit criteria
+
+A >20 MiB imported/ASR artifact can survive upload, process restart, fresh URL generation,
+Seed-ASR submit/query, transcript persistence, and eventual TOS cleanup without exposing
+credentials or signed URLs; a TOS outage does not stop live recording.
+
+---
 # M7 - ASR quality controls
 
 ## Goal
@@ -624,6 +666,9 @@ gates end-to-end verification, not implementation; milestones are therefore desc
 (`docs/DEVELOPMENT.md` section 7).
 
 P0 issue #26 MUST land before the Volcengine provider is described as production-aligned with the current official Seed-ASR 2.0 interface.
+
+P1 issue #29 is a post-MVP large-file transport enhancement. It MUST NOT become a prerequisite
+for ordinary 300-second live batches or block the M0-M6 release gate.
 
 M7 may partially land before the release but MUST NOT delay core reliability unless it fixes real transcription quality.
 
