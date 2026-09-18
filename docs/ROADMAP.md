@@ -192,7 +192,7 @@ The spool, `.part -> CLOSED` lifecycle, crash recovery, and gap semantics remain
 
 ## Goal
 
-Preserve the original file-transcription workflow and integrate Volcengine file ASR before live ASR batching.
+Preserve the original file-transcription workflow and integrate Volcengine Seed-ASR 2.0 Standard HTTP before live ASR batching.
 
 ## Deliverables
 
@@ -203,7 +203,7 @@ meetcap import .\meeting.m4a
 - media inspection through FFprobe/FFMpegCore
 - FFmpeg normalization only when required
 - persistent ASR job queue in SQLite
-- Volcengine file-ASR provider
+- Volcengine Seed-ASR 2.0 Standard HTTP provider
 - submit/query handling
 - Polly-based transient HTTP resilience inside the provider adapter
 - persistent retry/job state independent from Polly
@@ -222,7 +222,12 @@ This milestone is the first end-to-end ASR proof and the first proof that provid
 
 Implemented (issue #5):
 
-- `meetcap import <file> [--title <title>] [--tier standard|idle]`;
+Provider-protocol correction is tracked as P0 issue #26. Issue #5 implemented the durable
+submit/query architecture, but its legacy AppID/Access Token, configurable resource ID, and
+service-tier surface are superseded by #26. M3 is not considered production-aligned with the
+current Volcengine interface until #26 is complete.
+
+- current 0.1.0 CLI has `meetcap import <file> [--title <title>] [--tier standard|idle]`; issue #26 removes `--tier`, leaving `meetcap import <file> [--title <title>]`;
 - `meetcap asr resume [--session <id>] [--max-jobs <n>]`, the restart entry point for the
   persistent job queue;
 - `MeetCap.AudioPipeline` (FFprobe inspection, FFmpeg normalization only when required) with
@@ -238,17 +243,14 @@ Implemented (issue #5):
 
 Not implemented in this milestone, and deliberately out of scope:
 
-- static credential resolution through `credman:` (fails with an actionable message; use
-  `env:NAME` or a literal value);
-- the `turbo` (flash/single-shot) service tier, which is a different protocol and is rejected
-  rather than silently mapped;
+- legacy console authentication, recording-file 1.0, idle routing, and flash/turbo routing are explicitly removed by #26 rather than promoted into supported modes;
 - splitting an import that exceeds the provider's single-request or inline-upload limit;
 - hotword tables (M7);
 - any live-capture ASR batching (M4), loopback capture (M5), identity matching (M6),
   streaming ASR (M8), or LLM post-processing (M9).
 
 Real Volcengine transcription has not been verified in CI: the environment has no
-`VOLCENGINE_APP_ID` and no access token, so the provider boundary is mocked in tests
+`MEETCAP_VOLCENGINE_API_KEY`, so the provider boundary is mocked in tests
 (`docs/DEVELOPMENT.md` section 7). A manual Windows run with real credentials is still required
 before this milestone is validated end to end.
 
@@ -432,7 +434,7 @@ Reduce repeated manual speaker labeling across meetings by resolving anonymous A
 ## Default MVP pipeline
 
 ```text
-Volcengine BigASR
+Volcengine Seed-ASR 2.0
   -> text + timestamps + anonymous speaker labels
   -> select clean speech for each anonymous speaker
   -> sherpa-onnx
@@ -544,8 +546,8 @@ Improve recognition quality without changing recording reliability.
 - hotword-table configuration
 - request-level hotwords if supported
 - glossary file
-- provider request tracing without secrets
-- selectable standard/idle/turbo service tier
+- provider request tracing without secrets, including retained `X-Tt-Logid`
+- Seed-ASR 2.0 Standard HTTP contract tests
 - optional full-session final re-ASR flag
 - cost accounting per ASR job
 - measure anonymous speaker-label quality on real meetings
@@ -620,6 +622,8 @@ real-hardware validation checklist in `docs/M1_WINDOWS_VALIDATION.md` (status: n
 gates end-to-end verification, not implementation; milestones are therefore described as
 *implemented and automatically covered*, not *verified end to end*
 (`docs/DEVELOPMENT.md` section 7).
+
+P0 issue #26 MUST land before the Volcengine provider is described as production-aligned with the current official Seed-ASR 2.0 interface.
 
 M7 may partially land before the release but MUST NOT delay core reliability unless it fixes real transcription quality.
 

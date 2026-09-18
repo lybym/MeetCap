@@ -79,16 +79,16 @@ Polly is not a replacement for the persistent ASR job queue.
 
 ### Cloud speech
 
-- Volcengine BigASR / recording-file ASR as default
+- Volcengine Seed-ASR 2.0 recording-file Standard HTTP ASR as the only default cloud ASR contract
 - request speaker information where supported
-- streaming ASR behind the same abstraction but disabled by default
+- new-console `X-Api-Key` authentication only; streaming ASR remains separately deferred and disabled
 
 ### Speaker identity
 
 Default MVP identity stack:
 
 ```text
-Volcengine BigASR
+Volcengine Seed-ASR 2.0
   -> transcript + timestamps + anonymous speaker labels
   -> select clean per-speaker audio segments
   -> sherpa-onnx
@@ -223,7 +223,7 @@ the closed-chunk hand-off is a Core-owned event rather than a reference
               |
               v
 +----------------------------+
-| Volcengine File ASR        |
+| Volcengine Seed-ASR 2.0    |
 | Polly inside HTTP adapter  |
 +-------------+--------------+
               |
@@ -861,7 +861,28 @@ Normalization is a separate contract from the HTTP poll for one reason: the raw 
 response is written to disk **before** it is parsed, so a parser fix never requires re-billing
 the same audio (section 14).
 
-Provider-specific concepts such as endpoint URL, resource ID, request headers, hotword identifiers, and speaker-info flags must remain inside `MeetCap.Asr.Volcengine`.
+The Volcengine adapter owns a deliberately fixed wire contract:
+
+```text
+submit:      POST https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit
+query:       POST https://openspeech.bytedance.com/api/v3/auc/bigmodel/query
+auth:        X-Api-Key
+resource:    X-Api-Resource-Id: volc.seedasr.auc
+model:       Seed-ASR 2.0 / model_name=bigmodel
+audio:       audio.data Base64
+diagnostics: X-Api-Status-Code, X-Api-Message, X-Tt-Logid
+```
+
+Endpoint paths, resource ID and authentication-header names are provider protocol constants, not
+normal user configuration. The only provider authentication secret is the API key, resolved by
+the configuration/secret boundary and never persisted in artifacts or logs. Legacy
+`X-Api-App-Key`, `X-Api-Access-Key`, `volc.bigasr.auc`, idle routing and flash/turbo routing
+are not compatibility modes.
+
+Header presence and sequence semantics for submit/query MUST follow the official interface:
+https://docs.volcengine.com/docs/DoubaoVoice/task-submission-http-1?lang=zh
+
+Hotword identifiers and speaker-info flags remain inside `MeetCap.Asr.Volcengine`.
 
 The provider request id is supplied by the caller — the persistent job — instead of being
 generated per HTTP attempt. The same id is the provider's task identifier, so a retry after a
@@ -1290,7 +1311,7 @@ Implemented order of operations (M3):
 
 ```text
 load + validate config                    # invalid configuration stops here
-resolve provider (app id + credential)    # invalid credentials stop here
+resolve provider (Seed-ASR 2.0 API key)    # invalid credentials stop here
 resolve FFmpeg/FFprobe
 migrate database (creates the data root and its private-data marker)
 inspect source with FFprobe               # an unusable file stops here, state-free
@@ -1318,7 +1339,7 @@ mark the session COMPLETED once every job succeeded
 
 Failure guarantees, stated precisely:
 
-- Configuration, credential, tier, toolchain, and source-not-found failures happen before
+- Configuration, API-key, toolchain, and source-not-found failures happen before
   anything is created, so they leave no session state behind at all.
 - A failure after `inspect` (copying or normalizing) leaves a **visible, recoverable** session:
   the row exists, `session.json` exists and reflects the artifacts materialized so far, and the
@@ -1345,7 +1366,7 @@ imported file:
 
 ```text
 load + validate config                    # invalid configuration stops here
-resolve provider (app id + credential)    # invalid credentials stop here, before any session
+resolve provider (Seed-ASR 2.0 API key)    # invalid credentials stop here, before any session
 startup recovery scan
 create the session row + session.json + recording.lock
 attach the ASR batch builder to RecordingSession.ChunkClosed
@@ -1394,7 +1415,7 @@ keep private data private wherever the data root actually is, MeetCap drops a se
 existing `.gitignore`, and the marker is best effort: a read-only data root must not fail a
 command.
 
-Only configured ASR audio/batches are sent to the ASR provider.
+Only configured ASR audio/batches are sent to the Seed-ASR 2.0 provider.
 
 API credentials must not be committed to Git, copied into session artifacts, or written to normal logs.
 
@@ -1445,4 +1466,5 @@ This boundary is intentional: commodity capabilities should be imported; product
 - Polly: https://github.com/App-vNext/Polly
 - sherpa-onnx: https://github.com/k2-fsa/sherpa-onnx
 - 3D-Speaker: https://github.com/modelscope/3D-Speaker
+- Volcengine Seed-ASR 2.0 Standard HTTP task submission: https://docs.volcengine.com/docs/DoubaoVoice/task-submission-http-1?lang=zh
 - Volcengine ASR product capabilities: https://www.volcengine.com/docs/6561/1354871

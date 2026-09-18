@@ -508,6 +508,11 @@ updated_at
 Status values (section 12 of `ARCHITECTURE.md`): `pending`, `submitting`, `submitted`,
 `polling`, `succeeded`, `retry_wait`, `failed`, `cancelled`.
 
+The existing `tier` column is retained as a schema-compatibility field. After issue #26, all new
+Volcengine recording-file jobs use the single fixed value `standard`; it is no longer a user
+choice or routing input. This avoids a destructive migration solely to remove a now-constant
+column.
+
 Notes:
 
 - `provider_request_id` is allocated when the job is created and persisted **before** the
@@ -524,6 +529,8 @@ Notes:
 - `request_metadata_path` points at `asr/jobs/<job-id>/request.json`, which is sanitized —
   credentials and authorization headers never appear in it, and the inline audio payload is
   replaced by its byte count.
+- Under issue #26, the Volcengine `X-Tt-Logid` is retained in provider diagnostic metadata (or
+  the retained response envelope) for support tracing. `X-Api-Key` is never persisted there.
 - `raw_response_path` and `normalized_result_path` point at `response.json` and
   `normalized.jsonl`. The raw response is written before parsing so a parser fix never
   requires re-billing the same audio.

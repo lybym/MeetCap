@@ -134,54 +134,43 @@ stall threshold are one quantity, and separate keys would only let them disagree
 
 ## 7. ASR
 
+Target contract after issue #26:
+
 ```toml
 [asr]
 enabled = true
 strategy = "file"
 file_batch_seconds = 300
-service_tier = "standard"
-streaming_enabled = false
 retry_max_attempts = 8
 retry_initial_seconds = 5
 retry_max_seconds = 300
 final_full_session_pass = false
 ```
 
-Allowed service tiers: `standard`, `idle`, `turbo`.
+MeetCap supports one recording-file service profile: **Seed-ASR 2.0 Standard HTTP**. There is no
+`service_tier` setting and no `meetcap import --tier` override. Idle and flash/turbo are not
+fallbacks or compatibility modes.
 
 The app MUST NOT silently switch to streaming when file ASR fails.
 
-Retry configuration defines provider-execution resilience. Persistent retry/job state remains stored in the ASR job queue.
+Retry configuration defines provider-execution resilience. Persistent retry/job state remains
+stored in the ASR job queue.
 
-`meetcap import --tier <tier>` is a one-shot override of `service_tier` for that command only; it never rewrites `config.toml`.
-
-Tier support in the import/file-ASR path:
-
-```text
-standard   submit/query file ASR (default)
-idle       submit/query file ASR against the idle endpoints
-turbo      not implemented (the flash/single-shot endpoint is a different protocol)
-```
-
-Selecting `turbo` fails with an actionable error rather than being silently mapped onto the
-submit/query flow.
-
-M4 gives three of these keys a live-recording meaning, and adds no key of its own:
+M4 gives these keys a live-recording meaning:
 
 - `asr.enabled = false` is the supported way to record without a transcript. `meetcap start`
-  skips the ASR stack entirely, so no provider or credential is needed; the recording, the chunk
-  spool, and recovery are unaffected. With `enabled = true` the provider is built *before* the
-  session exists, so an empty `app_id` or an unresolvable credential fails visibly and leaves no
-  half-written session behind;
+  skips the ASR stack entirely, so no provider API key is needed; the recording, chunk spool, and
+  recovery are unaffected. With `enabled = true` the provider is built *before* the session
+  exists, so a missing/unresolvable API key fails visibly and leaves no half-written session
+  behind;
 - `file_batch_seconds` is the live batch window (default 300 s). It is independent of
   `capture.chunk_seconds`: chunks are the durability unit and batches are the provider context
   unit. The window closes on captured audio time, so a batch that covers a device outage declares
   a longer span than the audio inside it and its `batch-NNNNNN.json` manifest states where each
   chunk really sits (`docs/DATA_MODEL.md` section 6.1);
 - the retry keys pace the queue. A job in `retry_wait` is only eligible once its own durable
-  `next_retry_at` has passed, so a network outage does not burn attempts: the queue resumes on the
-  backoff schedule. `meetcap asr resume --force` is the explicit way to bypass that schedule when
-  the outage is known to be over.
+  `next_retry_at` has passed. `meetcap asr resume --force` is the explicit way to bypass that
+  schedule when the outage is known to be over.
 
 A batch window that cannot be built needs no key of its own either. An unreadable capture chunk
 is handled inside the batch builder: the window is recorded as `asr.batch.failed`, the offending
@@ -211,11 +200,11 @@ When the toolchain cannot be located, an import fails with a message naming
 
 ## 8. Volcengine
 
+Target contract after issue #26:
+
 ```toml
 [asr.volcengine]
-app_id = "your-app-id"
-credential = "env:MEETCAP_VOLCENGINE_ACCESS_TOKEN"
-resource_id = "volc.bigasr.auc"
+api_key = "env:MEETCAP_VOLCENGINE_API_KEY"
 hotword_table_id = ""
 request_speaker_info = true
 cost_per_hour_cny = 0.8
@@ -224,26 +213,65 @@ poll_timeout_seconds = 900
 http_timeout_seconds = 30
 ```
 
-Credential references may include `env:` and `credman:` schemes.
+Only the API key is user-supplied provider authentication. MeetCap fixes the rest of the wire
+contract to the official Seed-ASR 2.0 recording-file Standard HTTP interface:
 
-`env:` is resolved through the configuration/secret resolver. `credman:` is a documented
-scheme that is not implemented yet; it fails with an actionable message instead of sending an
-empty credential. A literal value is accepted for deployments that cannot use environment
-variables.
+```text
+authentication header: X-Api-Key
+resource header:       X-Api-Resource-Id: volc.seedasr.auc
+submit endpoint:        https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit
+query endpoint:         https://openspeech.bytedance.com/api/v3/auc/bigmodel/query
+task id:                UUID persisted before submit and reused for query
+audio transport:        audio.data (Base64)
+model_name:             bigmodel
+```
+
+Header presence and `X-Api-Sequence` semantics on submit/query MUST match the official interface
+document exactly:
+
+https://docs.volcengine.com/docs/DoubaoVoice/task-submission-http-1?lang=zh
+
+The provider captures `X-Api-Status-Code`, `X-Api-Message`, and `X-Tt-Logid`. The log ID is
+diagnostic metadata; the API key is never persisted.
+
+API-key references use the existing secret resolver. `env:` remains the recommended scheme.
+`credman:` may be supported only when the resolver actually implements it; unsupported schemes
+must fail with an actionable error rather than sending an empty key. Literal secrets are accepted
+only where the product already permits them and must be redacted from effective-config output.
+
+The following legacy keys are not part of the target contract and must not be silently accepted
+after issue #26:
+
+```text
+asr.service_tier
+asr.volcengine.app_id
+asr.volcengine.credential
+asr.volcengine.resource_id
+```
+
+Likewise, the adapter MUST NOT send `X-Api-App-Key` or `X-Api-Access-Key`.
+
+`user.uid` in the provider body is a non-secret MeetCap-owned identifier. The API key MUST NOT
+be copied into `user.uid`, because sanitized request metadata is retained locally.
 
 `cost_per_hour_cny` is used only to fill the per-job `estimated_cost_cny` field for local
 accounting. Provider pricing is configuration, not a product guarantee.
 
 `poll_interval_seconds` is the delay between provider result queries. `poll_timeout_seconds`
-is the wall-clock budget one command invocation spends polling a single job; when it expires
-the job stays persisted and `meetcap asr resume` continues it. `http_timeout_seconds` is the
+is the wall-clock budget one command invocation spends polling a single job; when it expires the
+job stays persisted and `meetcap asr resume` continues it. `http_timeout_seconds` is the
 per-request timeout enforced by the Polly timeout strategy inside the provider adapter.
 
-`request_speaker_info = true` means MeetCap asks Volcengine for anonymous speaker information when the selected API/service tier supports it.
+`request_speaker_info = true` asks Seed-ASR 2.0 Standard HTTP for anonymous speaker information
+when that capability is supported by the official interface.
 
-Provider speaker labels are session-scoped anonymous labels. They are not persistent identities and must not be treated as names.
+Provider speaker labels are session-scoped anonymous labels. They are not persistent identities
+and must not be treated as names.
 
-Because these labels are the default MVP diarization source, `speakers.enabled = true` with `request_speaker_info = false` produces a validation warning: recording still succeeds, but no anonymous speaker clusters exist for the identity pipeline to match, so nobody can be identified unless a local diarization fallback is configured.
+Because these labels are the default MVP diarization source, `speakers.enabled = true` with
+`request_speaker_info = false` produces a validation warning: recording still succeeds, but no
+anonymous speaker clusters exist for the identity pipeline to match unless a local diarization
+fallback is configured.
 
 ## 9. Speaker architecture
 
@@ -258,7 +286,7 @@ For the MVP:
 
 ```text
 Diarization default:
-Volcengine BigASR anonymous speaker labels
+Volcengine Seed-ASR 2.0 anonymous speaker labels
 
 Identity default:
 sherpa-onnx + 3D-Speaker ERes2Net-base
@@ -365,6 +393,10 @@ A running session uses a configuration snapshot captured at session start. Editi
 ## 13. Config migration
 
 The file contains `config_version = 1`. Breaking changes require migration or an actionable validation error.
+
+Issue #26 is such a breaking provider-config change. Its implementation MUST either bump/migrate
+the configuration version or reject `service_tier`, `app_id`, `credential`, and `resource_id`
+with a clear migration message. They must never continue under legacy semantics by accident.
 
 The pre-speaker-identity flat keys `speakers.provider`, `speakers.match_threshold`, and
 `speakers.match_margin` are rejected even when `config_version = 1`; they cannot silently

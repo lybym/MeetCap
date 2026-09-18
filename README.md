@@ -82,7 +82,12 @@ treated as persistent human identities.
 
 Real Volcengine transcription is not verified by CI: no credentials are available there, so the
 provider boundary is mocked in tests. The real 3D-Speaker/sherpa-onnx model is likewise not
-exercised in CI. The hardware-dependent acceptance tests are still open and are tracked as a
+exercised in CI.
+
+The normative Volcengine provider contract is Seed-ASR 2.0 recording-file Standard HTTP,
+new-console `X-Api-Key` authentication, and fixed resource ID `volc.seedasr.auc`. Protocol
+alignment of the existing provider implementation is tracked by issue #26; until #26 lands,
+the code on `main` may still expose the superseded legacy authentication/configuration surface. The hardware-dependent acceptance tests are still open and are tracked as a
 manual checklist in `docs/M1_WINDOWS_VALIDATION.md`; nothing here claims any milestone is
 verified end to end on real audio hardware yet.
 
@@ -119,14 +124,14 @@ requires M0 through M6, which this release closes at the implementation level
 - FluentMigrator or an equivalently thin migration layer
 - FFmpeg/FFprobe through FFMpegCore for media inspection and normalization
 - Polly for transient provider HTTP resilience
-- Volcengine BigASR / recording-file ASR for transcription and anonymous speaker labels
+- Volcengine Seed-ASR 2.0 recording-file **Standard HTTP** ASR for transcription and anonymous speaker labels; new-console `X-Api-Key` authentication only
 - sherpa-onnx + 3D-Speaker ERes2Net-base for local speaker embeddings and persistent identity matching
 - JSONL + Markdown artifacts
 
 The default MVP speaker path is:
 
 ```text
-Volcengine BigASR
+Volcengine Seed-ASR 2.0
   -> transcript + timestamps + anonymous speaker labels
   -> select clean speech for each anonymous speaker
   -> sherpa-onnx
