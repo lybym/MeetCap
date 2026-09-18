@@ -58,6 +58,8 @@ If two requirements conflict, the higher priority wins.
 8. No hybrid-meeting mode exists in the first product scope.
 9. Mature OSS SHOULD be reused for commodity capabilities when it does not compromise MeetCap reliability semantics.
 10. MeetCap-specific durability, job-state, timeline, artifact, and speaker-registry semantics remain explicit product-owned logic.
+11. Temporary cloud object storage may transport oversized ASR inputs, but it MUST remain private,
+    ephemeral, and subordinate to the durable local recording/artifact contract.
 
 ---
 
@@ -134,6 +136,12 @@ import
 ```
 
 This function is first-class and MUST remain available even after live capture is implemented.
+
+Issue #29 extends import transport without changing the workflow: normalized inputs at or below
+20 MiB continue through inline Seed-ASR `audio.data`; larger inputs are temporarily uploaded to a
+private Volcengine TOS object with the official .NET SDK and submitted through a presigned
+`audio.url`. The local imported/normalized file remains the durable source of truth. TOS is not
+required for normal-size imports and is not a public archive.
 
 ---
 
@@ -533,6 +541,10 @@ Artifact contract
 - Failed jobs persist and retry after restart/network recovery.
 - Raw provider response is saved.
 - Provider calls use Seed-ASR 2.0 Standard HTTP, `X-Api-Key`, and fixed resource ID `volc.seedasr.auc`.
+- Target after issue #29: inputs <=20 MiB use inline `audio.data`; larger inputs use private TOS
+  staging via the official .NET SDK and a presigned `audio.url`, without persisting the signed URL.
+- TOS upload/sign/delete failures never stop healthy recording and never replace the durable local
+  audio artifact; cleanup failure does not invalidate an otherwise successful transcript.
 - Anonymous speaker labels/timestamps are preserved where available.
 
 ### Speaker
