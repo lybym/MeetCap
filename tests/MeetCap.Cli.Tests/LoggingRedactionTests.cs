@@ -25,8 +25,7 @@ public class LoggingRedactionTests
             {
                 Volcengine = new VolcengineSection
                 {
-                    Credential = secrets.Length > 0 ? secrets[0] : string.Empty,
-                    AppId = secrets.Length > 1 ? secrets[1] : string.Empty,
+                    ApiKey = secrets.Length > 0 ? secrets[0] : string.Empty,
                 },
             },
         });
@@ -40,7 +39,7 @@ public class LoggingRedactionTests
         using var writer = new StringWriter();
         var logger = CliLoggingFactory.Create(secrets, writer, LogLevel.Information);
 
-        logger.Information("submitting batch with credential={Credential}", Sentinel);
+        logger.Information("submitting batch with api_key={ApiKey}", Sentinel);
         logger.Error(new InvalidOperationException($"provider rejected {Sentinel}"), "call failed");
 
         var text = writer.ToString();
@@ -49,15 +48,15 @@ public class LoggingRedactionTests
     }
 
     [Fact]
-    public void SerilogPipeline_MasksAppIdAsWellAsCredential()
+    public void SerilogPipeline_MasksTheApiKeyInEveryPositionOfAMessage()
     {
-        var secrets = RegistryWith(Sentinel, "app-id-12345");
+        var secrets = RegistryWith(Sentinel);
         using var writer = new StringWriter();
         var logger = CliLoggingFactory.Create(secrets, writer, LogLevel.Information);
 
-        logger.Information("app={AppId}", "app-id-12345");
+        logger.Information("api_key={ApiKey} provider=volcengine", Sentinel);
 
-        Assert.DoesNotContain("app-id-12345", writer.ToString());
+        Assert.DoesNotContain(Sentinel, writer.ToString());
     }
 
     [Fact]
@@ -71,7 +70,7 @@ public class LoggingRedactionTests
         // Command handlers log through Microsoft.Extensions.Logging; the production
         // factory bridges those calls into the redacting Serilog pipeline.
         var logger = loggerFactory.CreateLogger("MeetCap");
-        logger.LogInformation("credential loaded: {Credential}", Sentinel);
+        logger.LogInformation("api_key loaded: {ApiKey}", Sentinel);
 
         var text = writer.ToString();
         Assert.DoesNotContain(Sentinel, text);
@@ -86,7 +85,7 @@ public class LoggingRedactionTests
 
         // With no loaded configuration the registry is empty, so an unknown value is
         // written verbatim. Commands therefore must load configuration before logging.
-        logger.Information("credential={Credential}", Sentinel);
+        logger.Information("api_key={ApiKey}", Sentinel);
 
         Assert.Contains(Sentinel, writer.ToString());
     }

@@ -115,6 +115,7 @@ public class SqliteMigratorTests
             Assert.Contains(2, migrator.SupportedVersions);
             Assert.Contains(3, migrator.SupportedVersions);
             Assert.Contains(4, migrator.SupportedVersions);
+            Assert.Contains(5, migrator.SupportedVersions);
         }
         finally
         {
@@ -127,8 +128,9 @@ public class SqliteMigratorTests
     {
         // Two scripts sharing a version would make the second one look already applied,
         // so its tables would never be created at runtime. This asserts the embedded set
-        // is well formed: 0001 (M0 sessions), 0002 (M1 audio_chunks), 0003 (M3 asr_jobs)
-        // and 0004 (M6 speakers) are all present and claim distinct versions.
+        // is well formed: 0001 (M0 sessions), 0002 (M1 audio_chunks), 0003 (M3 asr_jobs),
+        // 0004 (M6 speakers) and 0005 (issue #26 provider_log_id) are all present and claim
+        // distinct versions.
         var versions = new SqliteMigrator().GetMigrations().Select(m => m.Version).ToArray();
 
         Assert.Equal(versions.Length, versions.Distinct().Count());
@@ -136,6 +138,127 @@ public class SqliteMigratorTests
         Assert.Contains(2, versions);
         Assert.Contains(3, versions);
         Assert.Contains(4, versions);
+        Assert.Contains(5, versions);
+    }
+
+    [Fact]
+    public void Migrate_AddsProviderLogIdAndPreservesExistingAsrJobRows()
+    {
+        // 0005 rebuilds asr_jobs to add a nullable column (SQLite has no
+        // ADD COLUMN IF NOT EXISTS). The rebuild must not lose rows, and the legacy `tier`
+        // column must survive as a schema-compatibility field (docs/DATA_MODEL.md section 6).
+        var db = NewDb();
+        try
+        {
+            var migrator = new SqliteMigrator();
+            var version = ProviderLogIdMigrationVersion();
+            migrator.Migrate(db);
+
+            using var c = Open(db);
+
+            // Rewind to the schema and migration state a pre-#26 database has.
+            using (var rewind = new SqliteCommand("ALTER TABLE asr_jobs DROP COLUMN provider_log_id", c))
+            {
+                rewind.ExecuteNonQuery();
+            }
+
+            using (var seed = new SqliteCommand(
+                       "INSERT INTO asr_jobs (id, session_id, source, tier, provider, input_artifact, status, " +
+                       "provider_request_id, created_at, updated_at) " +
+                       "VALUES ('job_legacy', 'ses_1', 'import', 'idle', 'volcengine', 'audio/import/a.wav', " +
+                       "'pending', 'req-1', @now, @now)",
+                       c))
+            {
+                seed.Parameters.AddWithValue("@now", "2026-09-15T00:00:00Z");
+                seed.ExecuteNonQuery();
+            }
+
+            using (var forget = new SqliteCommand("DELETE FROM schema_migrations WHERE version = @v", c))
+            {
+                forget.Parameters.AddWithValue("@v", version);
+                forget.ExecuteNonQuery();
+            }
+
+            // The upgrade.
+            migrator.Migrate(db);
+
+            Assert.True(ColumnExists(c, "asr_jobs", "provider_log_id"));
+            Assert.True(ColumnExists(c, "asr_jobs", "tier"));
+
+            using (var read = new SqliteCommand(
+                       "SELECT source, tier, provider, provider_request_id, provider_log_id " +
+                       "FROM asr_jobs WHERE id = 'job_legacy'",
+                       c))
+            using (var reader = read.ExecuteReader())
+            {
+                Assert.True(reader.Read());
+                Assert.Equal("import", reader.GetString(0));
+                Assert.Equal("idle", reader.GetString(1));
+                Assert.Equal("volcengine", reader.GetString(2));
+                Assert.Equal("req-1", reader.GetString(3));
+                Assert.True(reader.IsDBNull(4));
+            }
+
+            // `tier` is no longer a routing input, so the domain type reports the one
+            // supported value regardless of what a pre-#26 row stored (docs/DATA_MODEL.md
+            // section 6).
+            Assert.Equal("standard", new SqliteAsrJobStore(db).Get("job_legacy")!.Tier);
+        }
+        finally
+        {
+            Cleanup(db);
+        }
+    }
+
+    [Fact]
+    public void Migrate_CanReRunTheProviderLogIdMigrationInsteadOfFailingOnADuplicateColumn()
+    {
+        // The migrator relies on every script being re-runnable, because a second process can
+        // read schema_migrations before this version is recorded. A bare ALTER TABLE would fail
+        // with "duplicate column name" here; the rebuild has to be a no-op instead.
+        var db = NewDb();
+        try
+        {
+            var migrator = new SqliteMigrator();
+            migrator.Migrate(db);
+
+            using var c = Open(db);
+            using (var forget = new SqliteCommand("DELETE FROM schema_migrations WHERE version = @v", c))
+            {
+                forget.Parameters.AddWithValue("@v", ProviderLogIdMigrationVersion());
+                forget.ExecuteNonQuery();
+            }
+
+            migrator.Migrate(db); // must not throw
+
+            Assert.True(ColumnExists(c, "asr_jobs", "provider_log_id"));
+            Assert.True(TableExists(c, "asr_jobs"));
+            Assert.False(TableExists(c, "asr_jobs_new"));
+        }
+        finally
+        {
+            Cleanup(db);
+        }
+    }
+
+    private static int ProviderLogIdMigrationVersion() =>
+        new SqliteMigrator().GetMigrations()
+            .Single(m => m.ResourceName.EndsWith("0005_asr_job_provider_log_id.sql", StringComparison.Ordinal))
+            .Version;
+
+    private static bool ColumnExists(SqliteConnection c, string table, string column)
+    {
+        using var cmd = new SqliteCommand($"PRAGMA table_info({table})", c);
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            if (string.Equals(reader.GetString(1), column, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     [Fact]

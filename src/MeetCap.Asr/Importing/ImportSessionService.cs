@@ -18,9 +18,6 @@ public sealed record ImportRequest
     /// <summary>Explicit title; falls back to the file name, then to the configured default.</summary>
     public string? Title { get; init; }
 
-    /// <summary>One-shot service-tier override (never written back to config.toml).</summary>
-    public string? Tier { get; init; }
-
     /// <summary>Test/pre-allocation hooks; normally left null so ids are generated.</summary>
     public string? SessionId { get; init; }
 
@@ -38,9 +35,6 @@ public sealed record ImportOptions
     public required string ProviderName { get; init; }
 
     public string DefaultTitle { get; init; } = "Untitled Meeting";
-
-    /// <summary>Configured <c>asr.service_tier</c>.</summary>
-    public string ServiceTier { get; init; } = "standard";
 
     /// <summary>Configured <c>asr.volcengine.request_speaker_info</c>.</summary>
     public bool RequestSpeakerInfo { get; init; } = true;
@@ -205,7 +199,6 @@ public sealed class ImportSessionService
                 ["source_type"] = session.SourceType,
                 ["title"] = title,
                 ["provider"] = _options.ProviderName,
-                ["tier"] = ResolveTier(request.Tier),
             });
 
         artifacts.Add(CopySourceArtifact(paths, sourcePath));
@@ -256,13 +249,11 @@ public sealed class ImportSessionService
                 });
         }
 
-        var tier = ResolveTier(request.Tier);
         var job = new AsrJob
         {
             Id = jobId,
             SessionId = sessionId,
             Source = AudioTrackName.Import,
-            Tier = tier,
             Provider = _options.ProviderName,
             StartMs = 0,
             EndMs = sourceMedia.DurationMs,
@@ -286,7 +277,6 @@ public sealed class ImportSessionService
                 ["job_id"] = job.Id,
                 ["source"] = job.Source,
                 ["provider"] = job.Provider,
-                ["tier"] = job.Tier,
                 ["start_ms"] = job.StartMs,
                 ["end_ms"] = job.EndMs,
                 ["input_artifact"] = job.InputArtifact,
@@ -328,9 +318,6 @@ public sealed class ImportSessionService
         var fromFile = Path.GetFileNameWithoutExtension(sourcePath);
         return string.IsNullOrWhiteSpace(fromFile) ? _options.DefaultTitle : fromFile;
     }
-
-    private string ResolveTier(string? overrideTier) =>
-        string.IsNullOrWhiteSpace(overrideTier) ? _options.ServiceTier : overrideTier.Trim();
 
     private SourceArtifact CopySourceArtifact(SessionArtifactPaths paths, string sourcePath)
     {

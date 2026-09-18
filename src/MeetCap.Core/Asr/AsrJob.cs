@@ -15,8 +15,23 @@ public sealed record AsrJob
     /// <summary>Source track, e.g. <c>import</c>, <c>mic</c>, <c>loopback</c>.</summary>
     public required string Source { get; init; }
 
-    /// <summary>Provider service tier the job was queued with: <c>standard</c>, <c>idle</c>, <c>turbo</c>.</summary>
-    public required string Tier { get; init; }
+    /// <summary>
+    /// Schema-compatibility constant for the legacy <c>asr_jobs.tier</c> column
+    /// (<c>docs/DATA_MODEL.md</c> section 6).
+    /// </summary>
+    public const string StandardTier = "standard";
+
+    /// <summary>
+    /// The legacy service tier. Always <see cref="StandardTier"/>.
+    /// </summary>
+    /// <remarks>
+    /// Issue #26 removed the service-tier selector: MeetCap supports exactly one recording-file
+    /// profile (Seed-ASR 2.0 Standard HTTP), so this is a constant rather than a settable value
+    /// and is never used to route a request. The column is kept — rather than dropped in a
+    /// destructive migration — only because existing databases already declare it
+    /// <c>NOT NULL</c>.
+    /// </remarks>
+    public string Tier => StandardTier;
 
     /// <summary>Provider name, e.g. <c>volcengine</c>.</summary>
     public required string Provider { get; init; }
@@ -57,6 +72,17 @@ public sealed record AsrJob
     public string? ErrorCode { get; init; }
 
     public string? ErrorMessage { get; init; }
+
+    /// <summary>
+    /// Volcengine <c>X-Tt-Logid</c> from the last provider exchange for this job.
+    /// </summary>
+    /// <remarks>
+    /// Diagnostic metadata only: it is what a Volcengine support request is traced by, so it is
+    /// persisted on the job rather than being left inside the retained raw response body
+    /// (<c>docs/ASR_STRATEGY.md</c> section 13). It is not a credential and is safe to log; the
+    /// API key never reaches this field.
+    /// </remarks>
+    public string? ProviderLogId { get; init; }
 
     /// <summary>Source duration in milliseconds, used for the cost estimate.</summary>
     public int DurationMs { get; init; }

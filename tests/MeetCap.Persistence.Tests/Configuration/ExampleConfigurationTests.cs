@@ -137,6 +137,53 @@ public class ExampleConfigurationTests
         }
     }
 
+    [Fact]
+    public void LegacyVolcengineProviderKeys_BlockValidationWithMigrationInstructions()
+    {
+        var dir = NewDir();
+        try
+        {
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(
+                Path.Combine(dir, "config.toml"),
+                "config_version = 1\n\n" +
+                "[asr]\nservice_tier = \"idle\"\n\n" +
+                "[asr.volcengine]\napp_id = \"123\"\ncredential = \"env:OLD\"\nresource_id = \"volc.bigasr.auc\"\n");
+
+            var load = new TomlConfigurationStore(dir).Load();
+
+            // The removed provider keys are detected by the persistence layer (they are no
+            // longer in the schema), then promoted to blocking validation errors by Core. A v1
+            // configuration must not pass validation while its provider settings quietly fall
+            // back to the new defaults (docs/CONFIGURATION.md section 13, issue #26).
+            Assert.Contains("asr.service_tier", load.UnknownKeys);
+            Assert.Contains("asr.volcengine.app_id", load.UnknownKeys);
+            Assert.Contains("asr.volcengine.credential", load.UnknownKeys);
+            Assert.Contains("asr.volcengine.resource_id", load.UnknownKeys);
+
+            var validation = ConfigurationValidator.Validate(load.Configuration, load.UnknownKeys);
+
+            Assert.False(validation.IsValid);
+            Assert.All(
+                new[]
+                {
+                    "asr.service_tier",
+                    "asr.volcengine.app_id",
+                    "asr.volcengine.credential",
+                    "asr.volcengine.resource_id",
+                },
+                key => Assert.Contains(
+                    validation.Errors,
+                    error => error.StartsWith(
+                        $"Legacy configuration key '{key}' is not supported by this config layout.",
+                        StringComparison.Ordinal)));
+        }
+        finally
+        {
+            Cleanup(dir);
+        }
+    }
+
     private static string ExampleConfigPath()
         => Path.Combine(RepositoryRoot(), "config.example.toml");
 

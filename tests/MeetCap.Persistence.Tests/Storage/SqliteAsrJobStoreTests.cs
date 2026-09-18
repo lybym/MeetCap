@@ -24,7 +24,6 @@ public class SqliteAsrJobStoreTests
         Id = id,
         SessionId = sessionId,
         Source = "import",
-        Tier = "standard",
         Provider = "volcengine",
         StartMs = 0,
         EndMs = 754_000,
@@ -58,6 +57,7 @@ public class SqliteAsrJobStoreTests
             NormalizedResultPath = @"C:\data\sessions\ses_1\asr\jobs\job_1\normalized.jsonl",
             ErrorCode = "http.503",
             ErrorMessage = "temporarily unavailable",
+            ProviderLogId = "20260918120000ABCDEF",
             SpeakerInfoReturned = true,
             SubmittedAt = s_now.AddSeconds(1),
         };
@@ -79,6 +79,9 @@ public class SqliteAsrJobStoreTests
         Assert.Equal(job.NormalizedResultPath, loaded.NormalizedResultPath);
         Assert.Equal("http.503", loaded.ErrorCode);
         Assert.Equal("temporarily unavailable", loaded.ErrorMessage);
+        Assert.Equal("20260918120000ABCDEF", loaded.ProviderLogId);
+        // `tier` is a schema-compatibility column with one constant value.
+        Assert.Equal("standard", loaded.Tier);
         Assert.True(loaded.SpeakerInfoRequested);
         Assert.True(loaded.SpeakerInfoReturned);
         Assert.Equal(0.16, loaded.EstimatedCostCny, precision: 6);
@@ -96,6 +99,31 @@ public class SqliteAsrJobStoreTests
         Store(workspace).Create(Job());
 
         Assert.Equal("req-job_1", Store(workspace).Get("job_1")!.ProviderRequestId);
+    }
+
+    [Fact]
+    public void ProviderLogId_DefaultsToNullForAJobThatHasNotReachedTheProviderYet()
+    {
+        using var workspace = new TempWorkspace();
+        new SqliteMigrator().Migrate(workspace.DatabasePath);
+
+        Store(workspace).Create(Job());
+
+        Assert.Null(Store(workspace).Get("job_1")!.ProviderLogId);
+    }
+
+    [Fact]
+    public void ProviderLogId_IsPersistedByUpdateForTheNextProcess()
+    {
+        using var workspace = new TempWorkspace();
+        new SqliteMigrator().Migrate(workspace.DatabasePath);
+        var store = Store(workspace);
+
+        store.Create(Job());
+        store.Update(AsrJobTransitions.RecordProviderLogId(store.Get("job_1")!, "log-1", s_now));
+
+        // A fresh store instance stands in for a later process.
+        Assert.Equal("log-1", Store(workspace).Get("job_1")!.ProviderLogId);
     }
 
     [Fact]

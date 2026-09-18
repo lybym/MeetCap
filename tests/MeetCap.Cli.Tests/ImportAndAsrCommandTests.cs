@@ -3,14 +3,15 @@ using Xunit;
 namespace MeetCap.Cli.Tests;
 
 /// <summary>
-/// <c>meetcap import</c> and <c>meetcap asr resume</c> surface (Issue #5, M3).
+/// <c>meetcap import</c> and <c>meetcap asr resume</c> surface (Issue #5, M3; provider
+/// contract per issue #26).
 /// </summary>
 /// <remarks>
-/// The success path needs FFmpeg and Volcengine credentials, neither of which exists
+/// The success path needs FFmpeg and a Volcengine API key, neither of which exists
 /// in CI, so the CLI-level tests cover command surface and the failure ordering that
-/// the acceptance criteria call out: invalid credentials and configuration must fail
-/// visibly without leaving any session state behind. The end-to-end path is covered by
-/// MeetCap.IntegrationTests with the provider boundary mocked, and real Volcengine
+/// the acceptance criteria call out: an invalid or legacy provider configuration must
+/// fail visibly without leaving any session state behind. The end-to-end path is covered
+/// by MeetCap.IntegrationTests with the provider boundary mocked, and real Volcengine
 /// transcription is explicitly NOT verified (docs/DEVELOPMENT.md section 7).
 /// </remarks>
 public class ImportAndAsrCommandTests
@@ -19,9 +20,7 @@ public class ImportAndAsrCommandTests
         config_version = 1
 
         [asr.volcengine]
-        app_id = "test-app-id"
-        credential = "literal-test-token"
-        resource_id = "volc.bigasr.auc"
+        api_key = "literal-test-api-key"
         """;
 
     [Fact]
@@ -37,7 +36,7 @@ public class ImportAndAsrCommandTests
     }
 
     [Fact]
-    public void ImportHelp_DocumentsFileTitleAndTier()
+    public void ImportHelp_DocumentsFileAndTitleButNoServiceTier()
     {
         using var harness = CliHarness.Create();
 
@@ -45,7 +44,9 @@ public class ImportAndAsrCommandTests
 
         Assert.Equal(0, result.ExitCode);
         Assert.Contains("--title", result.Output);
-        Assert.Contains("--tier", result.Output);
+        // Issue #26 removed the tier selector, so the option must be gone from the surface
+        // rather than accepted and ignored.
+        Assert.DoesNotContain("--tier", result.Output);
     }
 
     [Fact]
@@ -63,16 +64,16 @@ public class ImportAndAsrCommandTests
     }
 
     [Fact]
-    public void Import_EmptyAppId_FailsWithAnActionableMessageBeforeCreatingSessionState()
+    public void Import_EmptyApiKey_FailsWithAnActionableMessageBeforeCreatingSessionState()
     {
         using var harness = CliHarness.Create();
-        harness.WriteConfig("config_version = 1\n\n[asr.volcengine]\napp_id = \"\"\n");
+        harness.WriteConfig("config_version = 1\n\n[asr.volcengine]\napi_key = \"\"\n");
         var source = WriteSource(harness);
 
         var result = harness.Run("--data-root", harness.DataRoot, "import", source);
 
         Assert.Equal(1, result.ExitCode);
-        Assert.Contains("asr.volcengine.app_id", result.Error);
+        Assert.Contains("credential", result.Error, StringComparison.OrdinalIgnoreCase);
 
         // Fail-visible, state-clean: no session directory and no database were created.
         Assert.False(Directory.Exists(Path.Combine(harness.DataRoot, "sessions")));
@@ -80,19 +81,19 @@ public class ImportAndAsrCommandTests
     }
 
     [Fact]
-    public void Import_UnresolvableCredential_FailsVisiblyAndNamesTheEnvironmentVariable()
+    public void Import_UnresolvableApiKey_FailsVisiblyAndNamesTheEnvironmentVariable()
     {
         using var harness = CliHarness.Create();
         harness.WriteConfig(
             "config_version = 1\n\n[asr.volcengine]\n" +
-            "app_id = \"test-app-id\"\n" +
-            "credential = \"env:MEETCAP_M3_TEST_MISSING_TOKEN\"\n");
+            "api_key = \"env:MEETCAP_M3_TEST_MISSING_KEY\"\n");
         var source = WriteSource(harness);
 
         var result = harness.Run("--data-root", harness.DataRoot, "import", source);
 
         Assert.Equal(1, result.ExitCode);
-        Assert.Contains("MEETCAP_M3_TEST_MISSING_TOKEN", result.Error);
+        Assert.Contains("MEETCAP_M3_TEST_MISSING_KEY", result.Error);
+        Assert.Contains("asr.volcengine.api_key", result.Error);
         Assert.False(File.Exists(Path.Combine(harness.DataRoot, "meetcap.db")));
         Assert.False(Directory.Exists(Path.Combine(harness.DataRoot, "sessions")));
     }
@@ -111,7 +112,29 @@ public class ImportAndAsrCommandTests
     }
 
     [Fact]
-    public void Import_UnsupportedTier_FailsInsteadOfSilentlyMappingToAnotherProtocol()
+    public void Import_RejectsALegacyProviderConfigurationWithAMigrationMessage()
+    {
+        // A pre-#26 configuration must not be reinterpreted: the legacy AppID/Access Token
+        // pair and the configurable resource id are rejected before any session exists.
+        using var harness = CliHarness.Create();
+        harness.WriteConfig(
+            "config_version = 1\n\n" +
+            "[asr]\nservice_tier = \"idle\"\n\n" +
+            "[asr.volcengine]\n" +
+            "app_id = \"test-app-id\"\ncredential = \"literal-test-token\"\nresource_id = \"volc.bigasr.auc\"\n");
+        var source = WriteSource(harness);
+
+        var result = harness.Run("--data-root", harness.DataRoot, "import", source);
+
+        Assert.Equal(1, result.ExitCode);
+        Assert.Contains("asr.volcengine.credential", result.Error);
+        Assert.Contains("api_key", result.Error);
+        Assert.False(File.Exists(Path.Combine(harness.DataRoot, "meetcap.db")));
+        Assert.False(Directory.Exists(Path.Combine(harness.DataRoot, "sessions")));
+    }
+
+    [Fact]
+    public void Import_TierFlagIsNoLongerACommand_SoPassingItIsAParseError()
     {
         using var harness = CliHarness.Create();
         harness.WriteConfig(ValidProviderConfig);
@@ -119,9 +142,21 @@ public class ImportAndAsrCommandTests
 
         var result = harness.Run("--data-root", harness.DataRoot, "import", source, "--tier", "turbo");
 
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.False(Directory.Exists(Path.Combine(harness.DataRoot, "sessions")));
+    }
+
+    [Fact]
+    public void ConfigValidate_ReportsTheLegacyProviderKeysAsErrors()
+    {
+        using var harness = CliHarness.Create();
+        harness.WriteConfig(
+            "config_version = 1\n\n[asr.volcengine]\ncredential = \"env:MEETCAP_OLD\"\n");
+
+        var result = harness.Run("config", "validate");
+
         Assert.Equal(1, result.ExitCode);
-        Assert.Contains("turbo", result.Error);
-        Assert.Contains("not implemented", result.Error);
+        Assert.Contains("Legacy configuration key 'asr.volcengine.credential'", result.Error);
     }
 
     [Fact]

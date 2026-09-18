@@ -179,13 +179,13 @@ internal sealed class CliHarness : IDisposable
             "enabled = true\n" +
             "strategy = \"file\"\n" +
             $"file_batch_seconds = {fileBatchSeconds}\n" +
-            "service_tier = \"standard\"\n" +
             "streaming_enabled = false\n" +
             "\n" +
             "[asr.volcengine]\n" +
-            "app_id = \"test-app\"\n" +
-            "credential = \"test-token\"\n" +
-            "resource_id = \"volc.bigasr.auc\"\n" +
+            // A literal key is accepted by the secret resolver, so the harness never needs a
+            // real environment variable. The adapter is the shipped one; only the HTTP
+            // transport is replaced.
+            "api_key = \"test-api-key\"\n" +
             "request_speaker_info = true\n" +
             "poll_interval_seconds = 1\n" +
             $"poll_timeout_seconds = {pollTimeoutSeconds}\n");

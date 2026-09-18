@@ -14,7 +14,8 @@ public sealed class SqliteAsrJobStore : IAsrJobStore, IAsrQueueInspector
         "id, session_id, source, tier, provider, start_ms, end_ms, input_artifact, status, " +
         "provider_request_id, attempt_count, next_retry_at, request_metadata_path, raw_response_path, " +
         "normalized_result_path, error_code, error_message, duration_ms, speaker_info_requested, " +
-        "speaker_info_returned, estimated_cost_cny, submitted_at, completed_at, created_at, updated_at";
+        "speaker_info_returned, estimated_cost_cny, submitted_at, completed_at, created_at, updated_at, " +
+        "provider_log_id";
 
     private static readonly string[] s_resumableStatuses = new[]
     {
@@ -45,12 +46,14 @@ public sealed class SqliteAsrJobStore : IAsrJobStore, IAsrQueueInspector
                 id, session_id, source, tier, provider, start_ms, end_ms, input_artifact, status,
                 provider_request_id, attempt_count, next_retry_at, request_metadata_path, raw_response_path,
                 normalized_result_path, error_code, error_message, duration_ms, speaker_info_requested,
-                speaker_info_returned, estimated_cost_cny, submitted_at, completed_at, created_at, updated_at)
+                speaker_info_returned, estimated_cost_cny, submitted_at, completed_at, created_at, updated_at,
+                provider_log_id)
             VALUES (
                 @id, @sessionId, @source, @tier, @provider, @startMs, @endMs, @inputArtifact, @status,
                 @providerRequestId, @attemptCount, @nextRetryAt, @requestMetadataPath, @rawResponsePath,
                 @normalizedResultPath, @errorCode, @errorMessage, @durationMs, @speakerInfoRequested,
-                @speakerInfoReturned, @estimatedCostCny, @submittedAt, @completedAt, @createdAt, @updatedAt)
+                @speakerInfoReturned, @estimatedCostCny, @submittedAt, @completedAt, @createdAt, @updatedAt,
+                @providerLogId)
             """,
             conn);
 
@@ -163,6 +166,7 @@ public sealed class SqliteAsrJobStore : IAsrJobStore, IAsrQueueInspector
                 estimated_cost_cny = @estimatedCostCny,
                 submitted_at = @submittedAt,
                 completed_at = @completedAt,
+                provider_log_id = @providerLogId,
                 updated_at = @updatedAt
             WHERE id = @id
             """,
@@ -293,6 +297,7 @@ public sealed class SqliteAsrJobStore : IAsrJobStore, IAsrQueueInspector
         cmd.Parameters.AddWithValue("@estimatedCostCny", job.EstimatedCostCny);
         cmd.Parameters.AddWithValue("@submittedAt", Timestamp(job.SubmittedAt));
         cmd.Parameters.AddWithValue("@completedAt", Timestamp(job.CompletedAt));
+        cmd.Parameters.AddWithValue("@providerLogId", Text(job.ProviderLogId));
         cmd.Parameters.AddWithValue("@createdAt", job.CreatedAt.UtcDateTime.ToString("o", CultureInfo.InvariantCulture));
         cmd.Parameters.AddWithValue("@updatedAt", job.UpdatedAt.UtcDateTime.ToString("o", CultureInfo.InvariantCulture));
     }
@@ -325,7 +330,9 @@ public sealed class SqliteAsrJobStore : IAsrJobStore, IAsrQueueInspector
             Id = id,
             SessionId = reader.GetString(reader.GetOrdinal("session_id")),
             Source = reader.GetString(reader.GetOrdinal("source")),
-            Tier = reader.GetString(reader.GetOrdinal("tier")),
+            // `tier` is a schema-compatibility column, not a routing input: AsrJob.Tier is a
+            // constant, so the stored value is deliberately not read back (docs/DATA_MODEL.md
+            // section 6).
             Provider = reader.GetString(reader.GetOrdinal("provider")),
             StartMs = reader.GetInt64(reader.GetOrdinal("start_ms")),
             EndMs = reader.GetInt64(reader.GetOrdinal("end_ms")),
@@ -339,6 +346,7 @@ public sealed class SqliteAsrJobStore : IAsrJobStore, IAsrQueueInspector
             NormalizedResultPath = ReadText(reader, "normalized_result_path"),
             ErrorCode = ReadText(reader, "error_code"),
             ErrorMessage = ReadText(reader, "error_message"),
+            ProviderLogId = ReadText(reader, "provider_log_id"),
             DurationMs = reader.GetInt32(reader.GetOrdinal("duration_ms")),
             SpeakerInfoRequested = reader.GetInt32(reader.GetOrdinal("speaker_info_requested")) != 0,
             SpeakerInfoReturned = reader.GetInt32(reader.GetOrdinal("speaker_info_returned")) != 0,

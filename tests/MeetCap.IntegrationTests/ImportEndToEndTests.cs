@@ -61,7 +61,6 @@ public class ImportEndToEndTests : IDisposable
     private void Migrate() => new SqliteMigrator().Migrate(DatabasePath);
 
     private (ImportSessionService Service, AsrJobProcessor Processor, FakeAsrProvider Provider, MeetCapDatabase Database) CreateService(
-        string tier = "standard",
         bool requestSpeakerInfo = true,
         bool writeMarkdown = true,
         FakeAsrProvider? provider = null)
@@ -101,7 +100,6 @@ public class ImportEndToEndTests : IDisposable
                 DataRoot = _dataRoot,
                 ProviderName = provider.Name,
                 DefaultTitle = "Untitled Meeting",
-                ServiceTier = tier,
                 RequestSpeakerInfo = requestSpeakerInfo,
                 CostPerHourCny = 0.8,
                 ConfigSnapshotJson = "{\"config_version\":1}",
@@ -386,7 +384,7 @@ public class ImportEndToEndTests : IDisposable
         var job = database.AsrJobs.Get("job_test")!;
 
         Assert.Equal("volcengine", job.Provider);
-        Assert.Equal("standard", job.Tier);
+        Assert.Equal(AsrJob.StandardTier, job.Tier);
         Assert.Equal("import", job.Source);
         Assert.Equal(754_000, job.DurationMs);
         Assert.True(job.SpeakerInfoRequested);
@@ -475,10 +473,51 @@ public class ImportEndToEndTests : IDisposable
     }
 
     [Fact]
-    public async Task Import_TierOverrideIsOneShotAndDoesNotAffectTheDefault()
+    public async Task Import_RetainsTheProviderLogIdOnTheJobRowForSupportTracing()
     {
+        // The provider's X-Tt-Logid is what a Volcengine support request about a task is traced
+        // by, so it survives the whole import in durable, queryable state and is recorded in the
+        // session's own event log (docs/ASR_STRATEGY.md section 13, issue #26).
         Migrate();
-        var (service, _, provider, database) = CreateService(tier: "standard");
+        var (service, _, provider, database) = CreateService();
+        provider.OnSubmit = request => new AsrSubmission
+        {
+            ProviderRequestId = request.ProviderRequestId,
+            SanitizedRequestJson = "{\"job_id\":\"" + request.JobId + "\"}",
+            ProviderLogId = "log-submit-1",
+        };
+        provider.EnqueuePoll(AsrPollResult.Completed(
+            new AsrCompletion(ProviderJson, "20000000", "log-query-1")));
+
+        await service.ImportAsync(new ImportRequest
+        {
+            SourcePath = _sourcePath,
+            SessionId = "ses_test",
+            JobId = "job_test",
+        });
+
+        Assert.Equal("log-query-1", database.AsrJobs.Get("job_test")!.ProviderLogId);
+
+        var paths = new SessionArtifactPaths(_dataRoot, "ses_test");
+        var submitted = File.ReadAllLines(paths.EventsJsonl)
+            .Select(line => JsonDocument.Parse(line).RootElement)
+            .First(element => element.GetProperty("event").GetString() == SessionEvents.AsrJobSubmitted);
+        Assert.Equal("log-submit-1", submitted.GetProperty("provider_log_id").GetString());
+
+        var completed = File.ReadAllLines(paths.EventsJsonl)
+            .Select(line => JsonDocument.Parse(line).RootElement)
+            .First(element => element.GetProperty("event").GetString() == SessionEvents.AsrJobCompleted);
+        Assert.Equal("log-query-1", completed.GetProperty("provider_log_id").GetString());
+    }
+
+    [Fact]
+    public async Task Import_NeverHandsTheProviderApiKeyToTheJobOrItsArtifacts()
+    {
+        // The provider boundary takes no credential at all: the adapter resolves the API key
+        // itself, so nothing above it can copy the secret into a request, a job row, or a
+        // retained artifact (docs/CONFIGURATION.md section 8, issue #26).
+        Migrate();
+        var (service, _, provider, database) = CreateService();
         provider.EnqueuePoll(AsrPollResult.Completed(new AsrCompletion(ProviderJson, "20000000")));
 
         await service.ImportAsync(new ImportRequest
@@ -486,11 +525,21 @@ public class ImportEndToEndTests : IDisposable
             SourcePath = _sourcePath,
             SessionId = "ses_test",
             JobId = "job_test",
-            Tier = "idle",
         });
 
-        Assert.Equal("idle", database.AsrJobs.Get("job_test")!.Tier);
-        Assert.Equal("idle", Assert.Single(provider.Submissions).ServiceTier);
+        var paths = new SessionArtifactPaths(_dataRoot, "ses_test");
+        var job = database.AsrJobs.Get("job_test")!;
+
+        // The request the domain side built carries no credential-bearing member.
+        Assert.DoesNotContain(
+            typeof(AsrFileRequest).GetProperties(),
+            p => p.Name.Contains("Key", StringComparison.Ordinal)
+                || p.Name.Contains("Token", StringComparison.Ordinal)
+                || p.Name.Contains("Secret", StringComparison.Ordinal));
+
+        // And the persisted job metadata has no free-form field that could hold one either.
+        Assert.Null(job.ErrorMessage);
+        Assert.DoesNotContain("api_key", File.ReadAllText(paths.JobRequestJson("job_test")), StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

@@ -74,7 +74,6 @@ public class AsrJobProcessorTests : IDisposable
             Id = jobId,
             SessionId = "ses_1",
             Source = AudioTrackName.Import,
-            Tier = "standard",
             Provider = provider,
             StartMs = 0,
             EndMs = 754_000,
@@ -141,6 +140,47 @@ public class AsrJobProcessorTests : IDisposable
 
         Assert.True(result.Job.SpeakerInfoReturned);
         Assert.Equal(0.1675, result.Job.EstimatedCostCny, precision: 3);
+    }
+
+    [Fact]
+    public async Task ProviderLogId_IsPersistedFromTheSubmitEvenBeforeTheResultArrives()
+    {
+        // The log id is what a Volcengine support request about a task is traced by, so it is
+        // recorded as soon as the submit answers rather than only on completion
+        // (docs/ASR_STRATEGY.md section 13, issue #26).
+        var job = CreateJob();
+        _provider.OnSubmit = request => new AsrSubmission
+        {
+            ProviderRequestId = request.ProviderRequestId,
+            SanitizedRequestJson = "{\"job_id\":\"" + request.JobId + "\"}",
+            ProviderLogId = "log-submit",
+        };
+        _provider.OnPoll = _ => AsrPollResult.Pending();
+
+        var result = await CreateProcessor(pollTimeout: TimeSpan.Zero).ProcessAsync(job);
+
+        Assert.Equal(AsrJobOutcome.StillRunning, result.Outcome);
+        Assert.Equal("log-submit", _jobs.Get("job_1")!.ProviderLogId);
+    }
+
+    [Fact]
+    public async Task ProviderLogId_IsReplacedByTheQueryLogIdOnCompletion()
+    {
+        var job = CreateJob();
+        _provider.OnSubmit = request => new AsrSubmission
+        {
+            ProviderRequestId = request.ProviderRequestId,
+            SanitizedRequestJson = "{\"job_id\":\"" + request.JobId + "\"}",
+            ProviderLogId = "log-submit",
+        };
+        _provider.EnqueuePoll(AsrPollResult.Completed(
+            new AsrCompletion("""{"result":{"utterances":[]}}""", "20000000", "log-query")));
+
+        var result = await CreateProcessor().ProcessAsync(job);
+
+        Assert.Equal(AsrJobOutcome.Succeeded, result.Outcome);
+        Assert.Equal("log-query", result.Job.ProviderLogId);
+        Assert.Equal("log-query", _jobs.Get("job_1")!.ProviderLogId);
     }
 
     [Fact]
@@ -475,7 +515,6 @@ public class AsrJobProcessorTests : IDisposable
             Id = "job_2",
             SessionId = "ses_1",
             Source = AudioTrackName.Import,
-            Tier = "standard",
             Provider = "volcengine",
             InputArtifact = first.InputArtifact,
             Status = AsrJobStatus.Pending,

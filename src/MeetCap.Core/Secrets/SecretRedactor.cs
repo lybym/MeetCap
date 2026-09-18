@@ -12,8 +12,8 @@ public static class SecretRedactor
     private const string Redacted = "***";
 
     /// <summary>
-    /// The secret-bearing string values present in the configuration (e.g. the
-    /// Volcengine credential). Empty values are not treated as secrets.
+    /// The secret-bearing string values present in the configuration (the Volcengine
+    /// API key reference). Empty values are not treated as secrets.
     /// </summary>
     public static IReadOnlySet<string> GetSecretValues(MeetCapConfiguration config)
     {
@@ -23,8 +23,7 @@ public static class SecretRedactor
             return secrets;
         }
 
-        AddIfNonEmpty(secrets, config.Asr.Volcengine.Credential);
-        AddIfNonEmpty(secrets, config.Asr.Volcengine.AppId);
+        AddIfNonEmpty(secrets, config.Asr.Volcengine.ApiKey);
         return secrets;
     }
 

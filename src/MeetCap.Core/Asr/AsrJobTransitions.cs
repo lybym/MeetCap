@@ -110,6 +110,24 @@ public static class AsrJobTransitions
         return job with { RawResponsePath = rawResponsePath, UpdatedAt = now };
     }
 
+    /// <summary>Records the provider's trace id (Volcengine <c>X-Tt-Logid</c>) for this job.</summary>
+    /// <remarks>
+    /// Not every provider response carries one, and a missing value must not erase a log id
+    /// already recorded for the same job: the submit log id is still what a support request
+    /// about that task is traced by. The job is returned unchanged when there is nothing to
+    /// record, so no spurious <c>updated_at</c> write happens either.
+    /// </remarks>
+    public static AsrJob RecordProviderLogId(AsrJob job, string? providerLogId, DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(job);
+        if (string.IsNullOrWhiteSpace(providerLogId))
+        {
+            return job;
+        }
+
+        return job with { ProviderLogId = providerLogId, UpdatedAt = now };
+    }
+
     /// <summary>
     /// Schedules a persistent retry. The delay is derived from the attempt that just
     /// failed, and the resulting <c>next_retry_at</c> is durable so a restart

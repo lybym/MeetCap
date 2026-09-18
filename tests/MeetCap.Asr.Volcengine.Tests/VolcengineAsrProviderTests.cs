@@ -1,4 +1,5 @@
 using System.Net;
+using System.Text.Json.Nodes;
 using MeetCap.Core.Asr;
 using MeetCap.Core.Configuration;
 using Xunit;
@@ -11,12 +12,13 @@ namespace MeetCap.Asr.Volcengine.Tests;
 /// </summary>
 /// <remarks>
 /// Real Volcengine transcription is NOT verified: this environment has no
-/// <c>VOLCENGINE_APP_ID</c> and no access token, and docs/DEVELOPMENT.md section 7
-/// forbids claiming otherwise or inventing credentials.
+/// <c>MEETCAP_VOLCENGINE_API_KEY</c>, and docs/DEVELOPMENT.md section 7 forbids claiming
+/// otherwise or inventing credentials. The contract asserted here is the one issue #26
+/// fixes: Seed-ASR 2.0, recording-file Standard HTTP, <c>X-Api-Key</c> only.
 /// </remarks>
 public class VolcengineAsrProviderTests : IDisposable
 {
-    private const string Token = "SECRET-ACCESS-TOKEN-0123456789";
+    private const string ApiKey = "SECRET-API-KEY-0123456789";
 
     private readonly string _audioRoot = Path.Combine(
         Path.GetTempPath(),
@@ -39,13 +41,11 @@ public class VolcengineAsrProviderTests : IDisposable
         return path;
     }
 
-    private VolcengineAsrProvider Create(StubHttpHandler handler, string tier = VolcengineTiers.Standard) =>
+    private static VolcengineAsrProvider Create(StubHttpHandler handler) =>
         new(
             new VolcengineAsrOptions
             {
-                AppId = "app-123",
-                AccessToken = Token,
-                ResourceId = "volc.bigasr.auc",
+                ApiKey = ApiKey,
                 BaseUrl = "https://asr.invalid/api/v3/auc/bigmodel",
                 MaxTransientAttempts = 3,
                 InitialBackoff = TimeSpan.FromMilliseconds(1),
@@ -53,7 +53,7 @@ public class VolcengineAsrProviderTests : IDisposable
             },
             handler);
 
-    private AsrFileRequest Request(string path, string tier = VolcengineTiers.Standard) => new()
+    private static AsrFileRequest Request(string path) => new()
     {
         JobId = "job_1",
         SessionId = "ses_1",
@@ -62,9 +62,14 @@ public class VolcengineAsrProviderTests : IDisposable
         AudioFormat = "wav",
         DurationMs = 754_000,
         ProviderRequestId = "req-0001",
-        ServiceTier = tier,
         RequestSpeakerInfo = true,
     };
+
+    private static AsrSubmission ExistingSubmission() =>
+        new() { ProviderRequestId = "req-0001", SanitizedRequestJson = "{}" };
+
+    private static string Header(HttpRequestMessage request, string name) =>
+        string.Join(",", request.Headers.GetValues(name));
 
     [Fact]
     public async Task Submit_SendsTheDocumentedHeadersAndBody()
@@ -78,33 +83,112 @@ public class VolcengineAsrProviderTests : IDisposable
 
         var request = Assert.Single(handler.Requests);
         Assert.Equal("https://asr.invalid/api/v3/auc/bigmodel/submit", request.RequestUri!.ToString());
-        Assert.Equal("app-123", string.Join(",", request.Headers.GetValues("X-Api-App-Key")));
-        Assert.Equal(Token, string.Join(",", request.Headers.GetValues("X-Api-Access-Key")));
-        Assert.Equal("volc.bigasr.auc", string.Join(",", request.Headers.GetValues("X-Api-Resource-Id")));
-        Assert.Equal("req-0001", string.Join(",", request.Headers.GetValues("X-Api-Request-Id")));
-        Assert.Equal("-1", string.Join(",", request.Headers.GetValues("X-Api-Sequence")));
+        Assert.Equal(ApiKey, Header(request, "X-Api-Key"));
+        Assert.Equal("volc.seedasr.auc", Header(request, "X-Api-Resource-Id"));
+        Assert.Equal("req-0001", Header(request, "X-Api-Request-Id"));
+        // The official Standard HTTP contract identifies submit as sequence -1.
+        Assert.Equal("-1", Header(request, "X-Api-Sequence"));
 
         var body = handler.RequestBodies[0];
+        Assert.Contains("\"model_name\":\"bigmodel\"", body, StringComparison.Ordinal);
         Assert.Contains("\"show_utterances\":true", body, StringComparison.Ordinal);
         Assert.Contains("\"enable_speaker_info\":true", body, StringComparison.Ordinal);
+        Assert.Contains("\"enable_itn\":true", body, StringComparison.Ordinal);
+        Assert.Contains("\"enable_punc\":true", body, StringComparison.Ordinal);
+        Assert.Contains("\"enable_ddc\":true", body, StringComparison.Ordinal);
         Assert.Contains("\"format\":\"wav\"", body, StringComparison.Ordinal);
+        Assert.Contains("\"data\":", body, StringComparison.Ordinal);
     }
 
     [Fact]
-    public async Task Submit_SanitizedMetadata_ContainsNoCredentialAndNoInlineAudio()
+    public async Task NoRequestEverSendsTheLegacyAuthenticationHeaders()
+    {
+        // The whole point of issue #26: one authentication generation, not two. Both the
+        // submit and the query are checked, because dropping the headers from only one of
+        // them would still leave the legacy scheme half-alive.
+        var handler = new StubHttpHandler()
+            .Enqueue(HttpStatusCode.OK, apiStatus: "20000000", apiLogId: "log-submit")
+            .EnqueueJson(HttpStatusCode.OK, """{"result":{"utterances":[]}}""", apiLogId: "log-query");
+        using var provider = Create(handler);
+
+        await provider.SubmitFileAsync(Request(WriteAudio()));
+        await provider.GetResultAsync(ExistingSubmission(), Request(WriteAudio()));
+
+        Assert.Equal(2, handler.Requests.Count);
+        Assert.All(handler.Requests, request =>
+        {
+            Assert.False(request.Headers.Contains("X-Api-App-Key"));
+            Assert.False(request.Headers.Contains("X-Api-Access-Key"));
+            // The new-console key is the only credential that is ever sent.
+            Assert.Equal(ApiKey, Header(request, "X-Api-Key"));
+        });
+    }
+
+    [Fact]
+    public async Task RequestBody_CarriesANonSecretMeetCapOwnedUserId()
+    {
+        var handler = new StubHttpHandler().Enqueue(HttpStatusCode.OK, apiStatus: "20000000");
+        using var provider = Create(handler);
+
+        await provider.SubmitFileAsync(Request(WriteAudio()));
+
+        var root = JsonNode.Parse(handler.RequestBodies[0])!.AsObject();
+        var body = root.ToJsonString();
+
+        // user.uid is persisted with the sanitized request metadata, so it must never be the
+        // API key (docs/CONFIGURATION.md section 8).
+        Assert.Equal(VolcengineAsrOptions.UserId, root["user"]!["uid"]!.GetValue<string>());
+        Assert.DoesNotContain(ApiKey, body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Submit_RetainsTheProviderLogIdForDiagnostics()
+    {
+        var handler = new StubHttpHandler().Enqueue(
+            HttpStatusCode.OK,
+            apiStatus: "20000000",
+            apiLogId: "20260918120000ABCDEF");
+        using var provider = Create(handler);
+
+        var submission = await provider.SubmitFileAsync(Request(WriteAudio()));
+
+        Assert.Equal("20260918120000ABCDEF", submission.ProviderLogId);
+    }
+
+    [Fact]
+    public async Task Query_RetainsTheProviderLogIdOnTheCompletion()
+    {
+        var handler = new StubHttpHandler().EnqueueJson(
+            HttpStatusCode.OK,
+            """{"result":{"text":"hello","utterances":[]}}""",
+            apiLogId: "log-query-1");
+        using var provider = Create(handler);
+
+        var result = await provider.GetResultAsync(ExistingSubmission(), Request(WriteAudio()));
+
+        Assert.Equal(AsrPollState.Completed, result.State);
+        Assert.Equal("log-query-1", result.Completion!.ProviderLogId);
+    }
+
+    [Fact]
+    public async Task Submit_SanitizedMetadata_ContainsNoApiKeyAndNoInlineAudio()
     {
         var handler = new StubHttpHandler().Enqueue(HttpStatusCode.OK, apiStatus: "20000000");
         using var provider = Create(handler);
 
         var submission = await provider.SubmitFileAsync(Request(WriteAudio(bytes: 4096)));
 
-        // The persisted request.json must never carry the access token or duplicate the
-        // user's audio.
-        Assert.DoesNotContain(Token, submission.SanitizedRequestJson, StringComparison.Ordinal);
-        Assert.DoesNotContain("data", submission.SanitizedRequestJson, StringComparison.Ordinal);
+        // The persisted request.json must never carry the API key or duplicate the user's audio.
+        Assert.DoesNotContain(ApiKey, submission.SanitizedRequestJson, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"data\"", submission.SanitizedRequestJson, StringComparison.Ordinal);
         Assert.Contains("\"inline_bytes\":4096", submission.SanitizedRequestJson, StringComparison.Ordinal);
-        Assert.Contains("volc.bigasr.auc", submission.SanitizedRequestJson, StringComparison.Ordinal);
+        Assert.Contains("volc.seedasr.auc", submission.SanitizedRequestJson, StringComparison.Ordinal);
+        Assert.Contains("\"model\":\"bigmodel\"", submission.SanitizedRequestJson, StringComparison.Ordinal);
         Assert.Contains("\"enable_speaker_info\":true", submission.SanitizedRequestJson, StringComparison.Ordinal);
+
+        var sanitized = JsonNode.Parse(submission.SanitizedRequestJson)!.AsObject();
+        Assert.False(sanitized.ContainsKey("tier"));
+        Assert.False(sanitized.ContainsKey("endpoint_tier"));
     }
 
     [Fact]
@@ -122,7 +206,7 @@ public class VolcengineAsrProviderTests : IDisposable
         Assert.Equal(3, handler.Requests.Count);
         Assert.All(
             handler.Requests,
-            request => Assert.Equal("req-0001", string.Join(",", request.Headers.GetValues("X-Api-Request-Id"))));
+            request => Assert.Equal("req-0001", Header(request, "X-Api-Request-Id")));
     }
 
     [Fact]
@@ -135,27 +219,27 @@ public class VolcengineAsrProviderTests : IDisposable
             .EnqueueJson(HttpStatusCode.OK, "{\"result\":{\"utterances\":[]}}");
         using var provider = Create(handler);
 
-        var result = await provider.GetResultAsync(
-            new AsrSubmission { ProviderRequestId = "req-0001", SanitizedRequestJson = "{}" },
-            Request(WriteAudio()));
+        var result = await provider.GetResultAsync(ExistingSubmission(), Request(WriteAudio()));
 
         Assert.Equal(AsrPollState.Completed, result.State);
         Assert.Equal(3, handler.Requests.Count);
         Assert.All(
             handler.Requests,
-            request => Assert.Equal("req-0001", string.Join(",", request.Headers.GetValues("X-Api-Request-Id"))));
+            request => Assert.Equal("req-0001", Header(request, "X-Api-Request-Id")));
     }
 
     [Fact]
     public async Task Unauthorized_FailsPermanentlyWithAnActionableMessage()
     {
-        var handler = new StubHttpHandler().Enqueue(HttpStatusCode.Unauthorized, body: "bad app id");        using var provider = Create(handler);
+        var handler = new StubHttpHandler().Enqueue(HttpStatusCode.Unauthorized, body: "bad api key");
+        using var provider = Create(handler);
 
         var ex = await Assert.ThrowsAsync<AsrPermanentException>(
             () => provider.SubmitFileAsync(Request(WriteAudio())));
 
         Assert.Equal("http.401", ex.Code);
-        Assert.Contains("asr.volcengine.app_id", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("asr.volcengine.api_key", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(ApiKey, ex.Message, StringComparison.Ordinal);
     }
 
     [Theory]
@@ -168,19 +252,23 @@ public class VolcengineAsrProviderTests : IDisposable
     {
         // Volcengine can answer with an HTTP error *and* its own X-Api-Status-Code. Gating the
         // permanent classification on the absence of that header made a 401 retryable, so a bad
-        // credential would be retried instead of failing visibly.
+        // API key would be retried instead of failing visibly.
         var handler = new StubHttpHandler().Enqueue(
             statusCode,
             body: "{\"message\":\"denied\"}",
             apiStatus: "45000010",
-            apiMessage: "auth failed");
+            apiMessage: "auth failed",
+            apiLogId: "log-401");
         using var provider = Create(handler);
 
         var ex = await Assert.ThrowsAsync<AsrPermanentException>(
             () => provider.SubmitFileAsync(Request(WriteAudio())));
 
         Assert.Equal(expectedCode, ex.Code);
-        Assert.Contains("asr.volcengine.app_id", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("asr.volcengine.api_key", ex.Message, StringComparison.Ordinal);
+        // The provider log id travels with the error so an incident can be traced from the
+        // persisted error_message alone.
+        Assert.Contains("X-Tt-Logid=log-401", ex.Message, StringComparison.Ordinal);
     }
 
     [Theory]
@@ -195,27 +283,25 @@ public class VolcengineAsrProviderTests : IDisposable
         using var provider = Create(handler);
 
         var ex = await Assert.ThrowsAsync<AsrPermanentException>(
-            () => provider.GetResultAsync(
-                new AsrSubmission { ProviderRequestId = "req-0001", SanitizedRequestJson = "{}" },
-                Request(WriteAudio())));
+            () => provider.GetResultAsync(ExistingSubmission(), Request(WriteAudio())));
 
         Assert.Equal(expectedCode, ex.Code);
     }
 
     [Fact]
-    public async Task ResponseBodiesThatEchoTheCredential_AreScrubbedFromErrors()
+    public async Task ResponseBodiesThatEchoTheApiKey_AreScrubbedFromErrors()
     {
         // One more response than the retry budget: the adapter must scrub every attempt.
         var handler = new StubHttpHandler().EnqueueRepeat(
             4,
             HttpStatusCode.ServiceUnavailable,
-            body: $"{{\"echoed\":\"{Token}\"}}");
+            body: $"{{\"echoed\":\"{ApiKey}\"}}");
         using var provider = Create(handler);
 
         var ex = await Assert.ThrowsAsync<AsrTransientException>(
             () => provider.SubmitFileAsync(Request(WriteAudio())));
 
-        Assert.DoesNotContain(Token, ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(ApiKey, ex.Message, StringComparison.Ordinal);
         Assert.Contains("***", ex.Message, StringComparison.Ordinal);
     }
 
@@ -257,16 +343,19 @@ public class VolcengineAsrProviderTests : IDisposable
         var pending = new StubHttpHandler().Enqueue(HttpStatusCode.OK, apiStatus: "20000002");
         using (var provider = Create(pending))
         {
-            var result = await provider.GetResultAsync(
-                new AsrSubmission { ProviderRequestId = "req-0001", SanitizedRequestJson = "{}" },
-                request);
+            var result = await provider.GetResultAsync(ExistingSubmission(), request);
             Assert.Equal(AsrPollState.Pending, result.State);
 
-            // The query carries no X-Api-Sequence: that header belongs to submit.
+            // The query carries no X-Api-Sequence and no X-Api-Sequence is required: that
+            // header belongs to submit, matching the official interface document.
             Assert.False(pending.Requests[0].Headers.Contains("X-Api-Sequence"));
             Assert.Equal(
                 "https://asr.invalid/api/v3/auc/bigmodel/query",
                 pending.Requests[0].RequestUri!.ToString());
+            // The query repeats the same task identity: same key, same resource, same request id.
+            Assert.Equal(ApiKey, Header(pending.Requests[0], "X-Api-Key"));
+            Assert.Equal("volc.seedasr.auc", Header(pending.Requests[0], "X-Api-Resource-Id"));
+            Assert.Equal("req-0001", Header(pending.Requests[0], "X-Api-Request-Id"));
         }
 
         var completed = new StubHttpHandler().EnqueueJson(
@@ -274,9 +363,7 @@ public class VolcengineAsrProviderTests : IDisposable
             "{\"result\":{\"text\":\"hello\",\"utterances\":[]}}");
         using (var provider = Create(completed))
         {
-            var result = await provider.GetResultAsync(
-                new AsrSubmission { ProviderRequestId = "req-0001", SanitizedRequestJson = "{}" },
-                request);
+            var result = await provider.GetResultAsync(ExistingSubmission(), request);
             Assert.Equal(AsrPollState.Completed, result.State);
             Assert.Contains("hello", result.Completion!.RawResponseJson, StringComparison.Ordinal);
             Assert.Equal("20000000", result.Completion.ProviderStatus);
@@ -285,9 +372,7 @@ public class VolcengineAsrProviderTests : IDisposable
         var silent = new StubHttpHandler().Enqueue(HttpStatusCode.OK, body: string.Empty, apiStatus: "20000003");
         using (var provider = Create(silent))
         {
-            var result = await provider.GetResultAsync(
-                new AsrSubmission { ProviderRequestId = "req-0001", SanitizedRequestJson = "{}" },
-                request);
+            var result = await provider.GetResultAsync(ExistingSubmission(), request);
 
             // Silence is a completed result with no speech, not a failure.
             Assert.Equal(AsrPollState.Completed, result.State);
@@ -303,9 +388,7 @@ public class VolcengineAsrProviderTests : IDisposable
         var unknown = new StubHttpHandler().Enqueue(HttpStatusCode.OK, apiStatus: "55000001", apiMessage: "boom");
         using (var provider = Create(unknown))
         {
-            var result = await provider.GetResultAsync(
-                new AsrSubmission { ProviderRequestId = "req-0001", SanitizedRequestJson = "{}" },
-                request);
+            var result = await provider.GetResultAsync(ExistingSubmission(), request);
             Assert.Equal(AsrPollState.Failed, result.State);
             Assert.True(result.Error!.IsTransient);
         }
@@ -313,70 +396,47 @@ public class VolcengineAsrProviderTests : IDisposable
         var permanent = new StubHttpHandler().Enqueue(HttpStatusCode.OK, apiStatus: "45000001", apiMessage: "bad参数");
         using (var provider = Create(permanent))
         {
-            var result = await provider.GetResultAsync(
-                new AsrSubmission { ProviderRequestId = "req-0001", SanitizedRequestJson = "{}" },
-                request);
+            var result = await provider.GetResultAsync(ExistingSubmission(), request);
             Assert.Equal(AsrPollState.Failed, result.State);
             Assert.False(result.Error!.IsTransient);
         }
     }
 
     [Fact]
-    public async Task IdleTier_UsesTheIdleEndpoints()
-    {
-        var handler = new StubHttpHandler().Enqueue(HttpStatusCode.OK, apiStatus: "20000000");
-        using var provider = Create(handler);
-
-        await provider.SubmitFileAsync(Request(WriteAudio(), VolcengineTiers.Idle));
-
-        Assert.Equal(
-            "https://asr.invalid/api/v3/auc/bigmodel/idle/submit",
-            handler.Requests[0].RequestUri!.ToString());
-    }
-
-    [Fact]
-    public async Task TurboTier_IsRejectedInsteadOfBeingSilentlyMapped()
-    {
-        var handler = new StubHttpHandler();
-        using var provider = Create(handler);
-
-        var ex = await Assert.ThrowsAsync<AsrConfigurationException>(
-            () => provider.SubmitFileAsync(Request(WriteAudio(), VolcengineTiers.Turbo)));
-
-        Assert.Contains("turbo", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("not implemented", ex.Message, StringComparison.Ordinal);
-        Assert.Empty(handler.Requests);
-    }
-
-    [Fact]
-    public void NoStreamingEndpointExistsAnywhereInThisAdapter()
+    public void EndpointContract_IsSubmitAndQueryOnlyAndUsesTheFixedResourceId()
     {
         // "No streaming ASR in the normal or failure path" (docs/ASR_STRATEGY.md section 7)
-        // is auditable: the adapter's only endpoints are submit/query.
-        var paths = new[]
-        {
-            VolcengineTiers.SubmitPath("https://x", VolcengineTiers.Standard),
-            VolcengineTiers.QueryPath("https://x", VolcengineTiers.Standard),
-            VolcengineTiers.SubmitPath("https://x", VolcengineTiers.Idle),
-            VolcengineTiers.QueryPath("https://x", VolcengineTiers.Idle),
-        };
+        // and "one resource id" (section 2) are both auditable from the options alone: the
+        // adapter has exactly two endpoint properties and one protocol constant.
+        var options = new VolcengineAsrOptions { ApiKey = ApiKey };
 
-        Assert.All(paths, path => Assert.DoesNotContain("stream", path, StringComparison.OrdinalIgnoreCase));
-        Assert.All(paths, path => Assert.DoesNotContain("sauc", path, StringComparison.OrdinalIgnoreCase));
+        Assert.Equal(
+            "https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit",
+            options.SubmitEndpoint);
+        Assert.Equal(
+            "https://openspeech.bytedance.com/api/v3/auc/bigmodel/query",
+            options.QueryEndpoint);
+        Assert.Equal("volc.seedasr.auc", VolcengineAsrOptions.ResourceId);
+
+        Assert.DoesNotContain("stream", options.SubmitEndpoint, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("stream", options.QueryEndpoint, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("idle", options.SubmitEndpoint, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("idle", options.QueryEndpoint, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("bigasr", options.SubmitEndpoint, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("bigasr", VolcengineAsrOptions.ResourceId, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
-    public void Factory_RejectsMissingAppIdAndUnresolvableCredential()
+    public void Factory_RejectsAnEmptyApiKeyAndAnUnresolvableReference()
     {
         var config = ConfigurationDefaults.Default();
-        config.Asr.Volcengine.AppId = string.Empty;
+        config.Asr.Volcengine.ApiKey = string.Empty;
         Assert.Throws<AsrConfigurationException>(() => VolcengineAsrProviderFactory.BuildOptions(config));
 
-        config.Asr.Volcengine.AppId = "app-123";
-        config.Asr.Volcengine.Credential = "env:MEETCAP_MISSING_TOKEN";
+        config.Asr.Volcengine.ApiKey = "env:MEETCAP_MISSING_API_KEY";
         var ex = Assert.Throws<AsrConfigurationException>(
             () => VolcengineAsrProviderFactory.BuildOptions(config, _ => null));
-        Assert.Contains("MEETCAP_MISSING_TOKEN", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("MEETCAP_MISSING_API_KEY", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -394,14 +454,23 @@ public class VolcengineAsrProviderTests : IDisposable
     public void Factory_BuildsOptionsFromTheEffectiveConfiguration()
     {
         var config = ConfigurationDefaults.Default();
-        config.Asr.Volcengine.AppId = "app-123";
-        config.Asr.Volcengine.Credential = "env:TOKEN";
+        config.Asr.Volcengine.ApiKey = "env:MEETCAP_API_KEY";
         config.Asr.Volcengine.HttpTimeoutSeconds = 12;
 
-        var options = VolcengineAsrProviderFactory.BuildOptions(config, name => name == "TOKEN" ? Token : null);
+        var options = VolcengineAsrProviderFactory.BuildOptions(
+            config,
+            name => name == "MEETCAP_API_KEY" ? ApiKey : null);
 
-        Assert.Equal("app-123", options.AppId);
-        Assert.Equal(Token, options.AccessToken);
+        Assert.Equal(ApiKey, options.ApiKey);
         Assert.Equal(TimeSpan.FromSeconds(12), options.HttpTimeout);
+        // The resource id is not configurable, so nothing in the configuration can change it.
+        Assert.Equal("volc.seedasr.auc", VolcengineAsrOptions.ResourceId);
+    }
+
+    [Fact]
+    public void VolcengineOptions_RejectAnEmptyApiKeyAtConstruction()
+    {
+        Assert.Throws<ArgumentException>(
+            () => new VolcengineAsrProvider(new VolcengineAsrOptions { ApiKey = "   " }));
     }
 }

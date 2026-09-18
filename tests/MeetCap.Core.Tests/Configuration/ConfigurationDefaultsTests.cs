@@ -31,13 +31,21 @@ public class ConfigurationDefaultsTests
         => Assert.Equal(5.0, ConfigurationDefaults.Default().Storage.MinimumFreeSpaceGb);
 
     [Fact]
-    public void Default_AsrServiceTierStandard()
-        => Assert.Equal("standard", ConfigurationDefaults.Default().Asr.ServiceTier);
+    public void Default_VolcengineApiKeyEnvReference()
+        => Assert.Equal("env:MEETCAP_VOLCENGINE_API_KEY",
+            ConfigurationDefaults.Default().Asr.Volcengine.ApiKey);
 
     [Fact]
-    public void Default_VolcengineCredentialEnvReference()
-        => Assert.Equal("env:MEETCAP_VOLCENGINE_ACCESS_TOKEN",
-            ConfigurationDefaults.Default().Asr.Volcengine.Credential);
+    public void Default_HasNoServiceTierSelector()
+    {
+        // Issue #26 removed the tier as a product setting: there is exactly one file-ASR
+        // service profile, so a default tier would be a routing surface with one value.
+        var asrType = typeof(AsrSection);
+        Assert.Null(asrType.GetProperty("ServiceTier"));
+        Assert.Null(typeof(VolcengineSection).GetProperty("AppId"));
+        Assert.Null(typeof(VolcengineSection).GetProperty("Credential"));
+        Assert.Null(typeof(VolcengineSection).GetProperty("ResourceId"));
+    }
 
     [Fact]
     public void Default_AllSectionsInitialized()

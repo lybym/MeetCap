@@ -58,14 +58,10 @@ internal sealed class AsrStack : ILiveAsrHost, IDisposable
     public IMediaPipeline? Media { get; }
 
     /// <summary>
-    /// Builds the stack. Provider, credential, tier, and toolchain problems are all
+    /// Builds the stack. Provider, API-key, and toolchain problems are all
     /// reported here -- before any session exists -- so a misconfiguration cannot
     /// corrupt session state.
     /// </summary>
-    /// <param name="effectiveTier">
-    /// The tier this invocation will actually use (a one-shot override wins over
-    /// configuration), so an unsupported tier is rejected before any media work.
-    /// </param>
     /// <param name="httpHandler">
     /// Optional transport for the provider adapter, supplied only by a test harness
     /// (<c>docs/DEVELOPMENT.md</c> section 7). Production passes <c>null</c>.
@@ -74,7 +70,6 @@ internal sealed class AsrStack : ILiveAsrHost, IDisposable
         CliContext context,
         MeetCapConfiguration configuration,
         string dataRoot,
-        string effectiveTier,
         bool requireMedia,
         out AsrStack? stack,
         out int exitCode,
@@ -86,7 +81,6 @@ internal sealed class AsrStack : ILiveAsrHost, IDisposable
         VolcengineAsrProvider? provider = null;
         try
         {
-            VolcengineAsrProviderFactory.EnsureTierSupported(effectiveTier);
             provider = VolcengineAsrProviderFactory.Create(configuration, httpHandler);
         }
         catch (AsrConfigurationException ex)

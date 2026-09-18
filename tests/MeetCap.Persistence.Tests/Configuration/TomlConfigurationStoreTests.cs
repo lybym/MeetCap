@@ -32,7 +32,7 @@ public class TomlConfigurationStoreTests
             Assert.Equal(1, load.Configuration.ConfigVersion);
             Assert.Equal("offline", load.Configuration.Capture.DefaultMode);
             Assert.Equal(60, load.Configuration.Capture.ChunkSeconds);
-            Assert.Equal("env:MEETCAP_VOLCENGINE_ACCESS_TOKEN", load.Configuration.Asr.Volcengine.Credential);
+            Assert.Equal("env:MEETCAP_VOLCENGINE_API_KEY", load.Configuration.Asr.Volcengine.ApiKey);
             Assert.Equal("%LOCALAPPDATA%\\MeetCap", load.Configuration.Storage.DataRoot);
             Assert.Empty(load.UnknownKeys);
         }
@@ -233,7 +233,7 @@ process_name = ""Teams""
     }
 
     [Fact]
-    public void ToToml_Serialized_ThenRedact_MasksCredential()
+    public void ToToml_Serialized_ThenRedact_MasksTheApiKey()
     {
         var dir = NewDir();
         try
@@ -243,11 +243,11 @@ process_name = ""Teams""
             var load = store.Load();
 
             var toml = store.ToToml(load.Configuration);
-            Assert.Contains("env:MEETCAP_VOLCENGINE_ACCESS_TOKEN", toml);
+            Assert.Contains("env:MEETCAP_VOLCENGINE_API_KEY", toml);
 
             var secrets = SecretRedactor.GetSecretValues(load.Configuration);
             var redacted = SecretRedactor.Redact(toml, secrets);
-            Assert.DoesNotContain("env:MEETCAP_VOLCENGINE_ACCESS_TOKEN", redacted);
+            Assert.DoesNotContain("env:MEETCAP_VOLCENGINE_API_KEY", redacted);
             Assert.Contains("***", redacted);
         }
         finally

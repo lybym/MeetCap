@@ -43,7 +43,6 @@ internal static class AsrCommand
                 context,
                 configuration,
                 dataRoot,
-                configuration.Asr.ServiceTier,
                 requireMedia: false,
                 out var stack,
                 out var stackFailure,
@@ -120,7 +119,6 @@ internal static class AsrCommand
             DataRoot = dataRoot,
             ProviderName = stack.Provider.Name,
             BatchSeconds = configuration.Asr.FileBatchSeconds,
-            ServiceTier = configuration.Asr.ServiceTier,
             RequestSpeakerInfo = configuration.Asr.Volcengine.RequestSpeakerInfo,
             CostPerHourCny = configuration.Asr.Volcengine.CostPerHourCny,
         };
