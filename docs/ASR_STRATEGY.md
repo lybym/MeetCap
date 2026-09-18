@@ -14,25 +14,46 @@ Reasoning:
 - final accuracy and recording reliability matter more than immediate text;
 - file-ASR jobs can be queued and retried independently of capture.
 
-## 2. Current provider assumptions
+## 2. Fixed provider contract
 
-At the time this document was written, Volcengine documentation describes recording-file ASR for meeting records, streaming ASR for real-time text, speaker diarization, timestamps, standard recording-file service, idle file ASR for batch/non-real-time work, turbo file ASR, and hotword capabilities.
-
-Current public product pricing shows approximately:
+MeetCap deliberately supports one Volcengine recording-file ASR contract:
 
 ```text
-Seed-ASR 2.0 recording-file recognition: 0.8 RMB/hour
-Seed-ASR 2.0 streaming recognition:      1.0 RMB/hour
+provider:       Volcengine / Doubao Voice
+model:          Seed-ASR 2.0
+mode:           recording-file Standard
+transport:      HTTPS
+lifecycle:      submit -> query
+authentication: X-Api-Key only (new console)
+resource id:    volc.seedasr.auc
+submit:         POST https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit
+query:          POST https://openspeech.bytedance.com/api/v3/auc/bigmodel/query
+audio upload:   audio.data (Base64)
 ```
 
-Pricing, service capabilities, and resource IDs are provider configuration, not hard-coded product guarantees.
+The resource ID and endpoint family are provider protocol constants, not user-tunable settings.
+MeetCap does not support the legacy `X-Api-App-Key + X-Api-Access-Key` scheme, recording-file
+1.0 (`volc.bigasr.auc`), idle routing, or flash/turbo routing in this product contract.
 
-References:
+The persistent provider request ID is a UUID allocated before submission and reused throughout
+the submit/query lifecycle. Header presence and sequence semantics MUST match the official
+Standard HTTP interface exactly. MeetCap also retains the provider's `X-Tt-Logid` for
+diagnostics while never persisting the API key.
 
-- https://www.volcengine.com/docs/6561/1354871
-- https://www.volcengine.com/docs/6561/1840838
-- https://www.volcengine.com/docs/6561/1631584
-- https://www.volcengine.com/docs/6561/155739
+MeetCap keeps its local-first workflow: normalized WAV artifacts are submitted through the
+official `audio.data` Base64 form, so object storage is not required merely to call ASR.
+
+Authoritative interface reference:
+
+- https://docs.volcengine.com/docs/DoubaoVoice/task-submission-http-1?lang=zh
+
+Related official references:
+
+- https://www.volcengine.com/docs/6561/1354871?lang=zh
+- https://www.volcengine.com/docs/6561/1354868?lang=zh
+
+Implementation alignment is tracked by issue #26. Until that issue lands, the implementation on
+`main` may still contain the superseded legacy authentication and tier configuration.
 
 ## 3. Default live-session algorithm
 
@@ -106,19 +127,24 @@ ASR batch:      300 s
 
 Both are configurable.
 
-## 5. ASR tiers
+## 5. Fixed ASR service profile
 
-### Standard
-Default for live sessions and ordinary imports.
+MeetCap exposes no recording-file service-tier selector.
 
-### Idle
-Optional for historical archives, overnight imports, and cost-sensitive bulk transcription. Provider documentation allows long completion windows.
+The supported profile is:
 
-### Turbo
-Optional for urgent turnaround. Not required for MVP.
+```text
+Seed-ASR 2.0
+recording-file Standard HTTP
+X-Api-Key
+volc.seedasr.auc
+```
 
-### Streaming
-Deferred/optional and never a dependency of recording.
+Idle, flash/turbo, recording-file 1.0, and legacy-console authentication are not compatibility
+modes. A configuration or CLI surface MUST NOT silently route a Standard job to those services.
+
+Streaming ASR remains a separately deferred product capability and is never a fallback for a
+failed file-ASR job.
 
 ## 6. Retry behavior
 
@@ -202,12 +228,12 @@ These are separate responsibilities.
 Default MVP source:
 
 ```text
-Volcengine BigASR
+Volcengine Seed-ASR 2.0
   -> timestamps
   -> speaker_0 / speaker_1 / ...
 ```
 
-When supported by the configured service tier/API, MeetCap requests speaker information and preserves it in normalized segments.
+MeetCap requests speaker information when supported by the Seed-ASR 2.0 Standard HTTP API and preserves it in normalized segments.
 
 Provider speaker labels are anonymous and session/provider scoped. They are not persistent identities and must never be treated as stable names.
 
@@ -272,22 +298,26 @@ actionable message. Split mapping with preserved original timestamps remains a l
 For every ASR job record:
 
 - provider;
-- tier;
 - source track;
 - duration;
 - submit/complete time;
 - retries;
 - provider request ID;
+- provider log ID (`X-Tt-Logid`);
 - success/error code;
 - whether speaker info was requested/returned;
 - estimated cost;
 - raw response path.
 
-Implemented columns in `asr_jobs` (M3): `provider`, `tier`, `source`, `duration_ms`,
+The current M3 schema contains `provider`, legacy `tier`, `source`, `duration_ms`,
 `submitted_at`, `completed_at`, `attempt_count`, `provider_request_id`, `error_code`,
 `error_message`, `speaker_info_requested`, `speaker_info_returned`, `estimated_cost_cny`,
 `raw_response_path`, `normalized_result_path`, `request_metadata_path`. A terminal job also
 emits an `asr.job.completed` or `asr.job.failed` record in `events.jsonl`.
+
+Under issue #26, `tier` is no longer a product selector (new jobs are Standard only), and
+`X-Tt-Logid` is retained in provider diagnostics/job artifacts. The API key must never appear in
+those artifacts.
 
 M4 adds the queue's own state to the report (`docs/ROADMAP.md` M4). `meetcap status` prints:
 
