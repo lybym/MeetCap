@@ -228,31 +228,38 @@ queue
 
 ---
 
-## 7. File-ASR service tiers
+## 7. Volcengine file-ASR provider contract
 
-Provider abstraction should support the following policy names:
-
-```text
-standard
-idle
-turbo
-streaming
-```
-
-Product defaults:
+MeetCap deliberately supports one cloud recording-file contract for the MVP:
 
 ```text
-live recording:  standard file ASR
-import:          standard file ASR
-economy import:  idle file ASR, if enabled by configuration
-streaming:       disabled
+provider:       Volcengine / Doubao Voice
+model:          Seed-ASR 2.0
+service:        recording-file Standard HTTP
+authentication: X-Api-Key only (new console)
+resource id:    volc.seedasr.auc
+lifecycle:      submit -> query
 ```
 
-The implementation MUST isolate provider-specific request fields behind an ASR provider interface.
+There is no product-level `standard|idle|turbo` selector. Idle, flash/turbo, recording-file 1.0,
+and legacy `X-Api-App-Key + X-Api-Access-Key` authentication are out of scope.
 
-Volcengine BigASR is the default provider and SHOULD request anonymous speaker information where the selected API/service tier supports it.
+The resource ID and endpoint family are fixed provider protocol, not user-tunable configuration.
+The user supplies only the API key secret and normal MeetCap behaviour settings.
 
----
+The implementation MUST isolate provider-specific request fields behind an ASR provider
+interface, preserve one durable UUID task/request ID across submit and query, retain provider
+`X-Tt-Logid` diagnostics, and never persist the API key.
+
+MeetCap submits its normalized local WAV artifact through the official `audio.data` Base64 form;
+object storage is not a prerequisite for file ASR.
+
+Seed-ASR 2.0 SHOULD request anonymous speaker information where the Standard HTTP API supports it.
+
+Authoritative interface:
+https://docs.volcengine.com/docs/DoubaoVoice/task-submission-http-1?lang=zh
+
+Implementation alignment is tracked by issue #26.
 
 ## 8. Recording requirements
 
@@ -402,7 +409,6 @@ Examples:
 - loopback mode / process preference;
 - capture chunk duration;
 - ASR batch duration;
-- ASR service tier;
 - retry policy;
 - hotword table identifier;
 - output root;
@@ -526,6 +532,7 @@ Artifact contract
 - Live recording batches are queued and transcribed using file ASR.
 - Failed jobs persist and retry after restart/network recovery.
 - Raw provider response is saved.
+- Provider calls use Seed-ASR 2.0 Standard HTTP, `X-Api-Key`, and fixed resource ID `volc.seedasr.auc`.
 - Anonymous speaker labels/timestamps are preserved where available.
 
 ### Speaker
@@ -554,7 +561,7 @@ meetcap start "Weekly Meeting" --mode offline
 durable 60 s local audio chunks
     |
     v
-5-minute Volcengine file-ASR batches
+5-minute Volcengine Seed-ASR 2.0 file-ASR batches
     |
     +--> transcript + timestamps
     +--> anonymous speaker labels
