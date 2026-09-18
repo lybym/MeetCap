@@ -85,11 +85,17 @@ provider boundary is mocked in tests. The real 3D-Speaker/sherpa-onnx model is l
 exercised in CI.
 
 The normative Volcengine provider contract is Seed-ASR 2.0 recording-file Standard HTTP,
-new-console `X-Api-Key` authentication, and fixed resource ID `volc.seedasr.auc`. Protocol
-alignment of the existing provider implementation is tracked by issue #26; until #26 lands,
-the code on `main` may still expose the superseded legacy authentication/configuration surface. The hardware-dependent acceptance tests are still open and are tracked as a
+new-console `X-Api-Key` authentication, and fixed resource ID `volc.seedasr.auc`. That
+contract is implemented by the provider adapter: the only user-supplied provider setting is
+`asr.volcengine.api_key`, and the legacy AppID/Access Token pair, the configurable resource id,
+and the service-tier selector are rejected with a migration message rather than reinterpreted.
+The provider's `X-Tt-Logid` is retained per job for support tracing.
+
+Real Volcengine transcription is still **not** verified end to end: it needs a real API key, a
+real network, and provider quota, none of which exist in CI, so the provider boundary is mocked
+in automated tests. The hardware-dependent acceptance tests are tracked as a
 manual checklist in `docs/M1_WINDOWS_VALIDATION.md`; nothing here claims any milestone is
-verified end to end on real audio hardware yet.
+verified end to end on real audio hardware or real provider credentials yet.
 
 ## Planned CLI
 

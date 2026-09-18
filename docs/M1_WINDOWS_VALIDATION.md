@@ -302,7 +302,7 @@ meetcap session repair --session <session-id>
 ## 12. M4 additions — live file-first transcription
 
 Issue #6 (M4, *file-first transcription during live recording*) adds behaviour that also needs a
-real Windows run, and specifically needs a **real Volcengine credential** and a **real network**:
+real Windows run, and specifically needs a **real Volcengine API key** and a **real network**:
 the automated coverage substitutes both boundaries. It lives in
 `tests/MeetCap.Asr.Tests/AsrBatchBuilderTests.cs`,
 `tests/MeetCap.Asr.Tests/AsrJobProcessorTests.cs`,
@@ -310,9 +310,10 @@ the automated coverage substitutes both boundaries. It lives in
 `tests/MeetCap.AudioPipeline.Tests/ChunkClosedSubscriberTests.cs` and
 `tests/MeetCap.Cli.Tests/LiveTranscriptionCommandTests.cs`.
 
-Prerequisites on top of section 2: a working `[asr.volcengine]` configuration
-(`app_id` + a resolvable credential via `env:` or a literal), and enough provider quota to submit
-the recorded windows.
+Prerequisites on top of section 2: a working `[asr.volcengine]` configuration (`api_key`, either
+a literal or an `env:NAME` reference to the new-console API key), and enough provider quota to
+submit the recorded windows. There is no `app_id`, `credential` or `resource_id` to set: the
+legacy keys are rejected by `meetcap config validate` with a migration message (issue #26).
 
 ### 12.1 Settings used by the scenarios below
 
@@ -330,7 +331,7 @@ meetcap start "M4 live check" --mode offline
 # speak into the microphone for about three minutes, then `meetcap stop` from another shell
 ```
 
-- [ ] `meetcap start` prints `asr: file ASR, batch window 30s, tier standard`.
+- [ ] `meetcap start` prints `asr: file ASR, batch window 30s`.
 - [ ] **While the recording is still running**, `transcript/raw.jsonl` exists and grows, and
       `transcript/live.md` contains the recognized text.
 - [ ] `asr/batches/mic/batch-00000N.wav` files appear, one per closed window, each a playable
@@ -340,8 +341,9 @@ meetcap start "M4 live check" --mode offline
 - [ ] Segments carry session-relative `start_ms` values that match where the speech actually
       happened in the meeting (check the third or fourth window specifically: a missing batch
       offset shows up as early timestamps repeated for later windows).
-- [ ] Where the configured tier supports it, segments carry an anonymous `speaker_label` such as
-      `speaker_1`, and `speaker_id` / `speaker_name` / `speaker_confidence` are still `null`.
+- [ ] Where the Seed-ASR 2.0 Standard HTTP interface supports it, segments carry an anonymous
+      `speaker_label` such as `speaker_1`, and `speaker_id` / `speaker_name` /
+      `speaker_confidence` are still `null`.
 - [ ] `meetcap stop` prints `asr batches: N queued, ...`, the session reaches `COMPLETED` once the
       queue is terminal, and `meetcap start` exits `0`.
 
@@ -364,7 +366,8 @@ meetcap start "M4 outage check" --mode offline
 - [ ] After the network returns, `meetcap asr resume` (or a later drain) completes the queue and
       the transcript contains the audio recorded during the outage.
 - [ ] No streaming endpoint was ever contacted (the adapter has no streaming call at all; confirm
-      by inspecting the retained `request.json` files, which name only the submit/query tier).
+      by inspecting the retained `request.json` files, which name only the fixed submit endpoint,
+      the model `bigmodel`, and the resource id `volc.seedasr.auc`).
 - [ ] `meetcap start` exited `0` even though the queue was behind.
 
 ### 12.4 Restart with work outstanding
@@ -407,12 +410,16 @@ meetcap asr resume
 
 ### 12.6 Provider rejects a batch permanently
 
-Point `[asr.volcengine] credential` at a wrong token and run the 12.2 scenario.
+Point `[asr.volcengine] api_key` at a wrong key and run the 12.2 scenario.
 
 - [ ] `meetcap asr resume` exits non-zero and names the failing job.
 - [ ] The session stays `PROCESSING` (audio recoverable), not `COMPLETED`.
 - [ ] `meetcap start` still exits `0` when the *recording* was clean.
 - [ ] The raw response that carried the rejection is retained in the job's `response.json`.
+- [ ] The persisted `error_message` names the provider log id (`X-Tt-Logid=...`) when the provider
+      returned one, and never contains the API key.
+- [ ] No request in the exchange carried `X-Api-App-Key` or `X-Api-Access-Key` (capture the
+      traffic with a proxy if confirmation is wanted; the adapter sends only `X-Api-Key`).
 
 ### 12.7 Artifact and disk footprint
 
@@ -420,7 +427,44 @@ Point `[asr.volcengine] credential` at a wrong token and run the 12.2 scenario.
       it never deletes the source audio.
 - [ ] The batch WAVs are real audio: open one in a player and confirm it plays at the session's
       format with no click or truncation at the chunk joins.
-- [ ] `meetcap.db` carries no new table or column (the M3 `asr_jobs` schema is unchanged).
+- [ ] `meetcap.db` carries exactly one schema change over M3: migration
+      `0005_asr_job_provider_log_id` adds the nullable `provider_log_id` column to `asr_jobs`.
+      No other table or column is added, and every pre-existing `asr_jobs` row survives.
+- [ ] `request.json` contains no `data` member (the inline audio is replaced by `inline_bytes`)
+      and no API key.
+
+### 12.8 Real Seed-ASR 2.0 Standard HTTP smoke test (required before claiming end-to-end)
+
+This is the one scenario that cannot be covered by an automated test in this repository: the
+interface document is the authority for header presence and sequence semantics, and only a real
+key can prove the adapter against it. Run it **after** 12.2, against the real service.
+
+```powershell
+# [asr.volcengine] api_key = "env:MEETCAP_VOLCENGINE_API_KEY"
+$env:MEETCAP_VOLCENGINE_API_KEY = "<new-console API key>"
+meetcap config validate
+meetcap import .\tests\audio\short-meeting.wav --title "Seed-ASR 2.0 smoke"
+```
+
+- [ ] `meetcap config validate` reports `Configuration valid` (no legacy-key error).
+- [ ] `meetcap import` exits `0` and prints a `session:` line, a `asr job: ... succeeded` line, and
+      a transcript path.
+- [ ] The submitted request used `POST /api/v3/auc/bigmodel/submit` with `X-Api-Key`,
+      `X-Api-Resource-Id: volc.seedasr.auc`, a UUID `X-Api-Request-Id`, and `X-Api-Sequence: -1`,
+      and the query used `POST /api/v3/auc/bigmodel/query` with the **same** request id and no
+      `X-Api-Sequence`.
+- [ ] The response carried `X-Api-Status-Code: 20000000`, and `asr_jobs.provider_log_id` holds the
+      returned `X-Tt-Logid`:
+      `select id, status, provider_request_id, provider_log_id from asr_jobs;`
+- [ ] `transcript/raw.jsonl` holds the recognized segments, and `request.json` contains no API key.
+- [ ] Record the provider log id in the Notes column below as the evidence that the run reached
+      Seed-ASR 2.0 Standard HTTP rather than a mock.
+
+Checklist line for the issue:
+
+```text
+Manual real-credential smoke test against Seed-ASR 2.0 Standard HTTP: NOT RUN | PASSED (<X-Tt-Logid>)
+```
 
 ---
 
@@ -547,6 +591,7 @@ on one job primary key.
 | 12.5 M4 unreadable chunk | | |
 | 12.6 M4 provider rejection | | |
 | 12.7 M4 artifact footprint | | |
+| 12.8 Seed-ASR 2.0 real smoke test | | |
 | 13.1 M5 system loopback | | |
 | 13.2 M5 overlapping speech | | |
 | 13.3 M5 one track degrades | | |
@@ -556,5 +601,11 @@ on one job primary key.
 
 M1, M2 and M4 may be described as verified on real hardware only when every row above is filled
 in and passing, or when the residual failure is written down here as a known limitation. The M4
-rows additionally require a real credential: without one, 12.2-12.4 and 12.6 cannot be run and
+rows additionally require a real API key: without one, 12.2-12.4, 12.6 and 12.8 cannot be run and
 must be recorded as not run rather than as passed.
+
+Status as of issue #26: **not run**. The automated suite covers the provider contract with a
+scripted transport (endpoint, headers, body shape, status handling, secret redaction, log-id
+retention), but no real Seed-ASR 2.0 Standard HTTP request has been made from this environment,
+so end-to-end provider verification is explicitly **not** claimed
+(`docs/DEVELOPMENT.md` section 7).

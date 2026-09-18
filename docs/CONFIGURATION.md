@@ -134,7 +134,7 @@ stall threshold are one quantity, and separate keys would only let them disagree
 
 ## 7. ASR
 
-Target contract after issue #26:
+Contract (issue #26):
 
 ```toml
 [asr]
@@ -200,7 +200,7 @@ When the toolchain cannot be located, an import fails with a message naming
 
 ## 8. Volcengine
 
-Target contract after issue #26:
+Contract (issue #26):
 
 ```toml
 [asr.volcengine]
@@ -231,16 +231,20 @@ document exactly:
 
 https://docs.volcengine.com/docs/DoubaoVoice/task-submission-http-1?lang=zh
 
-The provider captures `X-Api-Status-Code`, `X-Api-Message`, and `X-Tt-Logid`. The log ID is
-diagnostic metadata; the API key is never persisted.
+The provider captures `X-Api-Status-Code`, `X-Api-Message`, and `X-Tt-Logid`. The log id is
+diagnostic metadata: it is stored on the job row as `provider_log_id` (and in the
+`asr.job.submitted` / `asr.job.completed` records) so a provider-side incident can be traced,
+and it is included in provider error messages so a failed exchange names its log id in the
+persisted `error_message`. The API key is never persisted.
 
 API-key references use the existing secret resolver. `env:` remains the recommended scheme.
 `credman:` may be supported only when the resolver actually implements it; unsupported schemes
 must fail with an actionable error rather than sending an empty key. Literal secrets are accepted
 only where the product already permits them and must be redacted from effective-config output.
 
-The following legacy keys are not part of the target contract and must not be silently accepted
-after issue #26:
+The following legacy keys were removed by issue #26. They are no longer part of the schema, so
+`meetcap config validate` reports each one as a blocking error naming the migration to perform;
+they are never reinterpreted under their old semantics:
 
 ```text
 asr.service_tier
@@ -394,9 +398,12 @@ A running session uses a configuration snapshot captured at session start. Editi
 
 The file contains `config_version = 1`. Breaking changes require migration or an actionable validation error.
 
-Issue #26 is such a breaking provider-config change. Its implementation MUST either bump/migrate
-the configuration version or reject `service_tier`, `app_id`, `credential`, and `resource_id`
-with a clear migration message. They must never continue under legacy semantics by accident.
+Issue #26 was such a breaking provider-config change. It keeps `config_version = 1` and
+implements the rejection branch of this rule: `service_tier`, `app_id`, `credential`, and
+`resource_id` are no longer schema keys, so `meetcap config validate` (and every command that
+loads configuration) fails with a concrete migration instruction instead of silently applying
+new defaults. A new database migration (`0005_asr_job_provider_log_id`) adds the
+`provider_log_id` column; existing `asr_jobs` rows are copied across unchanged.
 
 The pre-speaker-identity flat keys `speakers.provider`, `speakers.match_threshold`, and
 `speakers.match_margin` are rejected even when `config_version = 1`; they cannot silently

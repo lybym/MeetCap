@@ -247,9 +247,10 @@ and legacy `X-Api-App-Key + X-Api-Access-Key` authentication are out of scope.
 The resource ID and endpoint family are fixed provider protocol, not user-tunable configuration.
 The user supplies only the API key secret and normal MeetCap behaviour settings.
 
-The implementation MUST isolate provider-specific request fields behind an ASR provider
-interface, preserve one durable UUID task/request ID across submit and query, retain provider
-`X-Tt-Logid` diagnostics, and never persist the API key.
+The implementation isolates provider-specific request fields behind an ASR provider
+interface, preserves one durable UUID task/request ID across submit and query, retains the
+provider's `X-Tt-Logid` per job (`asr_jobs.provider_log_id`), and never persists the API key.
+Issue #26 landed this contract in the provider adapter.
 
 MeetCap submits its normalized local WAV artifact through the official `audio.data` Base64 form;
 object storage is not a prerequisite for file ASR.
@@ -259,7 +260,8 @@ Seed-ASR 2.0 SHOULD request anonymous speaker information where the Standard HTT
 Authoritative interface:
 https://docs.volcengine.com/docs/DoubaoVoice/task-submission-http-1?lang=zh
 
-Implementation alignment is tracked by issue #26.
+Implementation alignment landed with issue #26. Real-credential end-to-end verification remains
+outstanding and is tracked in `docs/M1_WINDOWS_VALIDATION.md`.
 
 ## 8. Recording requirements
 
