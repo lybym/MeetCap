@@ -1,0 +1,98 @@
+name: release-candidate
+
+# RC build workflow for MeetCap.
+# Triggers a real Release build + full test suite on a given ref, then packages
+# the Windows CLI (meetcap) as a distributable archive with a SHA256 checksum.
+# This is build infrastructure (not product code); it lives on the default
+# branch so it can be dispatched against any release ref.
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_ref:
+        description: 'Ref (branch or SHA) to build the Release Candidate from'
+        required: true
+        default: 'release/v0.1.0'
+      rc_version:
+        description: 'RC version label, e.g. 0.1.0-rc.1'
+        required: true
+        default: '0.1.0-rc.1'
+
+jobs:
+  build-test-package:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout RC source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.build_ref }}
+          fetch-depth: 0
+
+      - name: Record source commit
+        id: src
+        shell: pwsh
+        run: |
+          "sha=$(git rev-parse HEAD)" >> $env:GITHUB_OUTPUT
+          "short=$(git rev-parse --short HEAD)" >> $env:GITHUB_OUTPUT
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Show SDK
+        run: dotnet --info
+
+      - name: Restore
+        run: dotnet restore MeetCap.slnx
+
+      - name: Build (Release, warnings as errors)
+        run: dotnet build MeetCap.slnx -c Release --no-restore -warnaserror
+
+      - name: Test (Release, full suite)
+        run: dotnet test MeetCap.slnx -c Release --no-build --logger "console;verbosity=normal"
+
+      - name: Publish CLI (Release, framework-dependent)
+        run: dotnet publish src/MeetCap.Cli/MeetCap.Cli.csproj -c Release -o publish/meetcap
+
+      - name: Package CLI artifact + checksum
+        id: pkg
+        shell: pwsh
+        run: |
+          $ver = "${{ inputs.rc_version }}"
+          $zip = "meetcap-$ver-win-x64.zip"
+          $sum = "meetcap-$ver-win-x64.sha256"
+          Compress-Archive -Path "publish/meetcap/*" -DestinationPath $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  $zip" | Out-File -FilePath $sum -Encoding ascii -NoNewline
+          Write-Host "SHA256 of $zip = $hash"
+          "zip=$zip" >> $env:GITHUB_OUTPUT
+          "sum=$sum" >> $env:GITHUB_OUTPUT
+
+      - name: Upload CLI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: meetcap-${{ inputs.rc_version }}-win-x64
+          path: |
+            ${{ steps.pkg.outputs.zip }}
+            ${{ steps.pkg.outputs.sum }}
+          if-no-files-found: error
+
+      - name: Job summary
+        shell: pwsh
+        run: |
+          $summary  = "### Release Candidate build`n`n"
+          $summary += "| Property | Value |`n|---|---|`n"
+          $summary += "| RC version | ${{ inputs.rc_version }} |`n"
+          $summary += "| Build ref | ${{ inputs.build_ref }} |`n"
+          $summary += "| Source SHA | ${{ steps.src.outputs.sha }} |`n"
+          $summary += "| CLI artifact | ${{ steps.pkg.outputs.zip }} |`n"
+          $summary += "| Checksum | ${{ steps.pkg.outputs.sum }} |`n"
+          $summary += "| Target framework | net10.0-windows |`n"
+          $summary += "| Runtime | .NET 10 (framework-dependent) |`n"
+          $summary += "| OS/arch | Windows x64 |`n"
+          $summary += "`nBuild + full test suite passed. Artifact ready for GitHub Pre-release."
+          $summary >> $env:GITHUB_STEP_SUMMARY
+          Write-Host $summary
