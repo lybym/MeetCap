@@ -82,6 +82,7 @@ Polly is not a replacement for the persistent ASR job queue.
 - Volcengine Seed-ASR 2.0 recording-file Standard HTTP ASR as the only default cloud ASR contract
 - request speaker information where supported
 - new-console `X-Api-Key` authentication only; streaming ASR remains separately deferred and disabled
+- issue #29 target: inline Base64 for <=20 MiB; private TOS + SDK-generated presigned `audio.url` for larger files
 
 ### Speaker identity
 
@@ -869,7 +870,7 @@ query:       POST https://openspeech.bytedance.com/api/v3/auc/bigmodel/query
 auth:        X-Api-Key
 resource:    X-Api-Resource-Id: volc.seedasr.auc
 model:       Seed-ASR 2.0 / model_name=bigmodel
-audio:       audio.data Base64
+audio:       <=20 MiB audio.data Base64; >20 MiB TOS presigned audio.url (target #29)
 diagnostics: X-Api-Status-Code, X-Api-Message, X-Tt-Logid
 ```
 
@@ -881,6 +882,11 @@ are not compatibility modes.
 
 Header presence and sequence semantics for submit/query MUST follow the official interface:
 https://docs.volcengine.com/docs/DoubaoVoice/task-submission-http-1?lang=zh
+
+Issue #29 adds a separate ASR-audio publishing boundary ahead of this provider. The provider does
+not own TOS SDK concerns: small inputs arrive as inline data, while larger inputs arrive as an
+ephemeral URL produced by a TOS adapter. The stable TOS bucket/object key, not the signed URL, is
+persisted for crash recovery.
 
 Hotword identifiers and speaker-info flags remain inside `MeetCap.Asr.Volcengine`.
 
@@ -1354,10 +1360,11 @@ when a process dies between writing the transcript and persisting the terminal j
 
 Imported and recorded sessions therefore share the same transcript and speaker-identity pipeline.
 
-Because the only supported input is a single provider file request, an import that exceeds the
-provider's single-request or inline-upload limit fails with an actionable message instead of
-being silently split; split mapping with preserved timestamps remains a later concern
-(`ASR_STRATEGY.md` section 12).
+Imports continue to prefer one provider file request. Current `main` is inline-Base64-only;
+issue #29 adds a transport fallback where inputs above 20 MiB are streamed to a private TOS object
+with the official .NET SDK and submitted as a presigned `audio.url`. This does not bypass provider
+file/duration limits and does not introduce automatic splitting; split mapping with preserved
+timestamps remains a later concern (`ASR_STRATEGY.md` section 12).
 
 ### 21.1 Live recording (M4)
 
@@ -1415,7 +1422,9 @@ keep private data private wherever the data root actually is, MeetCap drops a se
 existing `.gitignore`, and the marker is best effort: a read-only data root must not fail a
 command.
 
-Only configured ASR audio/batches are sent to the Seed-ASR 2.0 provider.
+Only configured ASR audio/batches are sent to cloud services. Under issue #29, files above the
+inline threshold are first staged temporarily in a private TOS object; smaller files remain
+inline. TOS objects are transient transport artifacts, not the durable recording source.
 
 API credentials must not be committed to Git, copied into session artifacts, or written to normal logs.
 
@@ -1436,6 +1445,7 @@ Microsoft.Data.Sqlite
 FluentMigrator (or thin equivalent)
 FFMpegCore + FFmpeg/FFprobe
 Polly
+Volcengine TOS .NET SDK (optional large-file ASR transport; target #29)
 sherpa-onnx
 3D-Speaker ERes2Net-base
 ```
@@ -1468,3 +1478,7 @@ This boundary is intentional: commodity capabilities should be imported; product
 - 3D-Speaker: https://github.com/modelscope/3D-Speaker
 - Volcengine Seed-ASR 2.0 Standard HTTP task submission: https://docs.volcengine.com/docs/DoubaoVoice/task-submission-http-1?lang=zh
 - Volcengine ASR product capabilities: https://www.volcengine.com/docs/6561/1354871
+- Volcengine TOS SDK overview: https://docs.volcengine.com/docs/TorchObjectStorage/SDKOverview-6?lang=zh
+- Volcengine TOS .NET upload overview: https://www.volcengine.com/docs/6349/1130432?lang=zh
+- Volcengine TOS .NET presigned URL: https://www.volcengine.com/docs/6349/1130151?lang=en
+- Volcengine TOS lifecycle overview: https://www.volcengine.com/docs/6349/1167743?lang=zh
