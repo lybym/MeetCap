@@ -55,11 +55,11 @@ jobs:
           }
 
           $tag = "v$env:VERSION"
-          $tagMatchCount = (gh api "repos/$env:REPOSITORY/git/matching-refs/tags/$tag" --jq 'length').Trim()
+          $tagRefs = @(gh api "repos/$env:REPOSITORY/git/matching-refs/tags/$tag" | ConvertFrom-Json)
           if ($LASTEXITCODE -ne 0) {
             throw "Unable to query whether tag $tag already exists."
           }
-          if ([int]$tagMatchCount -gt 0) {
+          if ($tagRefs | Where-Object { $_.ref -eq "refs/tags/$tag" }) {
             throw "Tag $tag already exists; refusing to overwrite it."
           }
 
