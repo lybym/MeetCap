@@ -5,7 +5,7 @@
     <RootNamespace>MeetCap.Asr.Volcengine</RootNamespace>
     <AssemblyName>MeetCap.Asr.Volcengine</AssemblyName>
     <PackageId>MeetCap.Asr.Volcengine</PackageId>
-    <Description>MeetCap Volcengine (BigASR recording-file) adapter. Every provider-specific JSON shape, endpoint, resource id, header, and status code lives here.</Description>
+    <Description>MeetCap Volcengine (Seed-ASR 2.0 recording-file Standard) adapter. Every provider-specific JSON shape, endpoint, resource id, header, and status code lives here.</Description>
   </PropertyGroup>
 
   <ItemGroup>

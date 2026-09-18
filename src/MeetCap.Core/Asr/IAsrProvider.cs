@@ -40,9 +40,6 @@ public sealed record AsrFileRequest
     /// </summary>
     public required string ProviderRequestId { get; init; }
 
-    /// <summary>Allowed: <c>standard</c>, <c>idle</c>, <c>turbo</c>.</summary>
-    public required string ServiceTier { get; init; }
-
     /// <summary>Whether the provider is asked for anonymous speaker information.</summary>
     public bool RequestSpeakerInfo { get; init; }
 }
@@ -61,6 +58,12 @@ public sealed record AsrSubmission
     /// authorization headers, and signed URLs must never appear here.
     /// </summary>
     public required string SanitizedRequestJson { get; init; }
+
+    /// <summary>
+    /// Provider-side trace id for this exchange, when the provider reports one
+    /// (Volcengine: <c>X-Tt-Logid</c>). Diagnostic only, never a credential.
+    /// </summary>
+    public string? ProviderLogId { get; init; }
 }
 
 /// <summary>Where a poll attempt landed.</summary>
@@ -80,7 +83,10 @@ public enum AsrPollState
 }
 
 /// <summary>The raw, unparsed provider result. Retained before normalization.</summary>
-public sealed record AsrCompletion(string RawResponseJson, string? ProviderStatus = null);
+public sealed record AsrCompletion(
+    string RawResponseJson,
+    string? ProviderStatus = null,
+    string? ProviderLogId = null);
 
 /// <summary>A provider-reported failure, classified for retry purposes.</summary>
 public sealed record AsrProviderError(string Code, string Message, bool IsTransient);

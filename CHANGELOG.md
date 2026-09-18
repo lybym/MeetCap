@@ -12,6 +12,75 @@ manual checklist in `docs/M1_WINDOWS_VALIDATION.md` has been run on real hardwar
 milestones are described as the former, never the latter
 (`docs/DEVELOPMENT.md` section 7).
 
+## [Unreleased]
+
+### Changed
+
+- **Volcengine file ASR migrated to Seed-ASR 2.0 with `X-Api-Key`-only authentication**
+  ([#26](https://github.com/lybym/MeetCap/issues/26)). The provider adapter now speaks one fixed
+  contract: Seed-ASR 2.0 recording-file Standard HTTP, `POST
+  /api/v3/auc/bigmodel/submit` then `POST /api/v3/auc/bigmodel/query`, `X-Api-Key`
+  authentication, and the fixed resource id `volc.seedasr.auc`. Requests never carry
+  `X-Api-App-Key` or `X-Api-Access-Key`, and the submit still identifies itself with
+  `X-Api-Sequence: -1` while the query sends the same request id with no sequence header.
+
+### Breaking changes
+
+- **Provider configuration is reduced to `asr.volcengine.api_key`.** The keys
+  `asr.service_tier`, `asr.volcengine.app_id`, `asr.volcengine.credential` and
+  `asr.volcengine.resource_id` were removed. They are no longer schema keys, so
+  `meetcap config validate` (and any command that loads configuration) fails with an
+  actionable migration message instead of silently applying new defaults. Existing
+  `config.toml` files must be edited:
+
+  ```toml
+  [asr.volcengine]
+  api_key = "env:MEETCAP_VOLCENGINE_API_KEY"
+  ```
+
+- **`meetcap import --tier` was removed**, along with the `standard|idle|turbo` service-tier
+  selector. MeetCap supports exactly one recording-file profile; idle and flash/turbo are not
+  fallbacks or compatibility modes, and a Standard request is never silently routed to them.
+
+### Added
+
+- **`asr_jobs.provider_log_id`** (migration `0005_asr_job_provider_log_id`) retains the
+  provider's `X-Tt-Logid` for support tracing. It is recorded as soon as submit answers,
+  replaced by the query's log id on completion, and also written to the `asr.job.submitted` /
+  `asr.job.completed` events and to provider error messages. The API key is never persisted.
+  The migration rebuilds `asr_jobs` and copies every existing row across unchanged — including
+  on a re-run, where it now keeps any `provider_log_id` written since the first run instead of
+  resetting it.
+
+### Fixed
+
+- **Migration `0005_asr_job_provider_log_id` no longer discards `provider_log_id` when it runs a
+  second time.** The script is re-runnable by contract, because a second process can read
+  `schema_migrations` before the version row is committed and then run it too; its rebuild
+  copied every column except the one it had just added, so values written in between were
+  silently reset to `NULL`. The copy now reads the column through a schema-conditional
+  placeholder that expands to the column when the schema has it and to `NULL` when it does not,
+  so a re-run preserves the stored log ids. `SqliteMigrator` applies each migration in an
+  immediate transaction so that placeholder is resolved against the schema the script actually
+  sees.
+- **The session configuration snapshot no longer stores the API key, in any serialized form.**
+  `sessions.config_snapshot` is persisted, and it was serialized from the effective configuration
+  verbatim, so a literal `asr.volcengine.api_key` was written to SQLite even though the API key is
+  never persisted (`docs/CONFIGURATION.md` rule 7). Every value is now redacted through the same
+  `SecretRedactor` as `config show` *before* it is serialized: replacing the key in the finished
+  JSON instead would miss a key containing a character the writer escapes (`+`, `"`, `\` or any
+  non-ASCII character), which lands in the snapshot as `\uXXXX` and is decoded by any JSON parser.
+
+### Notes
+
+- `asr_jobs.tier` is retained as a schema-compatibility column written as the constant
+  `standard`; it is no longer read as a routing input.
+- The batch manifest (`asr/batches/<source>/batch-NNNNNN.json`) no longer records `tier`. A
+  manifest written before this change is still readable: the extra field is ignored.
+- The manual real-credential smoke test against Seed-ASR 2.0 Standard HTTP is **not run** in this
+  environment (`docs/M1_WINDOWS_VALIDATION.md` section 12.8), so end-to-end provider verification
+  is still not claimed.
+
 ## [0.1.0] - 2026-09-18
 
 The first MVP-track release. Milestones M0 through M6 are implemented and

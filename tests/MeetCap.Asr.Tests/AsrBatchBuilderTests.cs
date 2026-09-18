@@ -52,7 +52,6 @@ public class AsrBatchBuilderTests : IDisposable
                 DataRoot = _dataRoot,
                 ProviderName = "volcengine",
                 BatchSeconds = batchSeconds,
-                ServiceTier = "standard",
                 RequestSpeakerInfo = true,
                 TimeProvider = TimeProvider.System,
             });
@@ -207,7 +206,9 @@ public class AsrBatchBuilderTests : IDisposable
         Assert.Equal(AsrJobStatus.Pending, job.Status);
         Assert.Equal("volcengine", job.Provider);
         Assert.Equal("mic", job.Source);
-        Assert.Equal("standard", job.Tier);
+        // `tier` is a schema-compatibility constant, not a configured value (docs/DATA_MODEL.md
+        // section 6, issue #26).
+        Assert.Equal(AsrJob.StandardTier, job.Tier);
         Assert.Equal(300_000, job.StartMs);
         Assert.Equal(320_000, job.EndMs);
         Assert.Equal(20_000, job.DurationMs);
@@ -433,7 +434,6 @@ public class AsrBatchBuilderTests : IDisposable
             Id = Ids.JobPrefix + "batch-000001",
             SessionId = SessionId,
             Source = AudioSources.Mic,
-            Tier = "standard",
             Provider = "volcengine",
             StartMs = batch.StartMs,
             EndMs = batch.EndMs,

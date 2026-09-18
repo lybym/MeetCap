@@ -10,10 +10,15 @@ public static class ConfigurationValidator
     private static readonly HashSet<string> s_captureModes = new(StringComparer.Ordinal) { "offline", "online" };
     private static readonly HashSet<string> s_loopbackModes = new(StringComparer.Ordinal) { "system", "process" };
     private static readonly HashSet<string> s_asrStrategies = new(StringComparer.Ordinal) { "file", "streaming" };
-    private static readonly HashSet<string> s_asrTiers = new(StringComparer.Ordinal) { "standard", "idle", "turbo" };
     private static readonly HashSet<string> s_speakerIdentityProviders =
         new(StringComparer.Ordinal) { "sherpa_onnx_3dspeaker" };
-    private static readonly IReadOnlyDictionary<string, string> s_legacyFlatSpeakerKeyInstructions =
+
+    /// <summary>
+    /// Keys that were part of an earlier configuration contract and must never be
+    /// reinterpreted under their old semantics. Each one is promoted from "unknown key"
+    /// to a blocking validation error with the migration the user has to perform.
+    /// </summary>
+    private static readonly IReadOnlyDictionary<string, string> s_legacyKeyInstructions =
         new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["speakers.provider"] =
@@ -23,6 +28,20 @@ public static class ConfigurationValidator
                 "Move its value to [speakers.identity] match_threshold.",
             ["speakers.match_margin"] =
                 "Move its value to [speakers.identity] match_margin.",
+            // Issue #26 removed the Volcengine service-tier selector, the legacy-console
+            // AppID/Access Token pair, and the configurable resource id.
+            ["asr.service_tier"] =
+                "Remove it. MeetCap supports exactly one recording-file profile " +
+                "(Seed-ASR 2.0 Standard HTTP), so there is no service tier to select.",
+            ["asr.volcengine.app_id"] =
+                "Remove it. The new Volcengine console authenticates with an API key, so set " +
+                "[asr.volcengine] api_key instead; X-Api-App-Key/X-Api-Access-Key are not sent.",
+            ["asr.volcengine.credential"] =
+                "Rename it to [asr.volcengine] api_key and set the new-console API key, for example " +
+                "'env:MEETCAP_VOLCENGINE_API_KEY'.",
+            ["asr.volcengine.resource_id"] =
+                "Remove it. MeetCap fixes X-Api-Resource-Id to 'volc.seedasr.auc' " +
+                "(Seed-ASR 2.0 recording-file Standard).",
         };
     private static readonly HashSet<string> s_logLevels = new(StringComparer.Ordinal)
         { "Trace", "Debug", "Information", "Warning", "Error", "Critical" };
@@ -47,7 +66,7 @@ public static class ConfigurationValidator
         {
             foreach (var key in unknownKeys)
             {
-                if (s_legacyFlatSpeakerKeyInstructions.TryGetValue(key, out var migrationInstruction))
+                if (s_legacyKeyInstructions.TryGetValue(key, out var migrationInstruction))
                 {
                     result.AddError(
                         $"Legacy configuration key '{key}' is not supported by this config layout. " +
@@ -156,11 +175,6 @@ public static class ConfigurationValidator
         if (!s_asrStrategies.Contains(asr.Strategy))
         {
             result.AddError($"asr.strategy='{asr.Strategy}' is invalid. Allowed: file, streaming.");
-        }
-
-        if (!s_asrTiers.Contains(asr.ServiceTier))
-        {
-            result.AddError($"asr.service_tier='{asr.ServiceTier}' is invalid. Allowed: standard, idle, turbo.");
         }
 
         RequirePositive(result, "asr.file_batch_seconds", asr.FileBatchSeconds);

@@ -10,7 +10,8 @@ using Polly.Retry;
 using Polly.Timeout;
 
 /// <summary>
-/// Volcengine file-ASR adapter: submit/query lifecycle for recording-file recognition.
+/// Volcengine file-ASR adapter: submit/query lifecycle for Seed-ASR 2.0 recording-file
+/// Standard recognition.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -19,6 +20,13 @@ using Polly.Timeout;
 /// (<c>docs/ARCHITECTURE.md</c> sections 11 and 12). Domain code consumes
 /// <see cref="AsrSubmission"/>, <see cref="AsrPollResult"/>, and normalized
 /// <c>TranscriptSegment</c> objects only.
+/// </para>
+/// <para>
+/// The wire contract is fixed by <c>docs/ASR_STRATEGY.md</c> section 2: Seed-ASR 2.0,
+/// recording-file Standard HTTP, <c>X-Api-Key</c> authentication, and the resource id
+/// <c>volc.seedasr.auc</c>. Legacy <c>X-Api-App-Key</c>/<c>X-Api-Access-Key</c> headers,
+/// <c>volc.bigasr.auc</c>, idle routing and flash/turbo routing are not compatibility
+/// modes: there is no auth-mode switch and no tier selector to route with.
 /// </para>
 /// <para>
 /// Polly is used <b>only</b> for transient HTTP execution: retry with exponential
@@ -38,8 +46,16 @@ using Polly.Timeout;
 /// </remarks>
 public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
 {
-    private const string StatusCodeHeader = "X-Api-Status-Code";
-    private const string MessageHeader = "X-Api-Message";
+    internal const string StatusCodeHeader = "X-Api-Status-Code";
+    internal const string MessageHeader = "X-Api-Message";
+
+    /// <summary>Provider-side trace id, retained for support diagnostics.</summary>
+    internal const string LogIdHeader = "X-Tt-Logid";
+
+    internal const string ResourceIdHeader = "X-Api-Resource-Id";
+    internal const string RequestIdHeader = "X-Api-Request-Id";
+    internal const string SequenceHeader = "X-Api-Sequence";
+    internal const string ApiKeyHeader = "X-Api-Key";
 
     /// <summary>Request accepted and completed.</summary>
     internal const string StatusSuccess = "20000000";
@@ -71,9 +87,7 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
     public VolcengineAsrProvider(VolcengineAsrOptions options, HttpMessageHandler? handler = null)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
-        ArgumentException.ThrowIfNullOrWhiteSpace(options.AppId);
-        ArgumentException.ThrowIfNullOrWhiteSpace(options.AccessToken);
-        ArgumentException.ThrowIfNullOrWhiteSpace(options.ResourceId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(options.ApiKey);
 
         _ownsHttpClient = handler is not null;
         _http = handler is null ? new HttpClient() : new HttpClient(handler, disposeHandler: false);
@@ -105,7 +119,7 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        var submitPath = _options.ToSubmitPath(request.ServiceTier);
+        var submitPath = _options.SubmitEndpoint;
 
         var audio = new FileInfo(request.InputArtifactPath);
         if (!audio.Exists)
@@ -145,6 +159,7 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
             submitPath,
             body,
             request.ProviderRequestId,
+            // The official Standard HTTP contract identifies the submit as sequence -1.
             sequence: -1,
             cancellationToken).ConfigureAwait(false);
 
@@ -155,6 +170,7 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
             {
                 ProviderRequestId = request.ProviderRequestId,
                 SanitizedRequestJson = sanitized,
+                ProviderLogId = response.LogId,
             };
         }
 
@@ -169,9 +185,10 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
         ArgumentNullException.ThrowIfNull(submission);
         ArgumentNullException.ThrowIfNull(request);
 
-        var queryPath = _options.ToQueryPath(request.ServiceTier);
+        // The query addresses the same task by the same request id and sends no
+        // X-Api-Sequence, which is what the official document specifies for query.
         var response = await SendAsync(
-            queryPath,
+            _options.QueryEndpoint,
             "{}",
             submission.ProviderRequestId,
             sequence: null,
@@ -180,7 +197,7 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
         var status = response.ApiStatus;
         if (status == StatusSuccess)
         {
-            return AsrPollResult.Completed(new AsrCompletion(response.Body, status));
+            return AsrPollResult.Completed(new AsrCompletion(response.Body, status, response.LogId));
         }
 
         if (status is StatusQueued or StatusProcessing)
@@ -193,7 +210,7 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
             // The provider detected silence and returned no text. This is a completed
             // result with zero segments, not a failure: the recording is intact and the
             // transcript legitimately has no speech.
-            return AsrPollResult.Completed(new AsrCompletion(response.Body, status));
+            return AsrPollResult.Completed(new AsrCompletion(response.Body, status, response.LogId));
         }
 
         var error = Failure(status, response);
@@ -257,14 +274,16 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
             Content = new StringContent(body, s_utf8, "application/json"),
         };
 
-        // Provider-specific headers stay inside this method.
-        httpRequest.Headers.TryAddWithoutValidation("X-Api-App-Key", _options.AppId);
-        httpRequest.Headers.TryAddWithoutValidation("X-Api-Access-Key", _options.AccessToken);
-        httpRequest.Headers.TryAddWithoutValidation("X-Api-Resource-Id", _options.ResourceId);
-        httpRequest.Headers.TryAddWithoutValidation("X-Api-Request-Id", requestId);
+        // Provider-specific headers stay inside this method. The new-console API key is the
+        // only credential, and X-Api-App-Key / X-Api-Access-Key are deliberately never sent:
+        // carrying both authentication generations would be the compatibility mode issue #26
+        // removes (docs/ASR_STRATEGY.md section 2).
+        httpRequest.Headers.TryAddWithoutValidation(ApiKeyHeader, _options.ApiKey);
+        httpRequest.Headers.TryAddWithoutValidation(ResourceIdHeader, VolcengineAsrOptions.ResourceId);
+        httpRequest.Headers.TryAddWithoutValidation(RequestIdHeader, requestId);
         if (sequence is not null)
         {
-            httpRequest.Headers.TryAddWithoutValidation("X-Api-Sequence", sequence.Value.ToString());
+            httpRequest.Headers.TryAddWithoutValidation(SequenceHeader, sequence.Value.ToString());
         }
 
         using var response = await _http
@@ -272,12 +291,9 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
             .ConfigureAwait(false);
 
         var responseBody = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
-        var apiStatus = response.Headers.TryGetValues(StatusCodeHeader, out var statusValues)
-            ? statusValues.FirstOrDefault()
-            : null;
-        var apiMessage = response.Headers.TryGetValues(MessageHeader, out var messageValues)
-            ? messageValues.FirstOrDefault()
-            : null;
+        var apiStatus = ReadHeader(response, StatusCodeHeader);
+        var apiMessage = ReadHeader(response, MessageHeader);
+        var logId = ReadHeader(response, LogIdHeader);
 
         var statusCode = (int)response.StatusCode;
 
@@ -294,8 +310,10 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
                 $"http.{statusCode}",
                 Scrub(
                     $"Volcengine rejected the request with HTTP {statusCode} for {path}" +
-                    Describe(apiStatus, apiMessage) +
-                    $": {Snippet(responseBody)} Check asr.volcengine.app_id and the resolved credential."));        }
+                    Describe(apiStatus, apiMessage, logId) +
+                    $": {Snippet(responseBody)} Check asr.volcengine.api_key and the resolved " +
+                    "new-console API key."));
+        }
 
         if (statusCode is >= 500 or 408 or 429)
         {
@@ -304,7 +322,7 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
             throw new AsrTransientException(
                 $"http.{statusCode}",
                 Scrub(
-                    $"Volcengine returned HTTP {statusCode}{Describe(apiStatus, apiMessage)}: " +
+                    $"Volcengine returned HTTP {statusCode}{Describe(apiStatus, apiMessage, logId)}: " +
                     Snippet(responseBody)));
         }
 
@@ -312,17 +330,25 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
         {
             throw new AsrTransientException(
                 $"http.{statusCode}",
-                Scrub($"Volcengine returned HTTP {statusCode} for {path}: {Snippet(responseBody)}"));
+                Scrub(
+                    $"Volcengine returned HTTP {statusCode} for {path}" +
+                    Describe(apiStatus, apiMessage, logId) +
+                    $": {Snippet(responseBody)}"));
         }
 
-        return new VolcengineResponse(responseBody, apiStatus ?? string.Empty, apiMessage ?? string.Empty);
+        return new VolcengineResponse(responseBody, apiStatus ?? string.Empty, apiMessage ?? string.Empty, logId);
     }
+
+    private static string? ReadHeader(HttpResponseMessage response, string name) =>
+        response.Headers.TryGetValues(name, out var values) ? values.FirstOrDefault() : null;
 
     private Exception Failure(string status, VolcengineResponse response)
     {
         var code = string.IsNullOrEmpty(status) ? "provider.unknown" : status;
         var message = Scrub(
-            $"Volcengine reported status {code} ({response.ApiMessage}). {Snippet(response.Body)}");
+            $"Volcengine reported status {code}" +
+            Describe(null, response.ApiMessage, response.LogId) +
+            $". {Snippet(response.Body)}");
         return s_permanentStatusCodes.Contains(code)
             ? new AsrPermanentException(code, message)
             : new AsrTransientException(code, message);
@@ -332,26 +358,33 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
     {
         var body = new JsonObject
         {
-            ["user"] = new JsonObject { ["uid"] = _options.AppId },
+            // MeetCap-owned, non-secret: request.json is persisted locally, so the API key
+            // must never be copied into user.uid (docs/CONFIGURATION.md section 8).
+            ["user"] = new JsonObject { ["uid"] = VolcengineAsrOptions.UserId },
             ["audio"] = new JsonObject
             {
                 ["format"] = request.AudioFormat,
                 ["data"] = audioBase64,
             },
-            ["request"] = new JsonObject
-            {
-                ["model_name"] = "bigmodel",
-                ["enable_itn"] = true,
-                ["enable_punc"] = true,
-                ["enable_ddc"] = true,
-                ["show_utterances"] = true,
-                // Anonymous speaker labels where the configured tier supports them.
-                ["enable_speaker_info"] = request.RequestSpeakerInfo,
-            },
+            ["request"] = BuildProviderRequest(request.RequestSpeakerInfo),
         };
 
         return body.ToJsonString();
     }
+
+    /// <summary>
+    /// The official Standard HTTP <c>request</c> object (Seed-ASR 2.0 recording-file).
+    /// </summary>
+    private static JsonObject BuildProviderRequest(bool requestSpeakerInfo) => new()
+    {
+        ["model_name"] = VolcengineAsrOptions.ModelName,
+        ["enable_itn"] = true,
+        ["enable_punc"] = true,
+        ["enable_ddc"] = true,
+        ["show_utterances"] = true,
+        // Anonymous speaker labels, requested per docs/ASR_STRATEGY.md section 10.
+        ["enable_speaker_info"] = requestSpeakerInfo,
+    };
 
     /// <summary>
     /// The request metadata persisted as <c>request.json</c>.
@@ -359,16 +392,18 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
     /// <remarks>
     /// The inline audio payload is replaced by its size: the artifact itself already
     /// lives in the session directory, and copying it into the job metadata would
-    /// duplicate user audio for no provenance benefit. Headers -- which carry the
-    /// access token -- are never included.
+    /// duplicate user audio for no provenance benefit. Headers -- which carry the API
+    /// key -- are never included, and the endpoint/resource id are recorded so a later
+    /// reader can tell which fixed contract produced the artifact.
     /// </remarks>
     private string BuildSanitizedRequestJson(AsrFileRequest request, long audioBytes)
     {
         var body = new JsonObject
         {
             ["provider"] = Name,
-            ["endpoint_tier"] = request.ServiceTier,
-            ["resource_id"] = _options.ResourceId,
+            ["model"] = VolcengineAsrOptions.ModelName,
+            ["resource_id"] = VolcengineAsrOptions.ResourceId,
+            ["endpoint"] = _options.SubmitEndpoint,
             ["job_id"] = request.JobId,
             ["session_id"] = request.SessionId,
             ["source"] = request.Source,
@@ -380,35 +415,50 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
                 ["format"] = request.AudioFormat,
                 ["inline_bytes"] = audioBytes,
             },
-            ["request"] = new JsonObject
-            {
-                ["model_name"] = "bigmodel",
-                ["enable_itn"] = true,
-                ["enable_punc"] = true,
-                ["enable_ddc"] = true,
-                ["show_utterances"] = true,
-                ["enable_speaker_info"] = request.RequestSpeakerInfo,
-            },
+            ["request"] = BuildProviderRequest(request.RequestSpeakerInfo),
         };
 
         return Scrub(body.ToJsonString());
     }
 
-    /// <summary>Removes any occurrence of the access token from text that will be stored or logged.</summary>
+    /// <summary>Removes any occurrence of the API key from text that will be stored or logged.</summary>
     private string Scrub(string text)
     {
-        if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(_options.AccessToken))
+        if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(_options.ApiKey))
         {
             return text;
         }
 
-        return text.Replace(_options.AccessToken, "***", StringComparison.Ordinal);
+        return text.Replace(_options.ApiKey, "***", StringComparison.Ordinal);
     }
 
-    private static string Describe(string? status, string? message) =>
-        string.IsNullOrEmpty(status) && string.IsNullOrEmpty(message)
-            ? string.Empty
-            : $" ({status} {message})".TrimEnd();
+    /// <summary>
+    /// Formats the provider's status/message/log-id headers for an error message.
+    /// </summary>
+    /// <remarks>
+    /// The log id is included so a provider-side incident can be traced from MeetCap's own
+    /// persisted <c>error_message</c> without a second round trip; it is not a secret.
+    /// </remarks>
+    private static string Describe(string? status, string? message, string? logId)
+    {
+        var parts = new List<string>(3);
+        if (!string.IsNullOrEmpty(status))
+        {
+            parts.Add(status);
+        }
+
+        if (!string.IsNullOrEmpty(message))
+        {
+            parts.Add(message);
+        }
+
+        if (!string.IsNullOrEmpty(logId))
+        {
+            parts.Add($"X-Tt-Logid={logId}");
+        }
+
+        return parts.Count == 0 ? string.Empty : $" ({string.Join(" ", parts)})";
+    }
 
     private static string Snippet(string? body)
     {
@@ -422,7 +472,11 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
     }
 
     /// <summary>One provider HTTP exchange, already read into memory.</summary>
-    internal sealed record VolcengineResponse(string Body, string ApiStatus, string ApiMessage)
+    internal sealed record VolcengineResponse(
+        string Body,
+        string ApiStatus,
+        string ApiMessage,
+        string? LogId)
     {
         /// <summary>Parses the response body as JSON, or returns null when it is not JSON.</summary>
         public JsonDocument? TryParseBody()

@@ -2,10 +2,12 @@ namespace MeetCap.Asr.Importing;
 
 using System.Security.Cryptography;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using MeetCap.Core.Asr;
 using MeetCap.Core.Configuration;
 using MeetCap.Core.Ids;
 using MeetCap.Core.Media;
+using MeetCap.Core.Secrets;
 using MeetCap.Core.Sessions;
 using MeetCap.Core.Transcripts;
 
@@ -17,9 +19,6 @@ public sealed record ImportRequest
 
     /// <summary>Explicit title; falls back to the file name, then to the configured default.</summary>
     public string? Title { get; init; }
-
-    /// <summary>One-shot service-tier override (never written back to config.toml).</summary>
-    public string? Tier { get; init; }
 
     /// <summary>Test/pre-allocation hooks; normally left null so ids are generated.</summary>
     public string? SessionId { get; init; }
@@ -38,9 +37,6 @@ public sealed record ImportOptions
     public required string ProviderName { get; init; }
 
     public string DefaultTitle { get; init; } = "Untitled Meeting";
-
-    /// <summary>Configured <c>asr.service_tier</c>.</summary>
-    public string ServiceTier { get; init; } = "standard";
 
     /// <summary>Configured <c>asr.volcengine.request_speaker_info</c>.</summary>
     public bool RequestSpeakerInfo { get; init; } = true;
@@ -205,7 +201,6 @@ public sealed class ImportSessionService
                 ["source_type"] = session.SourceType,
                 ["title"] = title,
                 ["provider"] = _options.ProviderName,
-                ["tier"] = ResolveTier(request.Tier),
             });
 
         artifacts.Add(CopySourceArtifact(paths, sourcePath));
@@ -256,13 +251,11 @@ public sealed class ImportSessionService
                 });
         }
 
-        var tier = ResolveTier(request.Tier);
         var job = new AsrJob
         {
             Id = jobId,
             SessionId = sessionId,
             Source = AudioTrackName.Import,
-            Tier = tier,
             Provider = _options.ProviderName,
             StartMs = 0,
             EndMs = sourceMedia.DurationMs,
@@ -286,7 +279,6 @@ public sealed class ImportSessionService
                 ["job_id"] = job.Id,
                 ["source"] = job.Source,
                 ["provider"] = job.Provider,
-                ["tier"] = job.Tier,
                 ["start_ms"] = job.StartMs,
                 ["end_ms"] = job.EndMs,
                 ["input_artifact"] = job.InputArtifact,
@@ -329,9 +321,6 @@ public sealed class ImportSessionService
         return string.IsNullOrWhiteSpace(fromFile) ? _options.DefaultTitle : fromFile;
     }
 
-    private string ResolveTier(string? overrideTier) =>
-        string.IsNullOrWhiteSpace(overrideTier) ? _options.ServiceTier : overrideTier.Trim();
-
     private SourceArtifact CopySourceArtifact(SessionArtifactPaths paths, string sourcePath)
     {
         var fileName = Path.GetFileName(sourcePath);
@@ -371,10 +360,66 @@ public sealed class ImportSessionService
 
     private DateTimeOffset Now() => _options.TimeProvider.GetUtcNow();
 
-    /// <summary>Serializes the effective configuration for the session snapshot.</summary>
+    /// <summary>
+    /// Serializes the effective configuration for the session snapshot, with secret-bearing
+    /// values redacted.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The snapshot is persisted — it is written to <c>sessions.config_snapshot</c> — so a
+    /// literal <c>asr.volcengine.api_key</c> would otherwise be stored verbatim, and
+    /// docs/CONFIGURATION.md states plainly that the API key is never persisted (issue #26
+    /// requires it to be absent from SQLite as well). Redaction uses the same
+    /// <see cref="SecretRedactor"/> as <c>config show</c>, so the effective configuration
+    /// stays reproducible without carrying the credential itself.
+    /// </para>
+    /// <para>
+    /// Each value is redacted <em>before</em> the serializer encodes it, never in the
+    /// serialized text afterwards. That distinction is the whole guarantee: the default JSON
+    /// encoder rewrites the bytes of a key that contains <c>+</c>, <c>&amp;</c>, <c>'</c>,
+    /// <c>"</c>, <c>\</c> or any non-ASCII character (<c>+</c> becomes <c>\u002B</c>, and
+    /// JSON must escape <c>"</c> and <c>\</c> whatever the encoder is), so a literal replace
+    /// over the finished JSON matches nothing and stores the credential in an escaped form
+    /// that any JSON parser decodes. Redacting first means the key's bytes are never handed
+    /// to the writer, so no serialized representation of the secret — escaped or not — can
+    /// reach the snapshot.
+    /// </para>
+    /// </remarks>
     public static string SnapshotJson(MeetCapConfiguration configuration)
     {
         ArgumentNullException.ThrowIfNull(configuration);
-        return JsonSerializer.Serialize(configuration, s_snapshotJson);
+
+        var options = new JsonSerializerOptions(s_snapshotJson);
+        options.Converters.Add(
+            new RedactingStringConverter(SecretRedactor.GetSecretValues(configuration)));
+        return JsonSerializer.Serialize(configuration, options);
+    }
+
+    /// <summary>
+    /// Writes every string of the configuration graph through <see cref="SecretRedactor"/>.
+    /// </summary>
+    /// <remarks>
+    /// The snapshot is serialized generically — no property is enumerated by hand, so a
+    /// configuration setting added later is snapshotted automatically — and this converter is
+    /// what keeps that generic write safe: it is handed each value before the writer encodes
+    /// it, so the replacement happens on the secret's own characters rather than on whatever
+    /// escaping the writer would have produced for them.
+    /// </remarks>
+    private sealed class RedactingStringConverter : JsonConverter<string>
+    {
+        private readonly IReadOnlySet<string> _secrets;
+
+        public RedactingStringConverter(IReadOnlySet<string> secrets) => _secrets = secrets;
+
+        public override string Read(
+            ref Utf8JsonReader reader,
+            Type typeToConvert,
+            JsonSerializerOptions options) => reader.GetString() ?? string.Empty;
+
+        public override void Write(
+            Utf8JsonWriter writer,
+            string value,
+            JsonSerializerOptions options) =>
+            writer.WriteStringValue(SecretRedactor.Redact(value, _secrets));
     }
 }

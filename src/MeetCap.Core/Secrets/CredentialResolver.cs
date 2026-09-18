@@ -29,8 +29,8 @@ public static class CredentialResolver
         if (string.IsNullOrWhiteSpace(reference))
         {
             throw new CredentialResolutionException(
-                "No credential is configured. Set asr.volcengine.credential, for example " +
-                "'env:MEETCAP_VOLCENGINE_ACCESS_TOKEN', and make sure the environment variable is set " +
+                "No credential is configured. Set asr.volcengine.api_key, for example " +
+                "'env:MEETCAP_VOLCENGINE_API_KEY', and make sure the environment variable is set " +
                 "for the account that runs meetcap.");
         }
 
@@ -41,14 +41,14 @@ public static class CredentialResolver
             {
                 throw new CredentialResolutionException(
                     "Credential reference 'env:' does not name an environment variable. " +
-                    "Use 'env:MEETCAP_VOLCENGINE_ACCESS_TOKEN'.");
+                    "Use 'env:MEETCAP_VOLCENGINE_API_KEY'.");
             }
 
             var value = environmentLookup(name);
             if (string.IsNullOrEmpty(value))
             {
                 throw new CredentialResolutionException(
-                    $"Environment variable '{name}' referenced by asr.volcengine.credential is not set. " +
+                    $"Environment variable '{name}' referenced by asr.volcengine.api_key is not set. " +
                     "Set it for the account that runs meetcap; MeetCap never reads credentials from the config file's neighbors.");
             }
 

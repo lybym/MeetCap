@@ -23,7 +23,6 @@ internal static class ImportCommand
         CliContext context,
         string file,
         string? title,
-        string? tier,
         CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(file))
@@ -51,7 +50,6 @@ internal static class ImportCommand
                 context,
                 configuration,
                 dataRoot,
-                string.IsNullOrWhiteSpace(tier) ? configuration.Asr.ServiceTier : tier.Trim(),
                 requireMedia: true,
                 out var stack,
                 out var stackFailure) || stack is null)
@@ -66,7 +64,6 @@ internal static class ImportCommand
             DataRoot = dataRoot,
             ProviderName = stack.Provider.Name,
             DefaultTitle = configuration.App.DefaultTitle,
-            ServiceTier = configuration.Asr.ServiceTier,
             RequestSpeakerInfo = configuration.Asr.Volcengine.RequestSpeakerInfo,
             CostPerHourCny = configuration.Asr.Volcengine.CostPerHourCny,
             ConfigSnapshotJson = ImportSessionService.SnapshotJson(configuration),
@@ -86,7 +83,7 @@ internal static class ImportCommand
         try
         {
             result = await service.ImportAsync(
-                new ImportRequest { SourcePath = sourcePath, Title = title, Tier = tier },
+                new ImportRequest { SourcePath = sourcePath, Title = title },
                 cancellationToken).ConfigureAwait(false);
         }
         catch (MediaProbeException ex)

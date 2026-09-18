@@ -34,7 +34,6 @@ ffmpeg_temporary_folder = ""
 enabled = true
 strategy = "file"
 file_batch_seconds = 300
-service_tier = "standard"
 streaming_enabled = false
 retry_max_attempts = 8
 retry_initial_seconds = 5
@@ -42,9 +41,11 @@ retry_max_seconds = 300
 final_full_session_pass = false
 
 [asr.volcengine]
-app_id = ""
-credential = "env:MEETCAP_VOLCENGINE_ACCESS_TOKEN"
-resource_id = "volc.bigasr.auc"
+# New-console API key, sent as X-Api-Key. The endpoint family, the resource id
+# (volc.seedasr.auc), the model (Seed-ASR 2.0) and the recording-file Standard service
+# are fixed by the provider contract, so there is no app_id, access token, resource_id,
+# or service_tier to configure. May use an "env:NAME" reference.
+api_key = "env:MEETCAP_VOLCENGINE_API_KEY"
 hotword_table_id = ""
 request_speaker_info = true
 # Estimate-only hourly rate in CNY; provider pricing is not a product guarantee.

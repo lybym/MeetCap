@@ -14,11 +14,23 @@ public class ConfigOverridesTests
     }
 
     [Fact]
-    public void Apply_OverridesServiceTier()
+    public void Apply_OverridesFileBatchSeconds()
     {
         var c = ConfigurationDefaults.Default();
+        ConfigOverrides.Apply(c, new Dictionary<string, string> { ["asr.file_batch_seconds"] = "120" });
+        Assert.Equal(120, c.Asr.FileBatchSeconds);
+    }
+
+    [Fact]
+    public void Apply_LegacyServiceTierOverride_IsIgnoredRatherThanRouted()
+    {
+        // There is no tier to override any more, and the overridable set is the only place a
+        // one-shot CLI value can reach configuration. An unrecognised key is left alone
+        // instead of being reinterpreted.
+        var c = ConfigurationDefaults.Default();
         ConfigOverrides.Apply(c, new Dictionary<string, string> { ["asr.service_tier"] = "idle" });
-        Assert.Equal("idle", c.Asr.ServiceTier);
+        Assert.Equal("file", c.Asr.Strategy);
+        Assert.Equal(300, c.Asr.FileBatchSeconds);
     }
 
     [Fact]

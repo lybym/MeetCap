@@ -1,9 +1,11 @@
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using MeetCap.Asr;
 using MeetCap.Asr.Importing;
 using MeetCap.Asr.Transcripts;
 using MeetCap.Asr.Volcengine;
 using MeetCap.Core.Asr;
+using MeetCap.Core.Configuration;
 using MeetCap.Core.Sessions;
 using MeetCap.Core.Transcripts;
 using MeetCap.Persistence.Storage;
@@ -61,10 +63,10 @@ public class ImportEndToEndTests : IDisposable
     private void Migrate() => new SqliteMigrator().Migrate(DatabasePath);
 
     private (ImportSessionService Service, AsrJobProcessor Processor, FakeAsrProvider Provider, MeetCapDatabase Database) CreateService(
-        string tier = "standard",
         bool requestSpeakerInfo = true,
         bool writeMarkdown = true,
-        FakeAsrProvider? provider = null)
+        FakeAsrProvider? provider = null,
+        string configSnapshotJson = "{\"config_version\":1}")
     {
         var database = new MeetCapDatabase(DatabasePath);
         database.EnsureMigrated();
@@ -101,10 +103,9 @@ public class ImportEndToEndTests : IDisposable
                 DataRoot = _dataRoot,
                 ProviderName = provider.Name,
                 DefaultTitle = "Untitled Meeting",
-                ServiceTier = tier,
                 RequestSpeakerInfo = requestSpeakerInfo,
                 CostPerHourCny = 0.8,
-                ConfigSnapshotJson = "{\"config_version\":1}",
+                ConfigSnapshotJson = configSnapshotJson,
             });
 
         return (service, processor, provider, database);
@@ -386,7 +387,7 @@ public class ImportEndToEndTests : IDisposable
         var job = database.AsrJobs.Get("job_test")!;
 
         Assert.Equal("volcengine", job.Provider);
-        Assert.Equal("standard", job.Tier);
+        Assert.Equal(AsrJob.StandardTier, job.Tier);
         Assert.Equal("import", job.Source);
         Assert.Equal(754_000, job.DurationMs);
         Assert.True(job.SpeakerInfoRequested);
@@ -475,10 +476,69 @@ public class ImportEndToEndTests : IDisposable
     }
 
     [Fact]
-    public async Task Import_TierOverrideIsOneShotAndDoesNotAffectTheDefault()
+    public async Task Import_RetainsTheProviderLogIdOnTheJobRowForSupportTracing()
     {
+        // The provider's X-Tt-Logid is what a Volcengine support request about a task is traced
+        // by, so it survives the whole import in durable, queryable state and is recorded in the
+        // session's own event log (docs/ASR_STRATEGY.md section 13, issue #26).
         Migrate();
-        var (service, _, provider, database) = CreateService(tier: "standard");
+        var (service, _, provider, database) = CreateService();
+        provider.OnSubmit = request => new AsrSubmission
+        {
+            ProviderRequestId = request.ProviderRequestId,
+            SanitizedRequestJson = "{\"job_id\":\"" + request.JobId + "\"}",
+            ProviderLogId = "log-submit-1",
+        };
+        provider.EnqueuePoll(AsrPollResult.Completed(
+            new AsrCompletion(ProviderJson, "20000000", "log-query-1")));
+
+        await service.ImportAsync(new ImportRequest
+        {
+            SourcePath = _sourcePath,
+            SessionId = "ses_test",
+            JobId = "job_test",
+        });
+
+        Assert.Equal("log-query-1", database.AsrJobs.Get("job_test")!.ProviderLogId);
+
+        var paths = new SessionArtifactPaths(_dataRoot, "ses_test");
+        var submitted = File.ReadAllLines(paths.EventsJsonl)
+            .Select(line => JsonDocument.Parse(line).RootElement)
+            .First(element => element.GetProperty("event").GetString() == SessionEvents.AsrJobSubmitted);
+        Assert.Equal("log-submit-1", submitted.GetProperty("provider_log_id").GetString());
+
+        var completed = File.ReadAllLines(paths.EventsJsonl)
+            .Select(line => JsonDocument.Parse(line).RootElement)
+            .First(element => element.GetProperty("event").GetString() == SessionEvents.AsrJobCompleted);
+        Assert.Equal("log-query-1", completed.GetProperty("provider_log_id").GetString());
+    }
+
+    [Fact]
+    public async Task Import_NeverHandsTheProviderApiKeyToTheJobOrItsArtifacts()
+    {
+        // The provider boundary takes no credential at all: the adapter resolves the API key
+        // itself, so nothing above it can copy the secret into a request, a job row, or a
+        // retained artifact (docs/CONFIGURATION.md section 8, issue #26).
+        //
+        // A literal key is the case that can actually leak, and the session snapshot is the one
+        // credential-bearing value the import path is handed, so a sentinel is put there and then
+        // searched for everywhere the run persists or writes. Asserting only on type-member names
+        // and the literal string "api_key" could not fail if a real secret were stored (review
+        // finding P2 on PR #28); the snapshot assertions below fail if SnapshotJson stops
+        // redacting.
+        //
+        // The sentinel deliberately contains characters the default JSON encoder rewrites ('+',
+        // '/', '==' padding and a non-ASCII character) and characters JSON itself must escape
+        // ('"' and '\'). A literal search for such a key is blind to the leak: what lands in
+        // sessions.config_snapshot is the *escaped* form, so the raw-text assertions below pass
+        // while the credential is fully recoverable. That is why the snapshot is also read back
+        // as decoded JSON and its api_key value asserted directly (review finding P1 on PR #28).
+        const string Sentinel = "SENTINEL-API-KEY-0123456789+中/==\"A\\B";
+        Migrate();
+        var configuration = new MeetCapConfiguration();
+        configuration.Asr.Volcengine.ApiKey = Sentinel;
+        var (service, _, provider, database) = CreateService(
+            configSnapshotJson: ImportSessionService.SnapshotJson(configuration));
         provider.EnqueuePoll(AsrPollResult.Completed(new AsrCompletion(ProviderJson, "20000000")));
 
         await service.ImportAsync(new ImportRequest
@@ -486,11 +546,83 @@ public class ImportEndToEndTests : IDisposable
             SourcePath = _sourcePath,
             SessionId = "ses_test",
             JobId = "job_test",
-            Tier = "idle",
         });
 
-        Assert.Equal("idle", database.AsrJobs.Get("job_test")!.Tier);
-        Assert.Equal("idle", Assert.Single(provider.Submissions).ServiceTier);
+        var paths = new SessionArtifactPaths(_dataRoot, "ses_test");
+        var job = database.AsrJobs.Get("job_test")!;
+
+        // The request the domain side built carries no credential-bearing member.
+        Assert.DoesNotContain(
+            typeof(AsrFileRequest).GetProperties(),
+            p => p.Name.Contains("Key", StringComparison.Ordinal)
+                || p.Name.Contains("Token", StringComparison.Ordinal)
+                || p.Name.Contains("Secret", StringComparison.Ordinal));
+
+        // And the sentinel appears nowhere the run wrote: the retained request metadata, the
+        // event log, the job row, or the session row. session.json is not searched: SessionDocument
+        // has no config-snapshot member, so such an assertion could never fail (review finding,
+        // test gaps). The persisted snapshot is asserted instead, both as text and as decoded JSON.
+        Assert.Null(job.ErrorMessage);
+        Assert.DoesNotContain(Sentinel, File.ReadAllText(paths.JobRequestJson("job_test")), StringComparison.Ordinal);
+        Assert.DoesNotContain(Sentinel, File.ReadAllText(paths.EventsJsonl), StringComparison.Ordinal);
+        Assert.Contains("config_version", ReadSessionConfigSnapshot(), StringComparison.Ordinal);
+        Assert.DoesNotContain(Sentinel, ReadSessionConfigSnapshot(), StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            JavaScriptEncoder.Default.Encode(Sentinel),
+            ReadSessionConfigSnapshot(),
+            StringComparison.Ordinal);
+        Assert.Equal("***", ReadSessionApiKey());
+        Assert.DoesNotContain(Sentinel, ReadAsrJobRow(), StringComparison.Ordinal);
+    }
+
+    /// <summary>The persisted session row's configuration snapshot.</summary>
+    private string ReadSessionConfigSnapshot()
+    {
+        using var c = OpenDatabase();
+        using var cmd = new SqliteCommand("SELECT config_snapshot FROM sessions WHERE id = 'ses_test'", c);
+        return Convert.ToString(cmd.ExecuteScalar()) ?? string.Empty;
+    }
+
+    /// <summary>
+    /// The <c>api_key</c> value inside the persisted snapshot, decoded. Reading it back as
+    /// characters is what makes the assertion independent of how the JSON writer escaped it.
+    /// </summary>
+    private string? ReadSessionApiKey()
+    {
+        using var snapshot = JsonDocument.Parse(ReadSessionConfigSnapshot());
+        return snapshot.RootElement
+            .GetProperty("asr")
+            .GetProperty("volcengine")
+            .GetProperty("api_key")
+            .GetString();
+    }
+
+    /// <summary>The stored ASR job row, flattened so any column can be searched for a secret.</summary>
+    private string ReadAsrJobRow()
+    {
+        using var c = OpenDatabase();
+        using var cmd = new SqliteCommand("SELECT * FROM asr_jobs WHERE id = 'job_test'", c);
+        using var reader = cmd.ExecuteReader();
+        if (!reader.Read())
+        {
+            return string.Empty;
+        }
+
+        var values = new List<string>();
+        for (var i = 0; i < reader.FieldCount; i++)
+        {
+            values.Add(reader.IsDBNull(i) ? string.Empty : Convert.ToString(reader.GetValue(i)) ?? string.Empty);
+        }
+
+        return string.Join('\u001f', values);
+    }
+
+    private SqliteConnection OpenDatabase()
+    {
+        var conn = new SqliteConnection(
+            new SqliteConnectionStringBuilder { DataSource = DatabasePath, Pooling = false }.ToString());
+        conn.Open();
+        return conn;
     }
 
     [Fact]

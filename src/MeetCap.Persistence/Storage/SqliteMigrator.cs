@@ -24,6 +24,14 @@ using Microsoft.Data.Sqlite;
 /// recorded first is treated as an already-applied migration rather than a
 /// primary-key failure. SQLite's own write lock ordering is left to SQLite.
 /// </para>
+/// <para>
+/// Because a re-run can happen, every script must be re-runnable *and* must leave
+/// existing data untouched. When a script has to read a column that only some
+/// schemas have — the usual case for a migration whose own job is to add that
+/// column — it cannot say so in SQL: SQLite cannot branch on column presence, and a
+/// statement naming an absent column fails while it is being prepared. Such a script
+/// uses the placeholder below instead.
+/// </para>
 /// </remarks>
 public sealed class SqliteMigrator
 {
@@ -60,8 +68,18 @@ public sealed class SqliteMigrator
             }
 
             var sql = ReadResource(resourceName);
-            using var tx = conn.BeginTransaction();
-            Execute(conn, tx, sql);
+
+            // IMMEDIATE, not SQLite's default deferred transaction: the script's
+            // schema-conditional placeholders are resolved before the script runs, and
+            // that answer is only the schema the script is about to change if no other
+            // migrator can commit between the read and this transaction's own write
+            // lock. Taking the write lock up front makes the read and the write one
+            // serialized step, so a concurrent migrator's committed rebuild is seen
+            // rather than missed. SQLite's own busy timeout (BusyTimeoutSeconds) is
+            // what a second process waits on; no lock of this layer's own is involved.
+            using var tx = conn.BeginTransaction(deferred: false);
+            var resolved = ResolveColumnPlaceholders(conn, tx, sql);
+            Execute(conn, tx, resolved);
             RecordApplied(conn, tx, version);
             tx.Commit();
 
@@ -138,6 +156,123 @@ public sealed class SqliteMigrator
         }
 
         return migrations;
+    }
+
+    /// <summary>
+    /// The schema-conditional column placeholder a migration script may use:
+    /// <c>{{table.column}}</c>.
+    /// </summary>
+    /// <remarks>
+    /// A re-runnable migration that adds a column often also has to copy that column's
+    /// existing values across a table rebuild — but only on a re-run, because on the
+    /// first run the column does not exist yet. SQL cannot express that choice, so the
+    /// placeholder does: it expands to the column reference when the column is present
+    /// and to <c>NULL</c> when it is not, which is exactly the value a column this
+    /// migration is adding would have on a first run.
+    /// </remarks>
+    private static readonly Regex ColumnPlaceholder = new(
+        @"\{\{(?<table>[A-Za-z_][A-Za-z0-9_]*)\.(?<column>[A-Za-z_][A-Za-z0-9_]*)\}\}",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    /// <summary>
+    /// Expands the <c>{{table.column}}</c> placeholders in a migration script against a
+    /// caller-supplied view of the schema.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A placeholder for a column that exists expands to the column name; one for a
+    /// column that does not expands to <c>NULL</c>, which is the value a column this
+    /// migration is adding has on a first run.
+    /// </para>
+    /// <para>
+    /// A placeholder whose table is absent from the schema is left exactly as written,
+    /// deliberately. That keeps a comment that quotes the syntax inert, and it keeps a
+    /// mistyped table name loud: the script then reaches SQLite unexpanded and fails to
+    /// prepare, rather than quietly expanding to <c>NULL</c> and dropping the value the
+    /// migration exists to carry.
+    /// </para>
+    /// <para>
+    /// Only a mistyped *table* is loud. A placeholder for a column that the named table does
+    /// not have expands to <c>NULL</c> even when the author meant an existing column and
+    /// mistyped its name, because <c>NULL</c> is also the correct first-run value of the
+    /// column the migration itself is adding — the two cases are the same string to this
+    /// mechanism and SQL cannot tell them apart either. Spelling the column correctly is
+    /// therefore the script author's responsibility (<c>docs/DATA_MODEL.md</c> section 14).
+    /// </para>
+    /// <para>
+    /// The placeholder is substituted over the whole script text, comments and string
+    /// literals included, so <c>{{table.column}}</c> is a reserved sequence: writing it where
+    /// it is not meant to expand (prose, a comment, sample data) substitutes it anyway
+    /// whenever that table exists. Whatever a script wants to say about the syntax uses a
+    /// form this pattern cannot match.
+    /// </para>
+    /// <para>
+    /// This is a pure function over the schema so both paths are directly testable
+    /// without a database.
+    /// </para>
+    /// </remarks>
+    internal static string ResolveColumnPlaceholders(
+        string sql,
+        Func<string, IReadOnlyCollection<string>?> columnsOf)
+    {
+        ArgumentNullException.ThrowIfNull(sql);
+        ArgumentNullException.ThrowIfNull(columnsOf);
+
+        return ColumnPlaceholder.Replace(sql, match =>
+        {
+            var table = match.Groups["table"].Value;
+            var column = match.Groups["column"].Value;
+            var columns = columnsOf(table);
+            if (columns is null)
+            {
+                return match.Value;
+            }
+
+            // Emit the name the schema declares rather than the placeholder's own spelling,
+            // so the statement SQLite prepares names the real column whichever case the
+            // migration author wrote.
+            return columns.FirstOrDefault(
+                name => string.Equals(name, column, StringComparison.OrdinalIgnoreCase)) ?? "NULL";
+        });
+    }
+
+    /// <summary>
+    /// Expands a pending migration's placeholders against the live schema, inside the
+    /// transaction that is about to run it.
+    /// </summary>
+    private static string ResolveColumnPlaceholders(
+        SqliteConnection conn,
+        SqliteTransaction tx,
+        string sql) =>
+        ResolveColumnPlaceholders(sql, table => ColumnsOf(conn, tx, table));
+
+    /// <summary>
+    /// The columns of <paramref name="table"/>, or <see langword="null"/> when the schema has
+    /// no such table.
+    /// </summary>
+    /// <remarks>
+    /// <c>pragma_table_info</c> is queried as a table-valued function rather than through
+    /// <c>sqlite_master</c> on purpose: it resolves its argument the way SQLite resolves an
+    /// identifier, so the lookup is case-insensitive and matches what the script itself will
+    /// see. A table always has at least one column, so an empty result means "no such table".
+    /// </remarks>
+    private static IReadOnlyCollection<string>? ColumnsOf(
+        SqliteConnection conn,
+        SqliteTransaction tx,
+        string table)
+    {
+        var columns = new List<string>();
+        using (var cmd = new SqliteCommand("SELECT name FROM pragma_table_info(@table)", conn, tx))
+        {
+            cmd.Parameters.AddWithValue("@table", table);
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                columns.Add(reader.GetString(0));
+            }
+        }
+
+        return columns.Count > 0 ? columns : null;
     }
 
     /// <summary>

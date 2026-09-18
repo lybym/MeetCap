@@ -220,14 +220,17 @@ This milestone is the first end-to-end ASR proof and the first proof that provid
 
 ## Implementation status
 
-Implemented (issue #5):
+Implemented (issue #5; provider contract corrected by issue #26):
 
-Provider-protocol correction is tracked as P0 issue #26. Issue #5 implemented the durable
-submit/query architecture, but its legacy AppID/Access Token, configurable resource ID, and
-service-tier surface are superseded by #26. M3 is not considered production-aligned with the
-current Volcengine interface until #26 is complete.
+The P0 provider-protocol correction (issue #26) has landed. Issue #5 implemented the durable
+submit/query architecture; #26 replaced its legacy AppID/Access Token authentication, the
+configurable resource ID, and the service-tier surface with the Seed-ASR 2.0 recording-file
+Standard HTTP contract and `X-Api-Key`, and added `asr_jobs.provider_log_id` for the provider's
+`X-Tt-Logid`. M3 is production-aligned with the current Volcengine interface at the
+implementation level; real-credential validation is still outstanding (`docs/ROADMAP.md`
+section 15.1).
 
-- current 0.1.0 CLI has `meetcap import <file> [--title <title>] [--tier standard|idle]`; issue #26 removes `--tier`, leaving `meetcap import <file> [--title <title>]`;
+- the 0.1.0 CLI has `meetcap import <file> [--title <title>]`; the `--tier` override was removed by issue #26 rather than kept as a one-value selector;
 - `meetcap asr resume [--session <id>] [--max-jobs <n>]`, the restart entry point for the
   persistent job queue;
 - `MeetCap.AudioPipeline` (FFprobe inspection, FFmpeg normalization only when required) with
@@ -235,7 +238,8 @@ current Volcengine interface until #26 is complete.
 - `MeetCap.Asr` (persistent job state machine driver, transcript assembly, import
   orchestration) and `MeetCap.Asr.Volcengine` (submit/query adapter, Polly inside the HTTP
   layer, provider JSON parsing);
-- `asr_jobs` migration `0003_asr_jobs` (version 0002 is claimed by the M1 capture migration);
+- `asr_jobs` migrations `0003_asr_jobs` and `0005_asr_job_provider_log_id` (version 0002 is
+  claimed by the M1 capture migration);
 - sanitized `request.json`, retained `response.json`, `normalized.jsonl`,
   `transcript/raw.jsonl`, `transcript/live.md`, and the `session.json` source artifact mapping
   (original + normalized, with SHA-256);
@@ -243,7 +247,7 @@ current Volcengine interface until #26 is complete.
 
 Not implemented in this milestone, and deliberately out of scope:
 
-- legacy console authentication, recording-file 1.0, idle routing, and flash/turbo routing are explicitly removed by #26 rather than promoted into supported modes;
+- legacy console authentication, recording-file 1.0, idle routing, and flash/turbo routing are removed rather than promoted into supported modes (issue #26);
 - splitting an import that exceeds the provider's single-request or inline-upload limit;
 - hotword tables (M7);
 - any live-capture ASR batching (M4), loopback capture (M5), identity matching (M6),
@@ -251,7 +255,7 @@ Not implemented in this milestone, and deliberately out of scope:
 
 Real Volcengine transcription has not been verified in CI: the environment has no
 `MEETCAP_VOLCENGINE_API_KEY`, so the provider boundary is mocked in tests
-(`docs/DEVELOPMENT.md` section 7). A manual Windows run with real credentials is still required
+(`docs/DEVELOPMENT.md` section 7). A manual Windows run with a real API key is still required
 before this milestone is validated end to end.
 
 ---
@@ -623,7 +627,9 @@ gates end-to-end verification, not implementation; milestones are therefore desc
 *implemented and automatically covered*, not *verified end to end*
 (`docs/DEVELOPMENT.md` section 7).
 
-P0 issue #26 MUST land before the Volcengine provider is described as production-aligned with the current official Seed-ASR 2.0 interface.
+P0 issue #26 (Seed-ASR 2.0 + `X-Api-Key`-only provider contract) has landed, so the Volcengine
+provider is production-aligned with the current official interface at the implementation level.
+The manual real-credential smoke test in `docs/M1_WINDOWS_VALIDATION.md` is still open.
 
 M7 may partially land before the release but MUST NOT delay core reliability unless it fixes real transcription quality.
 

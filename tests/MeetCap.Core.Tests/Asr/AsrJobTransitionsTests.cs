@@ -18,7 +18,6 @@ public class AsrJobTransitionsTests
         Id = "job_1",
         SessionId = "ses_1",
         Source = "import",
-        Tier = "standard",
         Provider = "volcengine",
         InputArtifact = "audio/import/a.wav",
         Status = status,
@@ -133,6 +132,36 @@ public class AsrJobTransitionsTests
         Assert.Equal("jobs/job_1/response.json", succeeded.RawResponsePath);
         Assert.Equal("jobs/job_1/normalized.jsonl", succeeded.NormalizedResultPath);
         Assert.True(succeeded.SpeakerInfoReturned);
+    }
+
+    [Fact]
+    public void RecordProviderLogId_KeepsAnEarlierLogIdWhenTheProviderOmitsOne()
+    {
+        // A submit log id is what a support request about that task is traced by, so a
+        // response that carries no X-Tt-Logid must not erase it (docs/ASR_STRATEGY.md
+        // section 13).
+        var submitted = AsrJobTransitions.RecordProviderLogId(Job(), "log-submit-1", s_now);
+        Assert.Equal("log-submit-1", submitted.ProviderLogId);
+
+        var stillThere = AsrJobTransitions.RecordProviderLogId(submitted, null, s_now.AddSeconds(1));
+        Assert.Equal("log-submit-1", stillThere.ProviderLogId);
+        Assert.Equal(submitted.UpdatedAt, stillThere.UpdatedAt);
+
+        var blank = AsrJobTransitions.RecordProviderLogId(submitted, "   ", s_now.AddSeconds(1));
+        Assert.Equal("log-submit-1", blank.ProviderLogId);
+
+        var replaced = AsrJobTransitions.RecordProviderLogId(submitted, "log-query-2", s_now.AddSeconds(1));
+        Assert.Equal("log-query-2", replaced.ProviderLogId);
+        Assert.Equal(s_now.AddSeconds(1), replaced.UpdatedAt);
+    }
+
+    [Fact]
+    public void Tier_IsASchemaCompatibilityConstantRatherThanARoutingInput()
+    {
+        // Issue #26 removed the tier selector, so the domain type cannot hold a legacy value
+        // (docs/DATA_MODEL.md section 6).
+        Assert.Equal("standard", AsrJob.StandardTier);
+        Assert.Equal("standard", Job().Tier);
     }
 
     [Fact]

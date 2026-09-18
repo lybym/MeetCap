@@ -99,8 +99,12 @@ internal static class CommandTree
     }
 
     /// <summary>
-    /// Builds <c>meetcap import &lt;file&gt; [--title &lt;title&gt;] [--tier &lt;tier&gt;]</c>.
+    /// Builds <c>meetcap import &lt;file&gt; [--title &lt;title&gt;]</c>.
     /// </summary>
+    /// <remarks>
+    /// There is no service-tier option: issue #26 removed the tier selector along with the
+    /// idle and flash/turbo services, so there is nothing to override.
+    /// </remarks>
     private static Command BuildImport(
         SecretRegistry secrets,
         ILoggerFactory loggerFactory,
@@ -120,15 +124,9 @@ internal static class CommandTree
             Description = "Session title. Defaults to the file name without its extension.",
         };
 
-        var tier = new Option<string?>("--tier")
-        {
-            Description = "One-shot ASR service tier override (standard | idle). Does not rewrite config.toml.",
-        };
-
         var command = new Command("import", "Import an existing recording and transcribe it with file ASR.");
         command.Arguments.Add(file);
         command.Options.Add(title);
-        command.Options.Add(tier);
         command.SetAction((parseResult, cancellationToken) =>
         {
             var context = CreateContext(
@@ -145,7 +143,6 @@ internal static class CommandTree
                 context,
                 parseResult.GetValue(file) ?? string.Empty,
                 parseResult.GetValue(title),
-                parseResult.GetValue(tier),
                 cancellationToken);
         });
 
