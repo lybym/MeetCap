@@ -20,6 +20,13 @@ A second implementation rule applies across milestones:
 
 Produce a runnable Windows CLI with configuration loading and session metadata.
 
+## Status
+
+Implemented (issue #2). The .NET 10 solution, CLI entry point, configuration loader, and
+SQLite bootstrap with SQL migrations are in place; `meetcap config init` / `config validate`
+/ `config show` / `config path` and `meetcap status` are exercised in
+`tests/MeetCap.Cli.Tests`.
+
 ## Deliverables
 
 - .NET 10 solution
@@ -607,6 +614,12 @@ Do not introduce Python/PyTorch into the default Windows runtime merely to dupli
 # Release gate for MVP
 
 The first MVP release requires M0 through M6.
+
+As of release 0.1.0, M0 through M6 are implemented and automatically covered. The
+real-hardware validation checklist in `docs/M1_WINDOWS_VALIDATION.md` (status: not yet run)
+gates end-to-end verification, not implementation; milestones are therefore described as
+*implemented and automatically covered*, not *verified end to end*
+(`docs/DEVELOPMENT.md` section 7).
 
 M7 may partially land before the release but MUST NOT delay core reliability unless it fixes real transcription quality.
 

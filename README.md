@@ -29,14 +29,14 @@ meetcap import .\meeting.m4a --title "Project Review"
 
 ## Implemented so far
 
-M0 (skeleton), M1 (offline microphone capture), M2 (durable spool and recovery hardening),
-and M3 (recording import + file ASR) are implemented:
+M0 through M6 are implemented and automatically covered by the test suite:
 
 ```powershell
-meetcap devices                  # active capture endpoints, default and configured
+meetcap devices                  # active capture and render endpoints, default and configured
 meetcap start "Weekly Meeting" --mode offline
+meetcap start "Remote Review" --mode online
 meetcap stop                     # signals the running recording to finish
-meetcap status                   # config, data root, database, incomplete sessions
+meetcap status                   # config, data root, database, incomplete sessions, ASR queue
 meetcap session repair           # repair/audit sessions a killed process left behind
 meetcap config init
 meetcap config path
@@ -44,6 +44,10 @@ meetcap config validate
 meetcap config show
 meetcap import .\meeting.m4a --title "Project Review"   # inspect, normalize, file ASR, transcript
 meetcap asr resume                                     # continue queued/retried ASR jobs
+meetcap speakers list                                 # enrolled speakers
+meetcap speakers enroll "Alice" --file .\alice.wav    # store voiceprint embeddings
+meetcap speakers assign --session <id> --label <l> --name "Alice"  # locked manual override
+meetcap speakers attribute --session <id>             # resolve anonymous labels to identities
 ```
 
 Offline capture (M1) writes recoverable WAV chunks, indexes them in `audio_chunks`, and
@@ -58,24 +62,41 @@ when the timeline still has a known gap instead of claiming success. An import (
 3. creates a normal session with `source_type=import` and queues a persistent file-ASR job;
 4. retains the raw provider response and writes `transcript/raw.jsonl` plus `transcript/live.md`.
 
+M4 (file-first transcription during live recording) batches durably closed chunks per source
+until the batch window is covered, queues a persistent file-ASR job, and drains it in the
+background while the meeting runs. A network outage does not disturb capture; queued batches
+complete after recovery, and `meetcap asr resume` is the restart entry point for the durable
+job queue.
+
+M5 (online dual-track capture) runs the microphone and system loopback as independent capture
+tracks, each with its own queue, chunk spool, and device-loss recovery, and merges their
+segments onto one session-relative timeline preserving both `source` and overlapping speech.
+
+M6 (speaker registry and voiceprint matching) enrolls multiple voiceprint embeddings per
+person, resolves anonymous ASR speaker labels through the normative priority
+`manual > high-confidence voiceprint > unknown`, and writes `transcript/final.jsonl` and
+`transcript/final.md` with attributed speaker names.
+
 Provider speaker labels are preserved exactly as anonymous, session-scoped data. They are never
 treated as persistent human identities.
 
 Real Volcengine transcription is not verified by CI: no credentials are available there, so the
-provider boundary is mocked in tests. M1's and M2's hardware-dependent acceptance tests are
-still open and are tracked as a manual checklist in `docs/M1_WINDOWS_VALIDATION.md`; nothing
-here claims M1 or M2 is verified end to end on real audio hardware yet.
+provider boundary is mocked in tests. The real 3D-Speaker/sherpa-onnx model is likewise not
+exercised in CI. The hardware-dependent acceptance tests are still open and are tracked as a
+manual checklist in `docs/M1_WINDOWS_VALIDATION.md`; nothing here claims any milestone is
+verified end to end on real audio hardware yet.
 
 ## Planned CLI
 
-```powershell
-meetcap start "Remote Review" --mode online
-meetcap speakers list
-```
+Later milestones are deferred by product decision: M7 (ASR quality controls), M8 (optional
+streaming ASR), and M9 (post-processing / meeting intelligence). The release gate for the MVP
+requires M0 through M6, which this release closes at the implementation level
+(see `docs/ROADMAP.md`).
 
 ## Documentation
 
 - [PRD](docs/PRD.md)
+- [Changelog](CHANGELOG.md)
 - [Technical Architecture](docs/ARCHITECTURE.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Configuration](docs/CONFIGURATION.md)
@@ -128,11 +149,11 @@ See `docs/ARCHITECTURE.md` for the authoritative architecture.
 
 ## Repository status
 
-This repository starts documentation-first. Code is added milestone by milestone
-according to `docs/ROADMAP.md`; agents should not implement later milestones
+M0 through M6 are implemented and automatically covered. Code is added milestone by
+milestone according to `docs/ROADMAP.md`; agents should not implement later milestones
 opportunistically.
 
-M0 (repository and executable skeleton), M1 (offline microphone capture), and M3 (recording
-import and file ASR) are implemented. M1's hardware-dependent acceptance tests are still open and are tracked as
-a manual checklist in `docs/M1_WINDOWS_VALIDATION.md`; nothing here claims M1 is verified
-end to end on real audio hardware yet.
+This is release **0.1.0**. The hardware-dependent acceptance tests are still open and are
+tracked as a manual checklist in `docs/M1_WINDOWS_VALIDATION.md`; nothing here claims any
+milestone is verified end to end on real audio hardware yet. See `CHANGELOG.md` for the
+release notes and `docs/ROADMAP.md` for milestone status.
