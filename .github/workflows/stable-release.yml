@@ -1,0 +1,196 @@
+name: stable-release
+
+# Publish a stable CLI release only from the current default branch after the
+# complete Release build and test suite has passed. The workflow owns the tag
+# and release creation so the tag cannot accidentally point at another ref.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Stable version to publish (for example, 0.1.0)
+        required: true
+        type: string
+        default: 0.1.0
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Validate release gate
+        id: source
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if ($env:VERSION -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Stable version must be MAJOR.MINOR.PATCH, got '$env:VERSION'."
+          }
+
+          $sourceSha = (git rev-parse HEAD).Trim()
+          $remoteMainSha = ((git ls-remote origin refs/heads/main).Split("`t")[0]).Trim()
+          if ([string]::IsNullOrWhiteSpace($remoteMainSha) -or $sourceSha -ne $remoteMainSha) {
+            throw "main moved during checkout: checked out $sourceSha, remote main is $remoteMainSha."
+          }
+
+          $props = Get-Content -LiteralPath 'Directory.Build.props' -Raw
+          $versionPattern = '<Version>' + [regex]::Escape($env:VERSION) + '</Version>'
+          if ($props -notmatch $versionPattern) {
+            throw "Directory.Build.props does not declare Version $env:VERSION."
+          }
+
+          $tag = "v$env:VERSION"
+          $existingTag = gh api "repos/$env:REPOSITORY/git/ref/tags/$tag" 2>$null
+          if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($existingTag)) {
+            throw "Tag $tag already exists; refusing to overwrite it."
+          }
+
+          $existingRelease = gh release view $tag --repo $env:REPOSITORY 2>$null
+          if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($existingRelease)) {
+            throw "Release $tag already exists; refusing to overwrite it."
+          }
+
+          "SOURCE_SHA=$sourceSha" >> $env:GITHUB_ENV
+          "source_sha=$sourceSha" >> $env:GITHUB_OUTPUT
+          Write-Host "Stable release source: $sourceSha"
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Show SDK
+        run: dotnet --info
+
+      - name: Restore
+        run: dotnet restore MeetCap.slnx
+
+      - name: Build (Release, warnings as errors)
+        run: dotnet build MeetCap.slnx -c Release --no-restore -warnaserror
+
+      - name: Test (Release, full suite)
+        run: dotnet test MeetCap.slnx -c Release --no-build --logger "console;verbosity=normal"
+
+      - name: Publish CLI
+        run: dotnet publish src/MeetCap.Cli/MeetCap.Cli.csproj -c Release -o publish/meetcap
+
+      - name: Package CLI and provenance
+        id: package
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $zip = "meetcap-$env:VERSION-win-x64.zip"
+          $sum = "meetcap-$env:VERSION-win-x64.sha256"
+          $info = "meetcap-$env:VERSION-win-x64-build-info.txt"
+          $notes = 'release-notes.md'
+
+          Compress-Archive -Path 'publish/meetcap/*' -DestinationPath $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $zip" | Out-File -FilePath $sum -Encoding ascii -NoNewline
+
+          @"
+          MeetCap Stable Release build provenance
+          ========================================
+
+          Stable version  : $env:VERSION
+          Repository       : https://github.com/$env:REPOSITORY
+          Source branch    : main
+          Source commit    : $env:SOURCE_SHA
+          Workflow         : stable-release
+          Run URL          : $env:GITHUB_SERVER_URL/$env:REPOSITORY/actions/runs/$env:GITHUB_RUN_ID
+          Runner           : $env:RUNNER_OS ($env:RUNNER_ARCH)
+          Configuration    : Release
+          Target framework : net10.0-windows
+          Runtime          : .NET 10 Desktop Runtime (x64), framework-dependent
+          CLI entrypoint   : meetcap.exe
+          CLI artifact     : $zip
+          SHA256           : $hash
+
+          Build and full test suite completed successfully before release creation.
+          This release is created from the merge commit currently at main.
+          "@ | Set-Content -LiteralPath $info -Encoding utf8
+
+          @"
+          # MeetCap $env:VERSION
+
+          Stable release built from `main` commit `$env:SOURCE_SHA`.
+
+          The complete Release configuration build and test suite passed before this release was created.
+
+          $(Get-Content -LiteralPath 'CHANGELOG.md' -Raw)
+          "@ | Set-Content -LiteralPath $notes -Encoding utf8
+
+          # Re-check main after the potentially long build. A moving main must
+          # never receive a release tag for the earlier checkout.
+          $remoteMainSha = ((git ls-remote origin refs/heads/main).Split("`t")[0]).Trim()
+          if ($remoteMainSha -ne $env:SOURCE_SHA) {
+            throw "main moved during build: built $env:SOURCE_SHA, remote main is $remoteMainSha."
+          }
+
+          "zip=$zip" >> $env:GITHUB_OUTPUT
+          "sum=$sum" >> $env:GITHUB_OUTPUT
+          "info=$info" >> $env:GITHUB_OUTPUT
+          "notes=$notes" >> $env:GITHUB_OUTPUT
+
+      - name: Create stable GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          REPOSITORY: ${{ github.repository }}
+          ZIP: ${{ steps.package.outputs.zip }}
+          SUM: ${{ steps.package.outputs.sum }}
+          INFO: ${{ steps.package.outputs.info }}
+          NOTES: ${{ steps.package.outputs.notes }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "v$env:VERSION"
+
+          gh release create $tag $env:ZIP $env:SUM $env:INFO `
+            --repo $env:REPOSITORY `
+            --target $env:SOURCE_SHA `
+            --title "MeetCap $env:VERSION" `
+            --notes-file $env:NOTES `
+            --latest
+
+      - name: Verify stable Release provenance
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = "v$env:VERSION"
+          $release = gh release view $tag --repo $env:REPOSITORY --json url,tagName,isPrerelease,isDraft,targetCommitish | ConvertFrom-Json
+          if ($release.isPrerelease -or $release.isDraft) {
+            throw "Stable release $tag is draft or prerelease."
+          }
+
+          $tagRef = gh api "repos/$env:REPOSITORY/git/ref/tags/$tag" | ConvertFrom-Json
+          $tagSha = $tagRef.object.sha
+          if ($tagSha -ne $env:SOURCE_SHA) {
+            throw "Stable tag $tag points to $tagSha, expected $env:SOURCE_SHA."
+          }
+
+          Write-Host "Stable release URL: $($release.url)"
+          Write-Host "Stable tag: $tag -> $tagSha"
