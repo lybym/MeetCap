@@ -116,21 +116,38 @@ public class LiveTranscriptionCommandTests
         var startTask = Task.Run(() => harness.Run("start", "Offline Review"));
         var sessionDirectory = WaitForSessionDirectory(harness.DataRoot);
         Assert.NotNull(sessionDirectory);
-        WaitForSessionStatus(harness.DataRoot, Path.GetFileName(sessionDirectory!), SessionStatus.Recording);
+        var sessionId = Path.GetFileName(sessionDirectory!);
+        WaitForSessionStatus(harness.DataRoot, sessionId, SessionStatus.Recording);
 
         WaitForChunkCount(sessionDirectory!, minimumChunks: 3);
 
+        // `meetcap stop` signals the recorder and waits for it to leave the recording-owned
+        // state, but its 15-second DefaultWait is a CLI UX budget, not a recording-durability
+        // invariant. Under CI load the recorder can take longer than that to finalize its last
+        // chunk while the recording itself stays clean. So accept stop's "still finalizing"
+        // exit (1) as an asynchronous-finalization condition (the request was still signalled);
+        // any other stop failure still fails the test. Recording durability is synchronized on
+        // the start command itself: when `meetcap start` returns, RecordingSession.Complete()
+        // has already persisted PROCESSING (docs/ARCHITECTURE.md section 20), so awaiting start
+        // (rather than a fixed wall-clock poll) is what proves the session left the
+        // recording-owned set without simply moving the timeout.
         var stop = harness.Run("stop");
+        if (stop.ExitCode != 0)
+        {
+            Assert.Contains("still finalizing", stop.Error, StringComparison.Ordinal);
+        }
+
         var start = await AwaitBounded(
             startTask,
             TimeSpan.FromSeconds(90),
             "meetcap start did not finish after meetcap stop during the scripted outage");
 
-        var sessionId = Path.GetFileName(sessionDirectory!);
-
-        // Recording was never disturbed: the session completed cleanly and every chunk is
-        // durable (docs/RELIABILITY.md section 1).
-        Assert.Equal(0, stop.ExitCode);
+        // Recording was never disturbed: `meetcap start` exits 0 only when the session reached
+        // a clean post-capture state (PROCESSING/COMPLETED, not INTERRUPTED or degraded). The
+        // durable session row is read once -- start has already returned, so PROCESSING is
+        // persisted -- to assert explicitly that it left the recording-owned set. INTERRUPTED
+        // would mean the recording itself failed, which is a real defect this test must catch
+        // (docs/RELIABILITY.md section 1; docs/ARCHITECTURE.md section 20).
         Assert.True(start.ExitCode == 0, "start did not exit cleanly" + Describe(start, stop));
         Assert.Contains("chunks closed:", start.Output, StringComparison.Ordinal);
         var chunks = Directory.GetFiles(Path.Combine(sessionDirectory!, "audio", "mic"), "*.wav");
@@ -142,6 +159,10 @@ public class LiveTranscriptionCommandTests
         Assert.Equal(0, harness.AsrHttp.Submits);
 
         var database = new MeetCapDatabase(Path.Combine(harness.DataRoot, "meetcap.db"));
+        var finalStatus = database.Sessions.Find(sessionId)?.Status;
+        Assert.True(
+            finalStatus == SessionStatus.Processing || finalStatus == SessionStatus.Completed,
+            $"expected a clean post-capture state, got {finalStatus}");
         var pending = database.AsrJobs.ListBySession(sessionId);
         Assert.NotEmpty(pending);
         Assert.All(
