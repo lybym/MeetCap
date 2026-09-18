@@ -63,11 +63,13 @@ milestones are described as the former, never the latter
   so a re-run preserves the stored log ids. `SqliteMigrator` applies each migration in an
   immediate transaction so that placeholder is resolved against the schema the script actually
   sees.
-- **The session configuration snapshot no longer stores the API key.** `sessions.config_snapshot`
-  is persisted, and it was serialized from the effective configuration verbatim, so a literal
-  `asr.volcengine.api_key` was written to SQLite even though the API key is never persisted
-  (`docs/CONFIGURATION.md` rule 7). The snapshot is now redacted through the same
-  `SecretRedactor` as `config show`.
+- **The session configuration snapshot no longer stores the API key, in any serialized form.**
+  `sessions.config_snapshot` is persisted, and it was serialized from the effective configuration
+  verbatim, so a literal `asr.volcengine.api_key` was written to SQLite even though the API key is
+  never persisted (`docs/CONFIGURATION.md` rule 7). Every value is now redacted through the same
+  `SecretRedactor` as `config show` *before* it is serialized: replacing the key in the finished
+  JSON instead would miss a key containing a character the writer escapes (`+`, `"`, `\` or any
+  non-ASCII character), which lands in the snapshot as `\uXXXX` and is decoded by any JSON parser.
 
 ### Notes
 

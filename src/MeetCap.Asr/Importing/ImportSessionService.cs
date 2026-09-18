@@ -2,6 +2,7 @@ namespace MeetCap.Asr.Importing;
 
 using System.Security.Cryptography;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using MeetCap.Core.Asr;
 using MeetCap.Core.Configuration;
 using MeetCap.Core.Ids;
@@ -364,18 +365,61 @@ public sealed class ImportSessionService
     /// values redacted.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// The snapshot is persisted — it is written to <c>sessions.config_snapshot</c> — so a
     /// literal <c>asr.volcengine.api_key</c> would otherwise be stored verbatim, and
     /// docs/CONFIGURATION.md states plainly that the API key is never persisted (issue #26
     /// requires it to be absent from SQLite as well). Redaction uses the same
     /// <see cref="SecretRedactor"/> as <c>config show</c>, so the effective configuration
     /// stays reproducible without carrying the credential itself.
+    /// </para>
+    /// <para>
+    /// Each value is redacted <em>before</em> the serializer encodes it, never in the
+    /// serialized text afterwards. That distinction is the whole guarantee: the default JSON
+    /// encoder rewrites the bytes of a key that contains <c>+</c>, <c>&amp;</c>, <c>'</c>,
+    /// <c>"</c>, <c>\</c> or any non-ASCII character (<c>+</c> becomes <c>\u002B</c>, and
+    /// JSON must escape <c>"</c> and <c>\</c> whatever the encoder is), so a literal replace
+    /// over the finished JSON matches nothing and stores the credential in an escaped form
+    /// that any JSON parser decodes. Redacting first means the key's bytes are never handed
+    /// to the writer, so no serialized representation of the secret — escaped or not — can
+    /// reach the snapshot.
+    /// </para>
     /// </remarks>
     public static string SnapshotJson(MeetCapConfiguration configuration)
     {
         ArgumentNullException.ThrowIfNull(configuration);
 
-        var json = JsonSerializer.Serialize(configuration, s_snapshotJson);
-        return SecretRedactor.Redact(json, SecretRedactor.GetSecretValues(configuration));
+        var options = new JsonSerializerOptions(s_snapshotJson);
+        options.Converters.Add(
+            new RedactingStringConverter(SecretRedactor.GetSecretValues(configuration)));
+        return JsonSerializer.Serialize(configuration, options);
+    }
+
+    /// <summary>
+    /// Writes every string of the configuration graph through <see cref="SecretRedactor"/>.
+    /// </summary>
+    /// <remarks>
+    /// The snapshot is serialized generically — no property is enumerated by hand, so a
+    /// configuration setting added later is snapshotted automatically — and this converter is
+    /// what keeps that generic write safe: it is handed each value before the writer encodes
+    /// it, so the replacement happens on the secret's own characters rather than on whatever
+    /// escaping the writer would have produced for them.
+    /// </remarks>
+    private sealed class RedactingStringConverter : JsonConverter<string>
+    {
+        private readonly IReadOnlySet<string> _secrets;
+
+        public RedactingStringConverter(IReadOnlySet<string> secrets) => _secrets = secrets;
+
+        public override string Read(
+            ref Utf8JsonReader reader,
+            Type typeToConvert,
+            JsonSerializerOptions options) => reader.GetString() ?? string.Empty;
+
+        public override void Write(
+            Utf8JsonWriter writer,
+            string value,
+            JsonSerializerOptions options) =>
+            writer.WriteStringValue(SecretRedactor.Redact(value, _secrets));
     }
 }

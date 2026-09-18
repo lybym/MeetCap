@@ -300,6 +300,55 @@ public class SqliteMigratorTests
         Assert.Equal(sql, SqliteMigrator.ResolveColumnPlaceholders(sql, _ => null));
     }
 
+    [Fact]
+    public void ResolveColumnPlaceholders_AMistypedColumnOnAnExistingTableBecomesNull()
+    {
+        // The asymmetry docs/DATA_MODEL.md section 14 and the migrator remarks now state: a
+        // placeholder for a column the schema does not have expands to NULL, because that is
+        // also the correct first-run value of the column the migration itself is adding. A
+        // mistyped *column* on an existing table is therefore indistinguishable from that
+        // legitimate case and is NOT loud — only a mistyped table is. Spelling the column
+        // correctly is what the script author has to get right.
+        IReadOnlyCollection<string>? ColumnsOf(string table) =>
+            string.Equals(table, "asr_jobs", StringComparison.OrdinalIgnoreCase) ? new[] { "id" } : null;
+
+        Assert.Equal(
+            "SELECT id, NULL FROM asr_jobs",
+            SqliteMigrator.ResolveColumnPlaceholders(
+                "SELECT id, {{asr_jobs.provider_log_idd}} FROM asr_jobs",
+                ColumnsOf));
+    }
+
+    [Fact]
+    public void UnexpandedPlaceholder_ReachesSqliteAndFailsLoudlyInsteadOfCopyingNull()
+    {
+        // This is the link the pass-through assertion above cannot reach: what makes a mistyped
+        // table loud is that the placeholder reaches SQLite exactly as written and the statement
+        // then fails. Asserted against a real database, because that failure — rather than a
+        // silent NULL — is what stops a mistake in a migration from dropping the value the
+        // migration exists to carry.
+        var db = NewDb();
+        try
+        {
+            new SqliteMigrator().Migrate(db);
+            using var c = Open(db);
+
+            var failure = Assert.Throws<SqliteException>(() =>
+            {
+                using var cmd = new SqliteCommand("SELECT {{asr_jobz.provider_log_id}} FROM asr_jobs", c);
+                cmd.ExecuteNonQuery();
+            });
+
+            // The placeholder itself is what SQLite rejects, which is why the statement cannot
+            // quietly degrade into a NULL copy.
+            Assert.Contains("{", failure.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Cleanup(db);
+        }
+    }
+
     private static void InsertAsrJob(SqliteConnection c, string id, string? providerLogId = null)
     {
         using (var cmd = new SqliteCommand(

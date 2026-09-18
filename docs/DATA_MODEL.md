@@ -743,6 +743,16 @@ statement naming an absent column fails while it is prepared. Those scripts use
 `SqliteMigrator`'s schema-conditional placeholder `{{table.column}}`, which expands to the
 column when the schema has it and to `NULL` when it does not.
 
+Two properties of that placeholder are what a script author has to know. First, only a
+mistyped *table* is loud: the placeholder is then left exactly as written, the script reaches
+SQLite unexpanded and fails to prepare, and the migration aborts instead of quietly copying
+`NULL`. A placeholder for a column the named table does not have expands to `NULL` even when
+the author mistyped the name of a column that does exist, because `NULL` is also the correct
+first-run value of the column the migration itself is adding — the mechanism cannot tell the
+two apart, and neither can SQL. Second, the placeholder is substituted over the whole script
+text, comments and string literals included, so `{{table.column}}` is a reserved sequence:
+a script only writes it where it is meant to expand.
+
 Every embedded `*.sql` resource under `Migrations` must carry a parseable version
 (`Migrations.<digits>`), and no two may claim the same one. Both violations are rejected before
 any DDL runs, because either one makes a migration silently not run: a duplicate looks

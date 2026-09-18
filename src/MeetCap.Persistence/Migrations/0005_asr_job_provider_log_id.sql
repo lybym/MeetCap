@@ -21,9 +21,11 @@
 -- copy has to carry provider_log_id across, but on a first run the column does not exist
 -- yet and a statement naming it would fail to prepare, which plain SQL cannot branch
 -- around. The copy reads it through SqliteMigrator's schema-conditional placeholder
--- `{{table.column}}`, which expands to the column when it exists and to NULL when it does
--- not. A first run therefore copies NULL (correct: no log id exists yet) and a re-run
--- copies the stored log id instead of silently resetting it.
+-- `{{<table>.<column>}}` -- written here so that it cannot match, because the sequence is
+-- substituted over the whole script text, comments included -- which expands to the column
+-- when it exists and to NULL when it does not. A first run therefore copies NULL (correct:
+-- no log id exists yet) and a re-run copies the stored log id instead of silently resetting
+-- it.
 --
 -- The rebuild is also what keeps the legacy `tier` column and every CHECK constraint
 -- byte-for-byte identical to migration 0003. `tier` is retained as a schema-compatibility

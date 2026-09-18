@@ -396,7 +396,11 @@ A running session uses a configuration snapshot captured at session start. Editi
 
 The snapshot is persisted (it is the session's `config_snapshot`), so it is captured with the
 secret-bearing values already redacted, exactly as rule 7 requires of effective-config output:
-a literal `asr.volcengine.api_key` is stored as `***`, never verbatim.
+a literal `asr.volcengine.api_key` is stored as `***`, never verbatim. Redaction replaces the
+value *before* the snapshot is serialized rather than editing the serialized text afterwards,
+because the JSON writer escapes `+`, `"`, `\` and every non-ASCII character: a key containing
+any of them appears in the finished document only in escaped form, where a replacement over the
+text would match nothing and persist the credential anyway.
 
 ## 13. Config migration
 

@@ -192,6 +192,21 @@ public sealed class SqliteMigrator
     /// migration exists to carry.
     /// </para>
     /// <para>
+    /// Only a mistyped *table* is loud. A placeholder for a column that the named table does
+    /// not have expands to <c>NULL</c> even when the author meant an existing column and
+    /// mistyped its name, because <c>NULL</c> is also the correct first-run value of the
+    /// column the migration itself is adding — the two cases are the same string to this
+    /// mechanism and SQL cannot tell them apart either. Spelling the column correctly is
+    /// therefore the script author's responsibility (<c>docs/DATA_MODEL.md</c> section 14).
+    /// </para>
+    /// <para>
+    /// The placeholder is substituted over the whole script text, comments and string
+    /// literals included, so <c>{{table.column}}</c> is a reserved sequence: writing it where
+    /// it is not meant to expand (prose, a comment, sample data) substitutes it anyway
+    /// whenever that table exists. Whatever a script wants to say about the syntax uses a
+    /// form this pattern cannot match.
+    /// </para>
+    /// <para>
     /// This is a pure function over the schema so both paths are directly testable
     /// without a database.
     /// </para>

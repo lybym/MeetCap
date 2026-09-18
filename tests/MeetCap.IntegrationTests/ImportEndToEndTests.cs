@@ -1,3 +1,4 @@
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using MeetCap.Asr;
 using MeetCap.Asr.Importing;
@@ -523,9 +524,16 @@ public class ImportEndToEndTests : IDisposable
         // credential-bearing value the import path is handed, so a sentinel is put there and then
         // searched for everywhere the run persists or writes. Asserting only on type-member names
         // and the literal string "api_key" could not fail if a real secret were stored (review
-        // finding P2 on PR #28); the snapshot assertion below fails if SnapshotJson stops
+        // finding P2 on PR #28); the snapshot assertions below fail if SnapshotJson stops
         // redacting.
-        const string Sentinel = "SENTINEL-API-KEY-0123456789";
+        //
+        // The sentinel deliberately contains characters the default JSON encoder rewrites ('+',
+        // '/', '==' padding and a non-ASCII character) and characters JSON itself must escape
+        // ('"' and '\'). A literal search for such a key is blind to the leak: what lands in
+        // sessions.config_snapshot is the *escaped* form, so the raw-text assertions below pass
+        // while the credential is fully recoverable. That is why the snapshot is also read back
+        // as decoded JSON and its api_key value asserted directly (review finding P1 on PR #28).
+        const string Sentinel = "SENTINEL-API-KEY-0123456789+中/==\"A\\B";
         Migrate();
         var configuration = new MeetCapConfiguration();
         configuration.Asr.Volcengine.ApiKey = Sentinel;
@@ -551,13 +559,19 @@ public class ImportEndToEndTests : IDisposable
                 || p.Name.Contains("Secret", StringComparison.Ordinal));
 
         // And the sentinel appears nowhere the run wrote: the retained request metadata, the
-        // durable session document, the event log, the job row, or the session row.
+        // event log, the job row, or the session row. session.json is not searched: SessionDocument
+        // has no config-snapshot member, so such an assertion could never fail (review finding,
+        // test gaps). The persisted snapshot is asserted instead, both as text and as decoded JSON.
         Assert.Null(job.ErrorMessage);
         Assert.DoesNotContain(Sentinel, File.ReadAllText(paths.JobRequestJson("job_test")), StringComparison.Ordinal);
-        Assert.DoesNotContain(Sentinel, File.ReadAllText(paths.SessionJson), StringComparison.Ordinal);
         Assert.DoesNotContain(Sentinel, File.ReadAllText(paths.EventsJsonl), StringComparison.Ordinal);
         Assert.Contains("config_version", ReadSessionConfigSnapshot(), StringComparison.Ordinal);
         Assert.DoesNotContain(Sentinel, ReadSessionConfigSnapshot(), StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            JavaScriptEncoder.Default.Encode(Sentinel),
+            ReadSessionConfigSnapshot(),
+            StringComparison.Ordinal);
+        Assert.Equal("***", ReadSessionApiKey());
         Assert.DoesNotContain(Sentinel, ReadAsrJobRow(), StringComparison.Ordinal);
     }
 
@@ -567,6 +581,20 @@ public class ImportEndToEndTests : IDisposable
         using var c = OpenDatabase();
         using var cmd = new SqliteCommand("SELECT config_snapshot FROM sessions WHERE id = 'ses_test'", c);
         return Convert.ToString(cmd.ExecuteScalar()) ?? string.Empty;
+    }
+
+    /// <summary>
+    /// The <c>api_key</c> value inside the persisted snapshot, decoded. Reading it back as
+    /// characters is what makes the assertion independent of how the JSON writer escaped it.
+    /// </summary>
+    private string? ReadSessionApiKey()
+    {
+        using var snapshot = JsonDocument.Parse(ReadSessionConfigSnapshot());
+        return snapshot.RootElement
+            .GetProperty("asr")
+            .GetProperty("volcengine")
+            .GetProperty("api_key")
+            .GetString();
     }
 
     /// <summary>The stored ASR job row, flattened so any column can be searched for a secret.</summary>
