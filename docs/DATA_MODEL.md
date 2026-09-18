@@ -528,7 +528,9 @@ Notes:
 - `next_retry_at` makes the backoff durable: a restart resumes the same schedule.
 - `request_metadata_path` points at `asr/jobs/<job-id>/request.json`, which is sanitized —
   credentials and authorization headers never appear in it, and the inline audio payload is
-  replaced by its byte count.
+  replaced by its byte count. Under issue #29, TOS-backed requests may record transport type plus
+  stable bucket/object-key identity, but MUST NOT persist the presigned URL, its signature/query
+  parameters, or TOS credentials.
 - Under issue #26, the Volcengine `X-Tt-Logid` is retained in provider diagnostic metadata (or
   the retained response envelope) for support tracing. `X-Api-Key` is never persisted there.
 - `raw_response_path` and `normalized_result_path` point at `response.json` and
@@ -603,6 +605,33 @@ durable: that is a lost batch window, never lost audio.
 
 This adds no SQLite table and no migration: the batch's own mapping lives in the artifact beside
 it, and the job row already has the columns to point at it.
+
+### 6.2 TOS large-file transport state (target after issue #29)
+
+Issue #29 requires a new numbered migration rather than rewriting the existing `0003_asr_jobs`
+migration. The durable job row must gain enough non-secret state to recover a TOS-backed
+submission across process restarts. Required semantics are:
+
+```text
+audio_transport      inline | tos
+tos_bucket           nullable; set for tos
+tos_object_key       nullable; set for tos
+tos_cleanup_state    not_required | pending | deleted
+```
+
+Exact column names may differ, but these invariants do not:
+
+- the presigned URL is never the durable identifier and is never stored in SQLite;
+- bucket + object key are persisted before provider submission so a restart can generate a new
+  SDK presigned GET URL instead of uploading a duplicate object unnecessarily;
+- TOS credentials never enter the database;
+- cleanup is durable/idempotent: a successful transcript may coexist with `cleanup_state =
+  pending` until `DeleteObject` succeeds;
+- cleanup debt is not a transcription failure and must not erase provider results;
+- inline jobs do not manufacture fake TOS state.
+
+The local `input_artifact` remains authoritative for the recording/batch itself. The TOS object
+is only a temporary transport copy and can be deleted without changing transcript provenance.
 
 ## 7. Transcript segment
 
@@ -746,7 +775,11 @@ already-applied, and an unnumbered script is never considered at all.
   timeline manifest under `asr/batches/` (section 6.1), and the job that consumes it uses the M3
   `asr_jobs` columns unchanged: `input_artifact` names the batch and `start_ms` carries its
   position on the session timeline. No table, column or constraint changed.
-- Later milestones add `speakers`, `speaker_embeddings` and `speaker_assignments` as their features are implemented, each as a new numbered migration. No table is created ahead of its feature (section 11).
+- Issue #29 adds TOS transport state to `asr_jobs` through a new numbered migration. Do not edit
+  `0003_asr_jobs` in place: already-created data roots must migrate forward while preserving the
+  existing provider request ID, retry state, and local input artifact.
+- Later milestones add new schema only with their implemented features. No table or column is
+  created ahead of its feature (section 11).
 
 Two scripts claiming one version would make the second look already applied and its tables would
 never be created, so `SqliteMigrator` fails loudly if two embedded scripts resolve to the same
