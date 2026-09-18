@@ -48,7 +48,26 @@ milestones are described as the former, never the latter
   provider's `X-Tt-Logid` for support tracing. It is recorded as soon as submit answers,
   replaced by the query's log id on completion, and also written to the `asr.job.submitted` /
   `asr.job.completed` events and to provider error messages. The API key is never persisted.
-  The migration rebuilds `asr_jobs` and copies every existing row across unchanged.
+  The migration rebuilds `asr_jobs` and copies every existing row across unchanged — including
+  on a re-run, where it now keeps any `provider_log_id` written since the first run instead of
+  resetting it.
+
+### Fixed
+
+- **Migration `0005_asr_job_provider_log_id` no longer discards `provider_log_id` when it runs a
+  second time.** The script is re-runnable by contract, because a second process can read
+  `schema_migrations` before the version row is committed and then run it too; its rebuild
+  copied every column except the one it had just added, so values written in between were
+  silently reset to `NULL`. The copy now reads the column through a schema-conditional
+  placeholder that expands to the column when the schema has it and to `NULL` when it does not,
+  so a re-run preserves the stored log ids. `SqliteMigrator` applies each migration in an
+  immediate transaction so that placeholder is resolved against the schema the script actually
+  sees.
+- **The session configuration snapshot no longer stores the API key.** `sessions.config_snapshot`
+  is persisted, and it was serialized from the effective configuration verbatim, so a literal
+  `asr.volcengine.api_key` was written to SQLite even though the API key is never persisted
+  (`docs/CONFIGURATION.md` rule 7). The snapshot is now redacted through the same
+  `SecretRedactor` as `config show`.
 
 ### Notes
 

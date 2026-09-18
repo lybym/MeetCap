@@ -14,6 +14,17 @@
 -- abort that process. The table is rebuilt instead: every statement is guarded, and a
 -- second run copies the (now identical) rows across and swaps again.
 --
+-- A re-run must also not *lose* anything. It is reached only because another process
+-- already committed this rebuild, and between that commit and this run's DROP TABLE the
+-- rest of MeetCap may have written real X-Tt-Logid values into provider_log_id — the very
+-- diagnostic state docs/DATA_MODEL.md section 6 says is kept for provider support. So the
+-- copy has to carry provider_log_id across, but on a first run the column does not exist
+-- yet and a statement naming it would fail to prepare, which plain SQL cannot branch
+-- around. The copy reads it through SqliteMigrator's schema-conditional placeholder
+-- `{{table.column}}`, which expands to the column when it exists and to NULL when it does
+-- not. A first run therefore copies NULL (correct: no log id exists yet) and a re-run
+-- copies the stored log id instead of silently resetting it.
+--
 -- The rebuild is also what keeps the legacy `tier` column and every CHECK constraint
 -- byte-for-byte identical to migration 0003. `tier` is retained as a schema-compatibility
 -- field; it is no longer a routing input (docs/DATA_MODEL.md section 6).
@@ -53,12 +64,14 @@ INSERT OR IGNORE INTO asr_jobs_new (
     id, session_id, source, tier, provider, start_ms, end_ms, input_artifact, status,
     provider_request_id, attempt_count, next_retry_at, request_metadata_path, raw_response_path,
     normalized_result_path, error_code, error_message, duration_ms, speaker_info_requested,
-    speaker_info_returned, estimated_cost_cny, submitted_at, completed_at, created_at, updated_at)
+    speaker_info_returned, estimated_cost_cny, submitted_at, completed_at, created_at, updated_at,
+    provider_log_id)
 SELECT
     id, session_id, source, tier, provider, start_ms, end_ms, input_artifact, status,
     provider_request_id, attempt_count, next_retry_at, request_metadata_path, raw_response_path,
     normalized_result_path, error_code, error_message, duration_ms, speaker_info_requested,
-    speaker_info_returned, estimated_cost_cny, submitted_at, completed_at, created_at, updated_at
+    speaker_info_returned, estimated_cost_cny, submitted_at, completed_at, created_at, updated_at,
+    {{asr_jobs.provider_log_id}}
 FROM asr_jobs;
 
 DROP TABLE IF EXISTS asr_jobs;

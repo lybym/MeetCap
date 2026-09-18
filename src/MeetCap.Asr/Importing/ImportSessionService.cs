@@ -6,6 +6,7 @@ using MeetCap.Core.Asr;
 using MeetCap.Core.Configuration;
 using MeetCap.Core.Ids;
 using MeetCap.Core.Media;
+using MeetCap.Core.Secrets;
 using MeetCap.Core.Sessions;
 using MeetCap.Core.Transcripts;
 
@@ -358,10 +359,23 @@ public sealed class ImportSessionService
 
     private DateTimeOffset Now() => _options.TimeProvider.GetUtcNow();
 
-    /// <summary>Serializes the effective configuration for the session snapshot.</summary>
+    /// <summary>
+    /// Serializes the effective configuration for the session snapshot, with secret-bearing
+    /// values redacted.
+    /// </summary>
+    /// <remarks>
+    /// The snapshot is persisted — it is written to <c>sessions.config_snapshot</c> — so a
+    /// literal <c>asr.volcengine.api_key</c> would otherwise be stored verbatim, and
+    /// docs/CONFIGURATION.md states plainly that the API key is never persisted (issue #26
+    /// requires it to be absent from SQLite as well). Redaction uses the same
+    /// <see cref="SecretRedactor"/> as <c>config show</c>, so the effective configuration
+    /// stays reproducible without carrying the credential itself.
+    /// </remarks>
     public static string SnapshotJson(MeetCapConfiguration configuration)
     {
         ArgumentNullException.ThrowIfNull(configuration);
-        return JsonSerializer.Serialize(configuration, s_snapshotJson);
+
+        var json = JsonSerializer.Serialize(configuration, s_snapshotJson);
+        return SecretRedactor.Redact(json, SecretRedactor.GetSecretValues(configuration));
     }
 }

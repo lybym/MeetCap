@@ -734,6 +734,15 @@ JSONL is the stable machine-consumption format. Agents should not need to parse 
 
 SQLite schema is created and evolved by numbered, embedded SQL migration scripts applied by `SqliteMigrator` (`src/MeetCap.Persistence/Storage/SqliteMigrator.cs`). Applied versions are recorded in `schema_migrations`. Re-running migrations is idempotent; already-applied migrations are skipped.
 
+A skip is not the only protection, because a second process can read `schema_migrations`
+before another process records a version and then run that script too. Every script must
+therefore also be safe to re-run *and* leave existing data intact. When such a script has to
+copy a column that only the later schema has — the usual case for the migration that adds that
+column — it cannot say so in SQL, because SQLite cannot branch on column presence and a
+statement naming an absent column fails while it is prepared. Those scripts use
+`SqliteMigrator`'s schema-conditional placeholder `{{table.column}}`, which expands to the
+column when the schema has it and to `NULL` when it does not.
+
 Every embedded `*.sql` resource under `Migrations` must carry a parseable version
 (`Migrations.<digits>`), and no two may claim the same one. Both violations are rejected before
 any DDL runs, because either one makes a migration silently not run: a duplicate looks
@@ -756,7 +765,12 @@ already-applied, and an unnumbered script is never considered at all.
   `SqliteMigrator` requires every script to be re-runnable (a second process that read
   `schema_migrations` before this version was recorded runs the script too), so the migration
   rebuilds `asr_jobs` instead: every statement is guarded, the rows are copied across unchanged
-  by `INSERT OR IGNORE`, and a re-run is a no-op. The legacy `tier` column and all `CHECK`
+  by `INSERT OR IGNORE`, and a re-run is a no-op. A re-run is reached only because another
+  process already committed this rebuild, so between that commit and this run's `DROP TABLE`
+  the rest of MeetCap can have written real `X-Tt-Logid` values; the copy therefore carries
+  `provider_log_id` through the schema-conditional placeholder, so a re-run preserves those
+  values rather than resetting them to `NULL`, and a first run copies `NULL` because no log id
+  exists yet. The legacy `tier` column and all `CHECK`
   constraints are reproduced byte-for-byte from `0003_asr_jobs`.
 - **M2** requires no new migration. The bounded-buffer accounting and the gap totals live in
   `session.json` and `events.jsonl` (sections 3 and 4), and the gap audit (section 5.1) reads

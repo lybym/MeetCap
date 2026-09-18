@@ -4,6 +4,7 @@ using MeetCap.Asr.Importing;
 using MeetCap.Asr.Transcripts;
 using MeetCap.Asr.Volcengine;
 using MeetCap.Core.Asr;
+using MeetCap.Core.Configuration;
 using MeetCap.Core.Sessions;
 using MeetCap.Core.Transcripts;
 using MeetCap.Persistence.Storage;
@@ -63,7 +64,8 @@ public class ImportEndToEndTests : IDisposable
     private (ImportSessionService Service, AsrJobProcessor Processor, FakeAsrProvider Provider, MeetCapDatabase Database) CreateService(
         bool requestSpeakerInfo = true,
         bool writeMarkdown = true,
-        FakeAsrProvider? provider = null)
+        FakeAsrProvider? provider = null,
+        string configSnapshotJson = "{\"config_version\":1}")
     {
         var database = new MeetCapDatabase(DatabasePath);
         database.EnsureMigrated();
@@ -102,7 +104,7 @@ public class ImportEndToEndTests : IDisposable
                 DefaultTitle = "Untitled Meeting",
                 RequestSpeakerInfo = requestSpeakerInfo,
                 CostPerHourCny = 0.8,
-                ConfigSnapshotJson = "{\"config_version\":1}",
+                ConfigSnapshotJson = configSnapshotJson,
             });
 
         return (service, processor, provider, database);
@@ -516,8 +518,19 @@ public class ImportEndToEndTests : IDisposable
         // The provider boundary takes no credential at all: the adapter resolves the API key
         // itself, so nothing above it can copy the secret into a request, a job row, or a
         // retained artifact (docs/CONFIGURATION.md section 8, issue #26).
+        //
+        // A literal key is the case that can actually leak, and the session snapshot is the one
+        // credential-bearing value the import path is handed, so a sentinel is put there and then
+        // searched for everywhere the run persists or writes. Asserting only on type-member names
+        // and the literal string "api_key" could not fail if a real secret were stored (review
+        // finding P2 on PR #28); the snapshot assertion below fails if SnapshotJson stops
+        // redacting.
+        const string Sentinel = "SENTINEL-API-KEY-0123456789";
         Migrate();
-        var (service, _, provider, database) = CreateService();
+        var configuration = new MeetCapConfiguration();
+        configuration.Asr.Volcengine.ApiKey = Sentinel;
+        var (service, _, provider, database) = CreateService(
+            configSnapshotJson: ImportSessionService.SnapshotJson(configuration));
         provider.EnqueuePoll(AsrPollResult.Completed(new AsrCompletion(ProviderJson, "20000000")));
 
         await service.ImportAsync(new ImportRequest
@@ -537,9 +550,51 @@ public class ImportEndToEndTests : IDisposable
                 || p.Name.Contains("Token", StringComparison.Ordinal)
                 || p.Name.Contains("Secret", StringComparison.Ordinal));
 
-        // And the persisted job metadata has no free-form field that could hold one either.
+        // And the sentinel appears nowhere the run wrote: the retained request metadata, the
+        // durable session document, the event log, the job row, or the session row.
         Assert.Null(job.ErrorMessage);
-        Assert.DoesNotContain("api_key", File.ReadAllText(paths.JobRequestJson("job_test")), StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(Sentinel, File.ReadAllText(paths.JobRequestJson("job_test")), StringComparison.Ordinal);
+        Assert.DoesNotContain(Sentinel, File.ReadAllText(paths.SessionJson), StringComparison.Ordinal);
+        Assert.DoesNotContain(Sentinel, File.ReadAllText(paths.EventsJsonl), StringComparison.Ordinal);
+        Assert.Contains("config_version", ReadSessionConfigSnapshot(), StringComparison.Ordinal);
+        Assert.DoesNotContain(Sentinel, ReadSessionConfigSnapshot(), StringComparison.Ordinal);
+        Assert.DoesNotContain(Sentinel, ReadAsrJobRow(), StringComparison.Ordinal);
+    }
+
+    /// <summary>The persisted session row's configuration snapshot.</summary>
+    private string ReadSessionConfigSnapshot()
+    {
+        using var c = OpenDatabase();
+        using var cmd = new SqliteCommand("SELECT config_snapshot FROM sessions WHERE id = 'ses_test'", c);
+        return Convert.ToString(cmd.ExecuteScalar()) ?? string.Empty;
+    }
+
+    /// <summary>The stored ASR job row, flattened so any column can be searched for a secret.</summary>
+    private string ReadAsrJobRow()
+    {
+        using var c = OpenDatabase();
+        using var cmd = new SqliteCommand("SELECT * FROM asr_jobs WHERE id = 'job_test'", c);
+        using var reader = cmd.ExecuteReader();
+        if (!reader.Read())
+        {
+            return string.Empty;
+        }
+
+        var values = new List<string>();
+        for (var i = 0; i < reader.FieldCount; i++)
+        {
+            values.Add(reader.IsDBNull(i) ? string.Empty : Convert.ToString(reader.GetValue(i)) ?? string.Empty);
+        }
+
+        return string.Join('\u001f', values);
+    }
+
+    private SqliteConnection OpenDatabase()
+    {
+        var conn = new SqliteConnection(
+            new SqliteConnectionStringBuilder { DataSource = DatabasePath, Pooling = false }.ToString());
+        conn.Open();
+        return conn;
     }
 
     [Fact]

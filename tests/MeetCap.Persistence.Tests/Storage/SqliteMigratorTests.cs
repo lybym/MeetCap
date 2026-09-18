@@ -211,11 +211,18 @@ public class SqliteMigratorTests
     }
 
     [Fact]
-    public void Migrate_CanReRunTheProviderLogIdMigrationInsteadOfFailingOnADuplicateColumn()
+    public void Migrate_ReRunOfProviderLogIdMigration_PreservesTheStoredProviderLogId()
     {
         // The migrator relies on every script being re-runnable, because a second process can
         // read schema_migrations before this version is recorded. A bare ALTER TABLE would fail
         // with "duplicate column name" here; the rebuild has to be a no-op instead.
+        //
+        // "A no-op" includes the rows: between the first run's commit and this replay's
+        // DROP TABLE the rest of MeetCap can write real X-Tt-Logid values into
+        // provider_log_id, and the rebuild used to reset every one of them to NULL. Asserting
+        // only "does not throw" plus column existence is what let that loss ship (review
+        // finding P1 on PR #28), so this test writes values, replays, and re-reads them —
+        // per row, so a single value smeared across the table would fail too.
         var db = NewDb();
         try
         {
@@ -223,22 +230,120 @@ public class SqliteMigratorTests
             migrator.Migrate(db);
 
             using var c = Open(db);
-            using (var forget = new SqliteCommand("DELETE FROM schema_migrations WHERE version = @v", c))
-            {
-                forget.Parameters.AddWithValue("@v", ProviderLogIdMigrationVersion());
-                forget.ExecuteNonQuery();
-            }
 
-            migrator.Migrate(db); // must not throw
+            // Both rows exist only after the first run, which is exactly the window the
+            // replay is able to destroy.
+            InsertAsrJob(c, "job_without_log_id");
+            InsertAsrJob(c, "job_with_log_id", providerLogId: "LOGID-REAL");
+
+            ForgetProviderLogIdMigration(c);
+            migrator.Migrate(db); // the replay
 
             Assert.True(ColumnExists(c, "asr_jobs", "provider_log_id"));
             Assert.True(TableExists(c, "asr_jobs"));
             Assert.False(TableExists(c, "asr_jobs_new"));
+            Assert.True(ReadIsNull(c, "SELECT provider_log_id FROM asr_jobs WHERE id = 'job_without_log_id'"));
+            Assert.Equal(
+                "LOGID-REAL",
+                ReadString(c, "SELECT provider_log_id FROM asr_jobs WHERE id = 'job_with_log_id'"));
         }
         finally
         {
             Cleanup(db);
         }
+    }
+
+    [Fact]
+    public void ResolveColumnPlaceholders_ExpandsToTheColumnWhenPresentAndToNullWhenAbsent()
+    {
+        // SQLite cannot branch on column presence, and naming an absent column fails while the
+        // statement is prepared, so a re-runnable migration cannot express "carry this column
+        // if it is already there" in SQL. The placeholder is that branch: a re-run expands it
+        // to the stored column, a first run to NULL.
+        var schema = new Dictionary<string, IReadOnlyCollection<string>>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["asr_jobs"] = new[] { "id", "provider_log_id" },
+            ["asr_jobs_old"] = new[] { "id" },
+        };
+        IReadOnlyCollection<string>? ColumnsOf(string table) =>
+            schema.TryGetValue(table, out var columns) ? columns : null;
+
+        Assert.Equal(
+            "SELECT id, provider_log_id FROM asr_jobs",
+            SqliteMigrator.ResolveColumnPlaceholders(
+                "SELECT id, {{asr_jobs.provider_log_id}} FROM asr_jobs",
+                ColumnsOf));
+
+        Assert.Equal(
+            "SELECT id, NULL FROM asr_jobs_old",
+            SqliteMigrator.ResolveColumnPlaceholders(
+                "SELECT id, {{asr_jobs_old.provider_log_id}} FROM asr_jobs_old",
+                ColumnsOf));
+
+        // SQLite identifier resolution is case-insensitive, so the table lookup is too.
+        Assert.Equal(
+            "SELECT id, provider_log_id FROM asr_jobs",
+            SqliteMigrator.ResolveColumnPlaceholders(
+                "SELECT id, {{ASR_JOBS.PROVIDER_LOG_ID}} FROM asr_jobs",
+                ColumnsOf));
+    }
+
+    [Fact]
+    public void ResolveColumnPlaceholders_LeavesAnUnknownTableUntouchedSoAMistakeStaysLoud()
+    {
+        // Two things must not happen here. A comment that quotes the syntax has to stay inert,
+        // and a mistyped table must reach SQLite unexpanded — expanding it to NULL would drop
+        // the value the migration exists to carry, silently.
+        const string sql = "-- {{asr_jobz.provider_log_id}} is resolved by SqliteMigrator\n" +
+                           "SELECT id, {{asr_jobz.provider_log_id}} FROM asr_jobs";
+
+        Assert.Equal(sql, SqliteMigrator.ResolveColumnPlaceholders(sql, _ => null));
+    }
+
+    private static void InsertAsrJob(SqliteConnection c, string id, string? providerLogId = null)
+    {
+        using (var cmd = new SqliteCommand(
+                   "INSERT INTO asr_jobs (id, session_id, source, tier, provider, input_artifact, status, " +
+                   "provider_request_id, created_at, updated_at) " +
+                   "VALUES (@id, 'ses_1', 'import', 'standard', 'volcengine', 'audio/import/a.wav', " +
+                   "'pending', @req, @now, @now)",
+                   c))
+        {
+            cmd.Parameters.AddWithValue("@id", id);
+            cmd.Parameters.AddWithValue("@req", "req-" + id);
+            cmd.Parameters.AddWithValue("@now", "2026-09-15T00:00:00Z");
+            cmd.ExecuteNonQuery();
+        }
+
+        if (providerLogId is not null)
+        {
+            using var set = new SqliteCommand(
+                "UPDATE asr_jobs SET provider_log_id = @logId WHERE id = @id", c);
+            set.Parameters.AddWithValue("@logId", providerLogId);
+            set.Parameters.AddWithValue("@id", id);
+            set.ExecuteNonQuery();
+        }
+    }
+
+    private static void ForgetProviderLogIdMigration(SqliteConnection c)
+    {
+        using var forget = new SqliteCommand("DELETE FROM schema_migrations WHERE version = @v", c);
+        forget.Parameters.AddWithValue("@v", ProviderLogIdMigrationVersion());
+        forget.ExecuteNonQuery();
+    }
+
+    private static string? ReadString(SqliteConnection c, string sql)
+    {
+        using var cmd = new SqliteCommand(sql, c);
+        var value = cmd.ExecuteScalar();
+        return value is null or DBNull ? null : Convert.ToString(value);
+    }
+
+    private static bool ReadIsNull(SqliteConnection c, string sql)
+    {
+        using var cmd = new SqliteCommand(sql, c);
+        var value = cmd.ExecuteScalar();
+        return value is null or DBNull;
     }
 
     private static int ProviderLogIdMigrationVersion() =>

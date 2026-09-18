@@ -394,6 +394,10 @@ readable. Older recordings are never deleted automatically
 
 A running session uses a configuration snapshot captured at session start. Editing the file affects the next session only.
 
+The snapshot is persisted (it is the session's `config_snapshot`), so it is captured with the
+secret-bearing values already redacted, exactly as rule 7 requires of effective-config output:
+a literal `asr.volcengine.api_key` is stored as `***`, never verbatim.
+
 ## 13. Config migration
 
 The file contains `config_version = 1`. Breaking changes require migration or an actionable validation error.
