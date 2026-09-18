@@ -97,6 +97,35 @@ network down
 
 This is normal operation, not a fatal session error.
 
+### 9.1 TOS transport failure semantics (target after issue #29)
+
+Large-file TOS staging belongs to the ASR/storage-transport failure domain. It never runs on the
+capture callback/thread and never weakens the local-audio invariant.
+
+Expected behavior:
+
+```text
+TOS upload/sign unavailable
+ -> local WAV/batch remains durable
+ -> recording continues
+ -> ASR job stays pending/retryable or fails actionably according to durable job policy
+
+process restarts after TOS upload
+ -> read persisted bucket/object key
+ -> generate a fresh presigned GET URL through the SDK
+ -> continue provider submit/query
+
+ASR succeeds but TOS DeleteObject fails
+ -> transcript/provider result remains successful
+ -> cleanup remains observable/pending
+ -> later cleanup retry or bucket lifecycle safety net removes the orphan
+```
+
+Presigned URLs and TOS credentials are never recovery state. A URL may expire safely because the
+stable bucket/object key is what is persisted. The deployment should apply a three-day
+lifecycle expiration to the dedicated `meetcap-asr/` prefix as a second line of orphan cleanup;
+MeetCap itself does not mutate bucket lifecycle policy.
+
 ## 10. Disk-space policy
 
 Before start, check configured minimum free space. During recording, periodically check remaining space and warn early.
