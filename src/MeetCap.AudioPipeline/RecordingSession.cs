@@ -123,11 +123,13 @@ public sealed class RecordingSession : IDisposable
     private readonly Action? _afterPacketWritten;
 
     /// <summary>
-    /// Test seam: awaited by every track after a device loss and before each reopen attempt,
-    /// so a test can date a whole outage deterministically instead of racing the capture loop.
-    /// Production passes <c>null</c>.
+    /// Test seam: builds the per-track function a track awaits after a device loss and before
+    /// each reopen attempt, so a test can date a whole outage deterministically instead of
+    /// racing the capture loop. It is a factory rather than one function because each track
+    /// must be able to park independently — a single shared seam could only ever hold the
+    /// first track that reached it. Production passes <c>null</c>.
     /// </summary>
-    private readonly Func<CancellationToken, Task>? _beforeReopenAttempt;
+    private readonly Func<AudioSource, Func<CancellationToken, Task>>? _beforeReopenAttempt;
 
     private CancellationTokenSource? _endCts;
     private SessionRecordingLock? _recordingLock;
@@ -151,7 +153,7 @@ public sealed class RecordingSession : IDisposable
         int maxDeviceRecoveryAttempts,
         SessionRecordingLock? recordingLock,
         Action? afterPacketWritten = null,
-        Func<CancellationToken, Task>? beforeReopenAttempt = null)
+        Func<AudioSource, Func<CancellationToken, Task>>? beforeReopenAttempt = null)
     {
         _paths = paths ?? throw new ArgumentNullException(nameof(paths));
         _settings = settings ?? throw new ArgumentNullException(nameof(settings));

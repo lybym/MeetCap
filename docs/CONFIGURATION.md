@@ -149,6 +149,19 @@ rather than exposing a retry count:
   upper bound to enforce: a very long window is a deliberate choice to wait a long time for a
   device, and the risk it carries is bounded because the track ends as soon as the window
   closes;
+- the upper end of that range is nevertheless an exact one, not an unbounded promise. The
+  attempt count is the window in milliseconds divided by the one-second backoff, and the
+  multiplication is done in `long` before it is narrowed. Seconds × milliseconds overflows
+  `int` above 2,147,483 seconds; performed in `int` that wraps to a **negative** budget, which
+  both consumers clamp to zero — turning an operator's very long window into *no* recovery at
+  all, the exact inversion of the configured policy this derivation exists to remove. The
+  longest window an `int` can carry is therefore also the exact boundary: `int.MaxValue`
+  seconds is `int.MaxValue` attempts (2,147,483,647), so every value configuration can express
+  is honoured and the result never decreases as the window grows. A longer window has no
+  representable attempt count; the narrowing is checked and throws rather than wrapping
+  negative, and that path is unreachable from configuration because the window itself is an
+  `int`. There is no saturation clamp, because no clamp could ever fire for a representable
+  window;
 - the default of 20 s is chosen for Bluetooth. A wired endpoint that is unplugged comes back
   almost immediately, but a headset that is switched off and on again — or that walks back into
   range — takes seconds, and the previous fixed budget of three retries reported a returning

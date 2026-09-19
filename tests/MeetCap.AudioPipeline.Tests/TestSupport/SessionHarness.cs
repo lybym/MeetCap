@@ -23,7 +23,7 @@ internal sealed class SessionHarness : IDisposable
         string? renderDeviceId = null,
         string? loopbackMode = null,
         string? loopbackProcessName = null,
-        Func<CancellationToken, Task>? beforeReopenAttempt = null)
+        Func<AudioSource, Func<CancellationToken, Task>>? beforeReopenAttempt = null)
     {
         _workspace = workspace ?? new TempWorkspace();
         OwnsWorkspace = workspace is null;
@@ -202,6 +202,6 @@ internal sealed class SessionHarness : IDisposable
         }
     }
 
-    private readonly Func<CancellationToken, Task>? _beforeReopenAttempt;
+    private readonly Func<AudioSource, Func<CancellationToken, Task>>? _beforeReopenAttempt;
     private readonly TempWorkspace _workspace;
 }

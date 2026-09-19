@@ -49,9 +49,13 @@ session still completes, and the outage is recorded as a degraded flag plus expl
 events. See `docs/RELIABILITY.md` section 8.
 
 `config_snapshot` is a JSON object holding the capture-relevant settings the session
-started with (`data_root`, `chunk_seconds`, `buffer_seconds`, `flush_interval_ms`,
-`minimum_free_space_gb`, `microphone_device_id`, `config_version`). It is written into a
-local artifact, so it never contains secret material.
+started with: `data_root`, `mode`, `chunk_seconds`, `buffer_seconds`, `flush_interval_ms`,
+`device_recovery_seconds`, `minimum_free_space_gb`, `microphone_device_id`, `config_version`,
+and — for an online session — a nested `online` object with `microphone_device_id`,
+`loopback_mode`, `render_device_id` and `process_name`. The key order is the order
+`CaptureConfigSnapshot.ToJson` writes; every key is additive, so a reader written against an
+older session still finds the keys it knows. It is written into a local artifact, so it never
+contains secret material.
 
 ## 2. Session directory
 

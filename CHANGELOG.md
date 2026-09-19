@@ -35,17 +35,33 @@ milestones are described as the former, never the latter
   described as lost. The measured outage is now applied when the track ends and written as an
   explicit `capture.gap` with `reason = "not_captured"`
   (`CaptureTimeline.RecordTerminalDeviceLoss`, `docs/RELIABILITY.md` section 8.2). The same
-  accounting now covers a second case: an endpoint that *did* return, where the session was
-  stopped before the reopened endpoint delivered a single buffer. That outage was measured but
-  never placed either, and it is no less real.
+  accounting now covers the two other ways a session can end with the outage still unplaced: an
+  endpoint that *did* return, where the session was stopped before the reopened endpoint
+  delivered a single buffer, and a session stopped while the endpoint was still gone with
+  recovery time left in its window. Both outages were measured and neither was placed, and both
+  are no less real than the unrecoverable one.
+- **A terminal gap no longer states the wrong reason why its audio is missing**
+  ([#34](https://github.com/lybym/MeetCap/issues/34)). Every terminal `capture.gap` carries the
+  same interval and the same `reason = "not_captured"`, so its `detail` is the only field that
+  says *why* the audio after the outage is gone. That wording was keyed on whether the endpoint
+  had reopened, so a track that ended because the endpoint came back at a format the session
+  refuses to splice claimed instead that "the session stopped before the reopened endpoint
+  delivered a buffer" — directly contradicting the `capture.format_changed` event and the
+  `end_reason = "device_format_changed"` written beside it. The cause is now recorded with the
+  handoff on the capture thread (`CaptureTrack.TerminalDeviceLossCause`) and each terminal path
+  has its own truthful sentence, asserted by a regression test per path
+  (`docs/RELIABILITY.md` section 8.2).
 - **A very long recovery window no longer silently buys no recovery at all**
   ([#34](https://github.com/lybym/MeetCap/issues/34)). The attempt budget derived from
   `capture.device_recovery_seconds` multiplied seconds by milliseconds in `int`, which overflows
   above 2,147,483 seconds: the wrapped negative count was clamped to zero by both consumers, so a
   window long enough to overflow produced no retries rather than many — the configured policy
   inverted, which is the failure this release exists to remove. The derivation now multiplies in
-  `long` and saturates at `int.MaxValue`, so every window validation accepts buys at least as many
-  attempts as any shorter one (`CaptureService.RecoveryAttemptsFor`,
+  `long` and narrows with a checked conversion, so every window validation accepts buys at least
+  as many attempts as any shorter one. The longest window an `int` can carry is also the exact
+  boundary — `int.MaxValue` seconds is `int.MaxValue` attempts — so there is no saturation clamp
+  to advertise; a longer window than any `int` can express throws rather than wrapping negative,
+  which is unreachable from configuration (`CaptureService.RecoveryAttemptsFor`,
   `docs/CONFIGURATION.md` section 6).
 - **Windows process loopback no longer reports a false discontinuity for every buffer**
   ([#33](https://github.com/lybym/MeetCap/issues/33)). Process loopback captures a process tree

@@ -128,14 +128,16 @@ A track that never placed a buffer reports no terminal gap. There is no span of 
 for anything to be missing from, and inventing one would overstate the loss in exactly the
 direction a reader cannot check.
 
-The same accounting covers the case where the endpoint *did* come back: if the session is stopped
-after the track reopened its endpoint but before that endpoint delivered a single buffer, there is
-still no next buffer to place the measured outage, so it is recorded the same way and with the
-same `reason = "not_captured"`. The reported interval and reason are identical to the unrecoverable
-case; only the event's `detail` distinguishes "the device never came back" from "the recording
-stopped first". The track is degraded either way — a device loss degrades it, whether or not it
-recovers — and the reported gap accounts for the audio that is missing from the span it did
-capture.
+The same accounting covers a session that is stopped with the outage still unplaced. There are two
+shapes of that: the endpoint never came back and the operator stopped with the recovery window
+still open, and the endpoint *did* come back but the session was stopped before the reopened
+endpoint delivered a single buffer — so there is still no next buffer to place the measured
+outage. Both are recorded the same way as the unrecoverable case, with the same interval and the
+same `reason = "not_captured"`. The reported interval and reason are identical across all three
+terminal cases; only the event's `detail` distinguishes "the device never came back" from "the
+recording was stopped first" from "the endpoint returned at a format the session refused to
+splice". The track is degraded whenever its device was lost, whether or not it recovered, and the
+reported gap accounts for the audio that is missing from the span it did capture.
 
 ## 9. Network loss
 

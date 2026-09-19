@@ -132,7 +132,10 @@ internal sealed class FakeCaptureSource : IAudioCaptureSource
     /// <summary>Pushes one packet as if the device had delivered it.</summary>
     public void Emit(AudioPacket packet) => PacketAvailable?.Invoke(packet);
 
-    /// <summary>Simulates the device disappearing.</summary>
+    /// <summary>
+    /// Simulates the device disappearing. Raises the event on the calling thread, so it returns
+    /// as soon as the capture loop has been signalled — not once the loop has acted on it.
+    /// </summary>
     public void Fail(Exception error) => Stopped?.Invoke(this, new CaptureStoppedEventArgs(error));
 
     /// <summary>Simulates capture ending without an error.</summary>

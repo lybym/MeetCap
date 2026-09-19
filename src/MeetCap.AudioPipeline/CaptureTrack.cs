@@ -72,6 +72,56 @@ internal sealed class CaptureTrack : IDisposable
     /// <summary>Rate limit for repeated stalled-consumer events.</summary>
     internal const int ConsumerStallEventIntervalMs = 1_000;
 
+    /// <summary>
+    /// The end reason a track records when the endpoint returned at a format the session
+    /// refuses to splice into the audio it already captured. Named once because the capture
+    /// path writes it and the terminal-gap wording reads it back
+    /// (docs/RELIABILITY.md section 8).
+    /// </summary>
+    internal const string FormatChangedEndReason = "device_format_changed";
+
+    /// <summary>
+    /// The end reason a track records when its recovery window closed with the endpoint still
+    /// gone (docs/RELIABILITY.md section 8.1).
+    /// </summary>
+    internal const string DeviceLostEndReason = "device_lost";
+
+    /// <summary>
+    /// Why a track is handing an unplaced outage to its consumer, which is what decides how
+    /// that outage is worded in the durable log.
+    /// </summary>
+    /// <remarks>
+    /// The interval and the reason of the resulting <c>capture.gap</c> are the same for every
+    /// value; only the <c>detail</c> differs, and it is the one field that has to be true
+    /// about <em>why</em> the audio after the outage is missing (docs/RELIABILITY.md
+    /// section 8.2).
+    /// </remarks>
+    private enum TerminalDeviceLossCause
+    {
+        /// <summary>No outage is pending: nothing to account for.</summary>
+        None = 0,
+
+        /// <summary>
+        /// The recovery window closed with the endpoint still gone, so the track ended
+        /// fatally (<c>end_reason = "device_lost"</c>).
+        /// </summary>
+        RecoveryWindowClosed = 1,
+
+        /// <summary>
+        /// The session ended while the measured outage was still unplaced and the track had
+        /// recovery time left: either the reopened endpoint never delivered a buffer, or the
+        /// stop landed inside the retry loop itself.
+        /// </summary>
+        SessionStopped = 2,
+
+        /// <summary>
+        /// The endpoint came back at a format the session refuses to splice into the audio it
+        /// already captured, so the track ended (<c>end_reason = "device_format_changed"</c>)
+        /// while the measured outage was still unplaced.
+        /// </summary>
+        FormatChanged = 3,
+    }
+
     private readonly SessionPaths _paths;
     private readonly CaptureSettings _settings;
     private readonly CapturePlatform _platform;
@@ -91,6 +141,12 @@ internal sealed class CaptureTrack : IDisposable
     /// Test seam: awaited after a device loss and before each reopen attempt, so a test can
     /// date a whole outage deterministically. Production passes <c>null</c>.
     /// </summary>
+    /// <remarks>
+    /// Built per track rather than installed once for the session, because a seam that were
+    /// shared could only ever hold the first track that reached it: a dual-track test that
+    /// needs <em>both</em> outages dated would then be racing the tracks against one another
+    /// instead of synchronising with them (docs/DEVELOPMENT.md section 6).
+    /// </remarks>
     private readonly Func<CancellationToken, Task>? _beforeReopenAttempt;
 
     private Action<AudioPacket>? _packetHandler;
@@ -107,8 +163,20 @@ internal sealed class CaptureTrack : IDisposable
     private Exception? _segmentFault;
 
     private int _deviceRestarted;
-    private int _deviceRecovered;
+
+    /// <summary>
+    /// The unplaced outage waiting for the consumer to account for, encoded as the
+    /// <see cref="TerminalDeviceLossCause"/> it has to be worded by, or
+    /// <see cref="TerminalDeviceLossCause.None"/> when there is none.
+    /// </summary>
+    /// <remarks>
+    /// The cause travels with the flag rather than being re-derived on the consumer side,
+    /// because the reason this track ended is the only thing that can truthfully word the
+    /// outage and the capture thread is the only place that knows it at the moment the
+    /// track ends (docs/RELIABILITY.md section 8.2).
+    /// </remarks>
     private int _terminalDeviceLoss;
+
     private int _flushRequested;
     private int _overflowSignalled;
     private int _timelineUnusable;
@@ -138,7 +206,7 @@ internal sealed class CaptureTrack : IDisposable
         Action? afterPacketWritten,
         Action<ClosedAudioChunk> onChunkClosed,
         Action<Exception> onStorageFailure,
-        Func<CancellationToken, Task>? beforeReopenAttempt = null)
+        Func<AudioSource, Func<CancellationToken, Task>>? beforeReopenAttempt = null)
     {
         _paths = paths ?? throw new ArgumentNullException(nameof(paths));
         _settings = settings ?? throw new ArgumentNullException(nameof(settings));
@@ -154,7 +222,10 @@ internal sealed class CaptureTrack : IDisposable
         _afterPacketWritten = afterPacketWritten;
         _onChunkClosed = onChunkClosed ?? throw new ArgumentNullException(nameof(onChunkClosed));
         _onStorageFailure = onStorageFailure ?? throw new ArgumentNullException(nameof(onStorageFailure));
-        _beforeReopenAttempt = beforeReopenAttempt;
+
+        // The seam is built for this track's own source, so a dual-track test can hold each
+        // track's first recovery attempt independently (docs/DEVELOPMENT.md section 6).
+        _beforeReopenAttempt = beforeReopenAttempt?.Invoke(source);
     }
 
     public AudioSource Source => _source;
@@ -311,7 +382,7 @@ internal sealed class CaptureTrack : IDisposable
                 // for that case either (docs/RELIABILITY.md section 8.2).
                 if (Volatile.Read(ref _pendingGapMs) > 0)
                 {
-                    Interlocked.Exchange(ref _terminalDeviceLoss, 1);
+                    Interlocked.Exchange(ref _terminalDeviceLoss, (int)TerminalDeviceLossCause.SessionStopped);
                 }
 
                 return;
@@ -345,7 +416,7 @@ internal sealed class CaptureTrack : IDisposable
             if (exhausted)
             {
                 WriteDeviceLostFatal(attempts);
-                EndTrack("device_lost");
+                EndTrack(DeviceLostEndReason);
                 CompleteWriter();
                 return;
             }
@@ -361,7 +432,7 @@ internal sealed class CaptureTrack : IDisposable
             {
                 WriteFormatChangedFatal(_format!, replacement.Format);
                 replacement.Dispose();
-                EndTrack("device_format_changed");
+                EndTrack(FormatChangedEndReason);
                 CompleteWriter();
                 return;
             }
@@ -553,7 +624,7 @@ internal sealed class CaptureTrack : IDisposable
             {
                 // Test seam only: it parks a test's clock control between the outage's start and
                 // its measurement, which is the one window the recovery path cannot otherwise be
-                // dated from outside (docs/DEVELOPMENT.md section 7).
+                // dated from outside (docs/DEVELOPMENT.md section 6).
                 await seam(cancellationToken).ConfigureAwait(false);
             }
 
@@ -562,6 +633,14 @@ internal sealed class CaptureTrack : IDisposable
             {
                 if (cancellationToken.IsCancellationRequested)
                 {
+                    // The session ended while the endpoint was still gone and the window was
+                    // still open. The outage measured up to this moment is real missing audio on
+                    // a span this track did capture, and no attempt will ever place it, so it is
+                    // handed to the consumer exactly as an exhausted window's is. Leaving it out
+                    // would report gap_count: 0 for a stretch the log itself describes with
+                    // capture.device_lost and one capture.discontinuity per failed retry
+                    // (issue #34 Acceptance Criterion 4, docs/RELIABILITY.md section 8.2).
+                    HandOverUnplacedOutage(downtimeStart);
                     return (null, attempts, false);
                 }
 
@@ -571,6 +650,10 @@ internal sealed class CaptureTrack : IDisposable
             if (cancellationToken.IsCancellationRequested)
             {
                 replacement.Dispose();
+
+                // The endpoint did come back, but the session ended before this attempt could
+                // hand it to the capture loop, so the measured outage is unplaced here too.
+                HandOverUnplacedOutage(downtimeStart);
                 return (null, attempts, false);
             }
 
@@ -580,10 +663,6 @@ internal sealed class CaptureTrack : IDisposable
             // Signals the consumer that the next buffer starts a fresh device stream, so
             // it must close the audio captured before the outage.
             Interlocked.Exchange(ref _deviceRestarted, 1);
-
-            // The endpoint did come back, which decides how a pending outage is worded if the
-            // session instead ends before the reopened endpoint delivers a buffer.
-            Interlocked.Exchange(ref _deviceRecovered, 1);
 
             _events.Write(new SessionEvent(SessionEventNames.CaptureDeviceRestored, CurrentTimelineMs())
             {
@@ -599,7 +678,6 @@ internal sealed class CaptureTrack : IDisposable
         // retrying is real missing audio even though no buffer will ever place it, so it is
         // carried to the consumer — which owns the timeline — instead of vanishing with the
         // track (docs/RELIABILITY.md section 8.2).
-        Interlocked.Exchange(ref _deviceRecovered, 0);
         Interlocked.Add(ref _pendingGapMs, MeasuredDowntime(downtimeStart));
         return (null, attempts, true);
     }
@@ -697,6 +775,11 @@ internal sealed class CaptureTrack : IDisposable
     /// ending the session: the other track may still be healthy
     /// (docs/RELIABILITY.md section 8).
     /// </summary>
+    /// <param name="reason">
+    /// The terminal end reason written to the session record. It also decides how this
+    /// track's unplaced outage is worded, because it is the only account of why the track
+    /// ended (docs/RELIABILITY.md section 8.2).
+    /// </param>
     private void EndTrack(string reason)
     {
         _degraded = true;
@@ -705,8 +788,14 @@ internal sealed class CaptureTrack : IDisposable
         // The track is ending, so no further buffer can place a measured outage on the
         // timeline. The flag hands whatever was measured to the consumer, which is the only
         // thread that writes the timeline, so the outage is counted exactly once instead of
-        // being lost (docs/RELIABILITY.md section 7).
-        Interlocked.Exchange(ref _terminalDeviceLoss, 1);
+        // being lost (docs/RELIABILITY.md section 7). The cause travels with it: a window that
+        // closed and a format the session refused are both terminal, but they are not the same
+        // statement and must not be worded as one.
+        Interlocked.Exchange(
+            ref _terminalDeviceLoss,
+            (int)(string.Equals(reason, FormatChangedEndReason, StringComparison.Ordinal)
+                ? TerminalDeviceLossCause.FormatChanged
+                : TerminalDeviceLossCause.RecoveryWindowClosed));
     }
 
     /// <summary>
@@ -722,12 +811,15 @@ internal sealed class CaptureTrack : IDisposable
     /// consumer's own <c>Observe</c> calls.
     /// </para>
     /// <para>
-    /// Two situations reach here with an outage that was measured but never placed: the recovery
-    /// window closed with the endpoint still gone and the track ended fatally, or the track
-    /// successfully reopened the endpoint and the session then stopped before that endpoint
-    /// delivered a single buffer. Both are real missing audio on a span this track did capture, so
-    /// both are reported; they differ only in the wording of the reason (docs/RELIABILITY.md
-    /// section 8.2).
+    /// Three situations reach here with an outage that was measured but never placed: the
+    /// recovery window closed with the endpoint still gone and the track ended fatally, the
+    /// track successfully reopened the endpoint and the session then stopped before that
+    /// endpoint delivered a single buffer, and the endpoint came back at a format the session
+    /// refused to splice. All three are real missing audio on a span this track did capture, so
+    /// all three are reported; they share an interval and a reason and differ only in the
+    /// wording of the <c>detail</c>, which is taken from the cause the capture thread recorded
+    /// when the track ended rather than from anything inferred after the fact
+    /// (docs/RELIABILITY.md section 8.2).
     /// </para>
     /// <para>
     /// A track that placed no buffer reports no gap: there is no span of captured audio for
@@ -737,12 +829,12 @@ internal sealed class CaptureTrack : IDisposable
     /// </remarks>
     private void ApplyTerminalDeviceLoss()
     {
-        if (Interlocked.Exchange(ref _terminalDeviceLoss, 0) == 0)
+        var cause = (TerminalDeviceLossCause)Interlocked.Exchange(ref _terminalDeviceLoss, 0);
+        if (cause == TerminalDeviceLossCause.None)
         {
             return;
         }
 
-        var recovered = Interlocked.Exchange(ref _deviceRecovered, 0) == 1;
         var pending = Interlocked.Exchange(ref _pendingGapMs, 0);
         var gap = _timeline?.RecordTerminalDeviceLoss(pending);
         if (gap is not { } terminal)
@@ -757,16 +849,53 @@ internal sealed class CaptureTrack : IDisposable
             GapEndMs = terminal.GapEndMs,
             GapMs = terminal.GapMs,
             Reason = AudioGapReasons.NotCaptured,
-            Detail = recovered
-                ? "the configured capture device returned and the track reopened it, but the session " +
-                  "stopped before the reopened endpoint delivered a buffer, so this stretch of the " +
-                  "track's timeline has no captured audio. The outage is what was measured while " +
-                  "retrying, not an estimate of what the rest of the session would have captured."
-                : "the configured capture device did not return within the recovery window, so this " +
-                  "stretch of the track's timeline has no captured audio. The track ends here; the " +
-                  "outage is what was measured while retrying, not an estimate of what a successful " +
-                  "recovery would have captured.",
+            Detail = TerminalDeviceLossDetail(cause),
         });
+    }
+
+    /// <summary>
+    /// The one statement that is true about why this track's unplaced outage is missing audio.
+    /// </summary>
+    /// <remarks>
+    /// Every branch says the same thing about the measurement — the outage is what was measured
+    /// while retrying, not an estimate of what the rest of the session would have captured — and
+    /// differs only in the cause, which is the field a reader uses to tell the terminal cases
+    /// apart (docs/RELIABILITY.md section 8.2).
+    /// </remarks>
+    private string TerminalDeviceLossDetail(TerminalDeviceLossCause cause)
+        => cause switch
+        {
+            TerminalDeviceLossCause.FormatChanged =>
+                "the capture endpoint returned but at a different format, so the track ended instead of " +
+                "splicing audio the session cannot place into what it already captured; this stretch of the " +
+                "track's timeline has no captured audio. The outage is what was measured while retrying, not " +
+                "an estimate of what a successful recovery would have captured.",
+
+            TerminalDeviceLossCause.SessionStopped =>
+                "the recording was stopped while this track was still recovering its capture device, with " +
+                "recovery time left in its window, so this stretch of the track's timeline has no captured " +
+                "audio. The outage is what was measured while retrying, not an estimate of what the rest of " +
+                "the session would have captured.",
+
+            _ =>
+                "the capture device did not return within the recovery window, so this stretch of the track's " +
+                "timeline has no captured audio. The track ends here; the outage is what was measured while " +
+                "retrying, not an estimate of what a successful recovery would have captured.",
+        };
+
+    /// <summary>
+    /// Measures the outage a cancelled recovery spent and hands it to the consumer, which owns the
+    /// timeline and is the only thread that can record it.
+    /// </summary>
+    /// <remarks>
+    /// The measurement and the handoff belong together: an outage that is measured but not handed
+    /// over is an outage the session reports as <c>gap_count: 0</c>, which is the defect this
+    /// exists to remove (docs/RELIABILITY.md section 8.2).
+    /// </remarks>
+    private void HandOverUnplacedOutage(DateTimeOffset downtimeStart)
+    {
+        Interlocked.Add(ref _pendingGapMs, MeasuredDowntime(downtimeStart));
+        Interlocked.Exchange(ref _terminalDeviceLoss, (int)TerminalDeviceLossCause.SessionStopped);
     }
 
     /// <summary>
@@ -909,8 +1038,8 @@ internal sealed class CaptureTrack : IDisposable
         if (restarted)
         {
             // The outage this track measured has now been placed by the first buffer of the
-            // restarted stream, so a later stop must not report it again as a terminal gap.
-            Interlocked.Exchange(ref _deviceRecovered, 0);
+            // restarted stream, and the pending measurement is consumed here, so a later stop
+            // cannot report it again as a terminal gap.
             _timeline!.RecordDeviceLoss(pendingGap);
         }
 

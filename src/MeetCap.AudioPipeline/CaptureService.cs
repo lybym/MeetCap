@@ -132,12 +132,22 @@ public sealed class CaptureService
     /// decreases as the window grows.
     /// </para>
     /// <para>
-    /// A window so long that the attempt count exceeds <see cref="int.MaxValue"/> is saturated
-    /// there rather than wrapped or thrown. The count is a loop bound, not an operator-visible
-    /// number, and saturating keeps the promise the window makes — more window never buys fewer
-    /// retries — while the count stays the finite bound the loop needs.
+    /// The narrowing itself is checked rather than clamped. A window of
+    /// <see cref="int.MaxValue"/> seconds — the longest one an <see cref="int"/> can carry, and
+    /// the longest this overload can be given — yields exactly
+    /// <see cref="int.MaxValue"/> attempts, so the checked conversion succeeds for every value
+    /// reachable from configuration and the boundary is exact rather than approximate. A longer
+    /// window, which only a caller handing this overload a <see cref="long"/> could express,
+    /// has no representable attempt count; it throws instead of silently wrapping to a negative
+    /// budget, which is the one failure mode the derivation exists to prevent
+    /// (docs/CONFIGURATION.md section 6).
     /// </para>
     /// </remarks>
+    /// <exception cref="OverflowException">
+    /// The window's attempt count exceeds <see cref="int.MaxValue"/> and so cannot be expressed
+    /// as a loop bound. Unreachable from configuration: validation's window is an
+    /// <see cref="int"/> and its longest value is exactly representable.
+    /// </exception>
     internal static int RecoveryAttemptsFor(int deviceRecoverySeconds)
         => RecoveryAttemptsFor((long)deviceRecoverySeconds);
 
@@ -145,7 +155,11 @@ public sealed class CaptureService
     internal static int RecoveryAttemptsFor(long deviceRecoverySeconds)
     {
         var attempts = Math.Max(0L, deviceRecoverySeconds) * 1_000L / CaptureTrack.DeviceRecoveryBackoffMs;
-        return (int)Math.Min(int.MaxValue, attempts);
+
+        // Not Math.Min: a clamp here could never fire for any window an int can express, so it
+        // would advertise a bound the derivation does not have. Checked narrowing is the guard
+        // that is actually true of the arithmetic (docs/CONFIGURATION.md section 6).
+        return checked((int)attempts);
     }
 
     public CaptureSettings Settings => _settings;
