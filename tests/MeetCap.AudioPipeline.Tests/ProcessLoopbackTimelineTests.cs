@@ -218,6 +218,243 @@ public class ProcessLoopbackTimelineTests
         Assert.Empty(Directory.GetFiles(paths.AudioDirectory(AudioSource.Loopback), "*.part"));
     }
 
+    [Fact]
+    public async Task ProcessLoopbackTrack_UnusableOnTheVeryFirstBuffer_StillNamesTheReasonAndOpensNoChunk()
+    {
+        // The other half of the unusable-timeline case: the diagnostic must survive a track
+        // that never placed a single buffer. Nothing was captured on this track, so it has to
+        // be able to say why without a chunk, an error log or a session that hung waiting for
+        // audio that could never come (docs/RELIABILITY.md sections 7 and 8).
+        using var harness = OnlineProcessLoopbackHarness();
+        var micSource = MicSource(harness);
+        var loopbackSource = ProcessLoopbackSource(harness);
+
+        var session = harness.Service.PrepareSession("Process Loopback Unusable First");
+        var paths = new SessionPaths(harness.DataRoot, session.SessionId);
+
+        using var cancellation = new CancellationTokenSource();
+        var run = session.RunAsync(cancellation.Token);
+
+        Assert.True(await Wait.UntilAsync(() => micSource.StartCount == 1 && loopbackSource.StartCount == 1),
+            "both tracks did not start");
+
+        // No placeable audio at all: the stream reports neither a device position nor a QPC
+        // timestamp from its first buffer on.
+        loopbackSource.Emit(TestAudio.PacketWithoutAnyTiming(Format, TestAudio.TenMsFrames, AudioSource.Loopback));
+
+        Assert.True(
+            await Wait.UntilAsync(() => EventsNamed(paths, SessionEventNames.CaptureTimelineUnusable).Count > 0),
+            "the process-loopback track did not report its unusable timeline");
+
+        // The other track keeps recording, which is what makes this a per-track failure.
+        TestAudio.EmitSeconds(micSource, Format, 0, milliseconds: 60_000);
+        cancellation.Cancel();
+
+        var outcome = await Finish(run);
+
+        Assert.True(outcome.Degraded);
+
+        var manifest = ReadManifest(paths);
+        var loopbackHealth = manifest.TrackHealth.Single(h => h.Source == AudioSources.Loopback);
+        var micHealth = manifest.TrackHealth.Single(h => h.Source == AudioSources.Mic);
+
+        // The reason is durable even though this track closed nothing at all.
+        Assert.True(loopbackHealth.Degraded);
+        Assert.Equal("timeline_unusable", loopbackHealth.EndReason);
+        Assert.Equal(0, loopbackHealth.ChunksClosed);
+        Assert.False(micHealth.Degraded);
+
+        // Exactly one statement, and it is the actionable one.
+        var unusable = Assert.Single(EventsNamed(paths, SessionEventNames.CaptureTimelineUnusable));
+        Assert.Equal(AudioSources.Loopback, unusable.Source);
+        Assert.Contains("QPC", unusable.Detail, StringComparison.Ordinal);
+
+        // No chunk was ever opened, so nothing half-written was left behind for recovery to
+        // find: no index row, no .part and no finalized file.
+        Assert.DoesNotContain(
+            harness.Database.Chunks.ListForSession(session.SessionId),
+            c => c.Source == AudioSource.Loopback);
+        Assert.Empty(Directory.GetFiles(paths.AudioDirectory(AudioSource.Loopback), "*.part"));
+        Assert.Empty(Directory.GetFiles(paths.AudioDirectory(AudioSource.Loopback), "*.wav"));
+    }
+
+    [Fact]
+    public async Task ProcessLoopbackTrack_ASecondUnusableBurst_IsStillOnlyOneEvent()
+    {
+        // "Once per track" has to hold across separate bursts, not just within the first one:
+        // the guard is a terminal state of the track, so a later packet that cannot be placed
+        // must not restate the diagnostic (docs/RELIABILITY.md section 8).
+        using var harness = OnlineProcessLoopbackHarness();
+        var micSource = MicSource(harness);
+        var loopbackSource = ProcessLoopbackSource(harness);
+
+        var session = harness.Service.PrepareSession("Process Loopback Repeated Unusable");
+        var paths = new SessionPaths(harness.DataRoot, session.SessionId);
+
+        using var cancellation = new CancellationTokenSource();
+        var run = session.RunAsync(cancellation.Token);
+
+        Assert.True(await Wait.UntilAsync(() => micSource.StartCount == 1 && loopbackSource.StartCount == 1),
+            "both tracks did not start");
+
+        TestAudio.EmitSecondsWithoutDevicePosition(loopbackSource, Format, 0, milliseconds: 1_000);
+        loopbackSource.Emit(TestAudio.PacketWithoutAnyTiming(Format, TestAudio.TenMsFrames, AudioSource.Loopback));
+
+        Assert.True(
+            await Wait.UntilAsync(() => EventsNamed(paths, SessionEventNames.CaptureTimelineUnusable).Count > 0),
+            "the process-loopback track did not report its unusable timeline");
+
+        // A later burst of unplaceable buffers, delivered after the track already ended.
+        for (var i = 0; i < 5; i++)
+        {
+            loopbackSource.Emit(TestAudio.PacketWithoutAnyTiming(Format, TestAudio.TenMsFrames, AudioSource.Loopback));
+        }
+
+        TestAudio.EmitSeconds(micSource, Format, 0, milliseconds: 60_000);
+        cancellation.Cancel();
+
+        var outcome = await Finish(run);
+
+        Assert.True(outcome.Degraded);
+        Assert.Single(EventsNamed(paths, SessionEventNames.CaptureTimelineUnusable));
+
+        var loopbackHealth = ReadManifest(paths).TrackHealth.Single(h => h.Source == AudioSources.Loopback);
+        Assert.Equal("timeline_unusable", loopbackHealth.EndReason);
+
+        // The audio placed before the failure stayed durable and was closed exactly once.
+        var closed = Assert.Single(
+            harness.Database.Chunks.ListForSession(session.SessionId),
+            c => c.Source == AudioSource.Loopback);
+        Assert.Equal(ChunkStates.Closed, closed.Status);
+        Assert.Equal(1_000, closed.EndMs);
+    }
+
+    [Fact]
+    public async Task ProcessLoopbackTrack_DeviceLossAndRecovery_ReportsTheOutageOnceAndStartsANewSegment()
+    {
+        // Issue #33's third expectation on a QPC-placed track, end to end: a real outage has to
+        // appear exactly once as a gap, the audio captured before it has to become durable on
+        // its own chunk, and the recovered stream has to stay on its declared clock instead of
+        // displacing the measured outage with the new stream's own reading
+        // (docs/RELIABILITY.md sections 7 and 8, docs/ARCHITECTURE.md section 8.1).
+        using var harness = OnlineProcessLoopbackHarness();
+        var micSource = MicSource(harness);
+        var firstLoopback = ProcessLoopbackSource(harness);
+
+        // The replacement stream, scripted like a real reopen: its own QPC starts from a fresh
+        // origin that says nothing about session time.
+        var reopened = new FakeCaptureSource(Format, harness.RenderDevice, AudioSource.Loopback)
+        {
+            Clock = CaptureClock.Qpc,
+        };
+        harness.Sources.EnqueueLoopback(reopened);
+
+        var session = harness.Service.PrepareSession("Process Loopback Device Loss");
+        var paths = new SessionPaths(harness.DataRoot, session.SessionId);
+
+        using var cancellation = new CancellationTokenSource();
+        var run = session.RunAsync(cancellation.Token);
+
+        Assert.True(await Wait.UntilAsync(() => micSource.StartCount == 1 && firstLoopback.StartCount == 1),
+            "both tracks did not start");
+
+        TestAudio.EmitSecondsWithoutDevicePosition(firstLoopback, Format, 0, milliseconds: 20_000);
+
+        // The outage is measured from the clock, and the track stamps its start when it notices
+        // the fault but reads it only once the endpoint is reopened. A clock advanced outside
+        // that window races the capture loop; advanced here it lands between the two, so the
+        // three-second outage is always observed. Without a measured outage there would be no
+        // gap to report at all.
+        harness.Sources.OnCreateLoopback = () => harness.Clock.Advance(TimeSpan.FromSeconds(3));
+        firstLoopback.Fail(new InvalidOperationException("loopback endpoint unplugged"));
+
+        Assert.True(
+            await Wait.UntilAsync(() => reopened.StartCount == 1, timeoutMs: 15_000),
+            "the loopback endpoint was not reopened");
+
+        // The reopened stream continues, but its own QPC sits far from where the outage ended.
+        TestAudio.EmitSecondsWithoutDevicePosition(
+            reopened, Format, 0, milliseconds: 20_000, qpcDeltaTicks: 900_000_000);
+
+        cancellation.Cancel();
+        var outcome = await Finish(run);
+
+        var loopbackEvents = EventsNamed(paths, SessionEventNames.CaptureGap, AudioSources.Loopback);
+
+        // One outage, one gap — not one per buffer of the reopened stream.
+        var gap = Assert.Single(loopbackEvents);
+        Assert.True(gap.GapMs > 0, "the measured outage was not reported as a gap");
+        Assert.NotNull(gap.GapStartMs);
+        Assert.NotNull(gap.GapEndMs);
+        Assert.Equal(gap.GapStartMs + gap.GapMs, gap.GapEndMs);
+
+        // No false discontinuity on either side of the outage.
+        Assert.Empty(EventsNamed(paths, SessionEventNames.CaptureDiscontinuity, AudioSources.Loopback));
+
+        // The audio captured before the outage is durable on its own chunk, and the recovered
+        // stream starts a new one — which is how the pre-outage audio survives an outage
+        // shorter than a chunk.
+        var loopbackChunks = harness.Database.Chunks.ListForSession(session.SessionId)
+            .Where(c => c.Source == AudioSource.Loopback).OrderBy(c => c.Sequence).ToList();
+
+        Assert.Equal(2, loopbackChunks.Count);
+        Assert.All(loopbackChunks, c => Assert.Equal(ChunkStates.Closed, c.Status));
+        Assert.Equal(0, loopbackChunks[0].StartMs);
+        Assert.True(loopbackChunks[0].EndMs >= 20_000);
+        Assert.Equal(loopbackChunks[0].EndMs + gap.GapMs, loopbackChunks[1].StartMs);
+
+        var loopbackHealth = ReadManifest(paths).TrackHealth.Single(h => h.Source == AudioSources.Loopback);
+        Assert.True(loopbackHealth.Degraded);
+        Assert.Equal(1, loopbackHealth.GapCount);
+        Assert.Equal(gap.GapMs, loopbackHealth.GapTotalMs);
+
+        // The microphone track is untouched by the loopback track's outage.
+        Assert.False(ReadManifest(paths).TrackHealth.Single(h => h.Source == AudioSources.Mic).Degraded);
+    }
+
+    [Fact]
+    public void ProcessLoopbackTrack_UnusableEndReasonSurvivesARecoveryRoundTrip()
+    {
+        // `timeline_unusable` is free-form text, so nothing but a test pins it. A session whose
+        // process-loopback track ended this way and was then found by startup recovery must
+        // still report the track's own end reason, or the honest label this change added would
+        // be lost exactly when a reader needs it (docs/DATA_MODEL.md sections 3 and 5).
+        using var workspace = new TempWorkspace(sessionStatus: SessionStatus.Recording);
+        var paths = workspace.Paths;
+
+        SessionManifestStore.Save(paths.ManifestPath, new SessionManifest
+        {
+            SessionId = paths.SessionId,
+            Title = "Interrupted process loopback",
+            Mode = SessionModes.Online,
+            SourceType = SessionSourceTypes.Live,
+            Status = SessionStatus.Recording,
+            ConfigVersion = 1,
+            Tracks = new[] { AudioSources.Mic, AudioSources.Loopback },
+            ChunkSeconds = 60,
+            Degraded = true,
+            TrackHealth = new[]
+            {
+                new TrackHealth(AudioSources.Mic, AudioBufferHealth.Empty, 0, 0, false, null, 1, 0),
+                new TrackHealth(AudioSources.Loopback, AudioBufferHealth.Empty, 0, 0, true, "timeline_unusable", 0, 0),
+            },
+        });
+
+        var report = new SessionRecoveryScanner(workspace.Database, new FakeClock()).Scan(workspace.DataRoot);
+
+        Assert.Equal(1, report.RecoveredSessions);
+        Assert.True(SessionManifestStore.TryLoad(paths.ManifestPath, out var manifest, out var error), error);
+
+        // Recovery rewrote the session's status, and the per-track reason is still there.
+        Assert.Equal(SessionStatus.Interrupted, manifest!.Status);
+        Assert.NotNull(manifest.RecoveredAt);
+
+        var loopbackHealth = manifest.TrackHealth.Single(h => h.Source == AudioSources.Loopback);
+        Assert.Equal("timeline_unusable", loopbackHealth.EndReason);
+        Assert.True(loopbackHealth.Degraded);
+        Assert.Null(manifest.TrackHealth.Single(h => h.Source == AudioSources.Mic).EndReason);
+    }
+
     /// <summary>
     /// An online harness whose configuration asks for process loopback
     /// (<c>capture.online.loopback_mode = "process"</c>, target <c>ffplay</c>) — the

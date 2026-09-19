@@ -407,8 +407,12 @@ Known limits of this milestone, stated rather than implied:
   that a process request is placed by QPC at all —
   `tests/MeetCap.WindowsAudio.Tests/NAudioLoopbackClockTests.cs`. The real-hardware
   confirmation of the underlying timing is the reproduction recorded in
-  docs/ARCHITECTURE.md section 8.1, not a soak run: `M1_WINDOWS_VALIDATION.md` section 13.5
-  is still not run.
+  docs/ARCHITECTURE.md section 8.1, plus the `M1_WINDOWS_VALIDATION.md` section 13.5
+  timeline rows run on real hardware against the fixed build with an actively playing
+  target process (section 14.1 of that document): stable process audio was not degraded,
+  and the QPC-placed chunks covered the whole session span. That is not a soak run, and it
+  is not the whole of section 13.5 — the real-drop row and the rows needing a real meeting
+  application are still not run.
 - **No echo-duplicate detection.** The same words can appear on both tracks (a local speaker
   picked up by the microphone and again by the loopback); the merger preserves both rather than
   deleting either, and marking probable echo duplicates is left to a later milestone

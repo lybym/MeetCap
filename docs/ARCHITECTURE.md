@@ -443,10 +443,11 @@ NAudio-provided timing metadata should be carried through the MeetCap abstractio
 Do not build the unified timeline only from wall-clock timestamps.
 
 A captured stream does not always provide every field above. When it does not, the
-unavailable field is absent rather than zero, and the timeline is placed by a field the
-stream *does* provide: the timing a track is built from is declared by the capture source
-(`IAudioCaptureSource.Clock`) instead of being inferred from the buffer values. See
-section 8.1.
+timeline is placed by a field the stream *does* provide, and which field that is is
+declared by the capture source (`IAudioCaptureSource.Clock`) instead of being inferred
+from the buffer values. A field the stream does not report is still carried, as the zero
+its own API returns for it, rather than discarded — the point is only that the timeline
+never guesses its clock from those values. See section 8.1.
 
 ### 8.1 Session timeline
 
@@ -463,12 +464,34 @@ qpc              the device's QPC timestamp in 100-ns units, when the stream has
                  position of its own
 ```
 
-A source that reports no position of its own reports **zero** for every buffer, not a
-missing value. Placing such a track by device position therefore reads as a backwards jump
-on every buffer after the first — one false `capture.discontinuity` per buffer, and a
-track wrongly reported degraded. That is why the clock is declared by the capture source
-and carried with the source's format into `CaptureTimeline`, and why nothing is inferred
-from the packet values at run time.
+On the verified Windows/NAudio environment (Windows 11 build 26200, Realtek render
+endpoint, NAudio 3.1), a source that reports no position of its own reports **zero** for
+every buffer, not a missing value, and Windows process loopback is such a source. Placing
+such a track by device position therefore reads as a backwards jump on every buffer after
+the first — one false `capture.discontinuity` per buffer, and a track wrongly reported
+degraded. That is why the clock is declared by the capture source and carried with the
+source's format into `CaptureTimeline`, and why nothing is inferred from the packet values
+at run time.
+
+That declaration is bound to the capture *mode*: a `process` loopback request is placed by
+QPC, and every other request by device position
+(`MeetCap.WindowsAudio.NAudioCaptureSourceFactory.LoopbackClock`). Two consequences are
+deliberate and worth stating rather than leaving to be rediscovered:
+
+- if a system-loopback or microphone endpoint ever reports a constant device position, that
+  track still gets one false discontinuity per buffer and reads as degraded, because no
+  device-position track is checked for a position that never advances. The mode-bound
+  declaration closes the process-loopback case, which is the one that was observed, not the
+  whole class;
+- if a future Windows/NAudio combination makes process loopback report a real advancing
+  device position, the track is still placed by QPC and its frame-exact placement is lost.
+  The declaration is version-independent by design, so this costs resolution, not
+  correctness — the two clocks are equivalent observers of the same device time.
+
+The wording above is scoped to the environment it was observed on
+(`docs/M1_WINDOWS_VALIDATION.md` section 13.5): "process loopback reports no device
+position" is a property of that capture path as verified here, not a documented guarantee
+of the platform.
 
 The two clocks are equivalent observers of the same device time. Both produce
 session-relative positions from device timing, both count a skipped stretch exactly once as

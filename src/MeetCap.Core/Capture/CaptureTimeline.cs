@@ -33,6 +33,11 @@ public readonly record struct PacketTiming(
     /// </summary>
     /// <remarks>
     /// <para>
+    /// Non-null exactly when <see cref="HasGap"/> holds: a forward step that rounds to a
+    /// zero-millisecond gap is not a hole this field names, so it stays <c>null</c> there
+    /// rather than describing an empty interval.
+    /// </para>
+    /// <para>
     /// Together with <see cref="GapEndMs"/> this is the gap's own interval — audio stopped
     /// at <see cref="GapStartMs"/> and resumed at <see cref="GapEndMs"/>. It is deliberately
     /// separate from <see cref="StartMs"/>, which is where <em>this buffer</em> begins.
@@ -280,6 +285,8 @@ public sealed class CaptureTimeline
             _nextExpectedFrames = packet.DevicePositionFrames + frames;
         }
 
+        var gapStart = GapIntervalStart(gap, gapStartMs);
+
         if (gap > 0)
         {
             GapTotalMs += gap;
@@ -288,8 +295,8 @@ public sealed class CaptureTimeline
 
         return new PacketTiming(targetMs, endMs, gap, flagged, false, SegmentRestart: true)
         {
-            GapStartMs = gap > 0 ? gapStartMs : null,
-            GapEndMs = gap > 0 ? targetMs : null,
+            GapStartMs = gapStart,
+            GapEndMs = gapStart is null ? null : targetMs,
         };
     }
 
@@ -350,6 +357,11 @@ public sealed class CaptureTimeline
         var endMs = startMs + durationMs;
         _lastEndMs = endMs;
 
+        // The interval is named only when the gap is a whole millisecond of missing audio, so a
+        // step that rounds to zero never leaves a zero-length hole behind
+        // (docs/DATA_MODEL.md section 4.1).
+        var gapStart = GapIntervalStart(placement.GapMs, placement.GapStartMs);
+
         if (placement.GapMs > 0)
         {
             GapTotalMs += placement.GapMs;
@@ -358,10 +370,36 @@ public sealed class CaptureTimeline
 
         return new PacketTiming(startMs, endMs, placement.GapMs, flagged, placement.Anomaly)
         {
-            GapStartMs = placement.GapStartMs,
-            GapEndMs = placement.GapStartMs is null ? null : startMs,
+            GapStartMs = gapStart,
+            GapEndMs = gapStart is null ? null : startMs,
         };
     }
+
+    /// <summary>
+    /// The gap interval's start, or <c>null</c> when there is no reportable gap.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A forward step smaller than a millisecond rounds to a zero-millisecond gap. Such a step
+    /// is real — the stream skipped that fraction of its own clock — but it is not reportable:
+    /// the session timeline, every other gap surface and the recovery gap audit are all
+    /// expressed in whole milliseconds, so a zero-millisecond gap is not a hole any of them can
+    /// name. Reporting one would leave <see cref="PacketTiming.GapStartMs"/> non-null while
+    /// <see cref="PacketTiming.GapMs"/> is 0, contradicting the documented invariant that the
+    /// interval is null when nothing is missing, and handing a future consumer that keys off
+    /// <see cref="PacketTiming.GapStartMs"/> a zero-length gap to read
+    /// (docs/DATA_MODEL.md section 4.1).
+    /// </para>
+    /// <para>
+    /// QPC integer-tick rounding makes this reachable on ordinary hardware, because a buffer
+    /// length is rarely a whole number of ticks. At 3000 Hz a 1000-frame buffer is 3,333,333.33
+    /// ticks, and the rounded per-buffer expectation falls one tick behind the stream's own
+    /// reading by the third buffer — a forward step of a single tick, far below the millisecond
+    /// this timeline measures holes in.
+    /// </para>
+    /// </remarks>
+    private static long? GapIntervalStart(long gapMs, long? gapStartMs)
+        => gapMs > 0 ? gapStartMs : null;
 
     /// <summary>
     /// Frames as QPC ticks, rounded to the nearest tick.

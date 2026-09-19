@@ -29,6 +29,14 @@ milestones are described as the former, never the latter
   by QPC, which reproduces the system-loopback baseline's timeline for the same audio
   (`docs/ARCHITECTURE.md` section 8.1). Session logs now record the clock per track in the
   `session.started` detail.
+- **A sub-millisecond forward step in a QPC-placed stream is no longer reported as a
+  zero-length gap** ([#33](https://github.com/lybym/MeetCap/issues/33)). A buffer length that is
+  not a whole number of QPC ticks leaves a rounding remainder, so the stream's own reading can sit
+  a few ticks — well under a millisecond — ahead of the continuation `CaptureTimeline` expected.
+  `PacketTiming.GapStartMs` / `GapEndMs` were populated from that step even though `GapMs` floored
+  to `0`, contradicting their own documented invariant and handing a consumer that keys off
+  `GapStartMs` a zero-length gap to read (`docs/DATA_MODEL.md` sections 4 and 4.1). The gap
+  interval is now populated only when `GapMs` measures a whole millisecond of missing audio.
 
 ### Added
 

@@ -433,9 +433,11 @@ machine with a render endpoint and, for the process row, a running meeting appli
 The process-loopback path uses NAudio's `WithProcessLoopback`, so a real Windows/NAudio
 environment is required to confirm it can target a meeting application's process tree
 (`docs/DEVELOPMENT.md` section 7). Section 13.5 additionally carries the process-loopback
-timeline rows added for issue #33; the timing behaviour behind them was reproduced on real
-hardware and is recorded in docs/ARCHITECTURE.md section 8.1, but the checklist itself is
-still unrun.
+timeline rows added for issue #33: two of them — stable process audio is not marked
+degraded, and the QPC-placed chunks cover the whole session span — were run on real
+hardware against the fixed build with an actively playing target process and passed
+(`docs/M1_WINDOWS_VALIDATION.md` section 14.1), with the remaining rows, including the
+real-drop row, still unrun. The rest of the checklist is still unrun.
 
 ---
 

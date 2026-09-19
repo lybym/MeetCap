@@ -438,6 +438,66 @@ public class CaptureTimelineTests
     }
 
     [Fact]
+    public void QpcClock_SubMillisecondForwardDrift_IsNotReportedAsAGap()
+    {
+        // A buffer length that is not a whole number of QPC ticks drifts by a sub-millisecond
+        // amount on every buffer: 1000 frames at 3000 Hz is 333,333.33 ticks, which rounds to
+        // 333,333. The stream's own reading then sits one tick — a ten-thousandth of a
+        // millisecond — ahead of the continuation the timeline expected. That is a real forward
+        // step, but it is far below the millisecond the timeline measures holes in, so it must
+        // not be dressed up as a gap: the interval would otherwise name an empty hole
+        // (docs/DATA_MODEL.md section 4.1).
+        var format = new AudioFormat(3_000, 1, 16, AudioSampleFormat.Pcm);
+        var timeline = new CaptureTimeline(format, CaptureClock.Qpc);
+
+        const int BufferFrames = 1_000; // 333,333.33 ticks => 333,333 rounded
+
+        timeline.Observe(Packet(format, devicePosition: 0, frames: BufferFrames, qpc: 0));
+
+        for (var buffer = 1; buffer <= 20; buffer++)
+        {
+            var timing = timeline.Observe(
+                Packet(format, devicePosition: 0, frames: BufferFrames, qpc: buffer * BufferFrames * 10_000_000L / format.SampleRate));
+
+            Assert.Equal(0, timing.GapMs);
+            Assert.False(timing.HasGap);
+            Assert.False(timing.IsIrregular);
+            Assert.Null(timing.GapStartMs);
+            Assert.Null(timing.GapEndMs);
+        }
+
+        // Twenty buffers of sub-millisecond rounding never turned into a claimed loss.
+        Assert.Equal(0, timeline.GapTotalMs);
+        Assert.Equal(0, timeline.GapCount);
+    }
+
+    [Fact]
+    public void GapInterval_IsPresentExactlyWhenTheGapIsReportable()
+    {
+        // The invariant behind the fix: GapStartMs/GapEndMs name a hole only when GapMs
+        // measures one. A zero-millisecond gap is not a hole any gap surface can express, so
+        // the interval is null there — a consumer keying off GapStartMs never sees a
+        // zero-length gap.
+        var timeline = new CaptureTimeline(Mono48k, CaptureClock.Qpc);
+
+        for (var i = 0; i < 5; i++)
+        {
+            var contiguous = timeline.Observe(ProcessLoopbackPacket(i * TenMs));
+            Assert.Equal(0, contiguous.GapMs);
+            Assert.Null(contiguous.GapStartMs);
+            Assert.Null(contiguous.GapEndMs);
+        }
+
+        // One full buffer of its own clock time missing: reportable, and named.
+        var reported = timeline.Observe(ProcessLoopbackPacket(6 * TenMs));
+
+        Assert.Equal(10, reported.GapMs);
+        Assert.True(reported.HasGap);
+        Assert.Equal(50, reported.GapStartMs);
+        Assert.Equal(60, reported.GapEndMs);
+    }
+
+    [Fact]
     public void QpcClock_WithoutAQpcTimestamp_FailsWithAnActionableDiagnostic()
     {
         // Issue #33's fourth expectation: an unsupported process-loopback environment must
@@ -502,10 +562,18 @@ public class CaptureTimelineTests
         int frames,
         long? qpc = null,
         AudioBufferFlags flags = AudioBufferFlags.None)
+        => Packet(Mono48k, devicePosition, frames, qpc, flags);
+
+    private static AudioPacket Packet(
+        AudioFormat format,
+        long devicePosition,
+        int frames,
+        long? qpc,
+        AudioBufferFlags flags = AudioBufferFlags.None)
         => new(
             AudioSource.Mic,
-            Mono48k,
-            new byte[frames * Mono48k.BlockAlign],
+            format,
+            new byte[frames * format.BlockAlign],
             devicePosition,
             qpc,
             DateTimeOffset.UnixEpoch,
