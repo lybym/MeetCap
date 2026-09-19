@@ -20,6 +20,15 @@ internal sealed class FakeAsrProvider : IAsrProvider
     /// <summary>Overrides polling. When null the queued results are used.</summary>
     public Func<AsrFileRequest, AsrPollResult>? OnPoll { get; set; }
 
+    /// <summary>
+    /// Overrides the release of a staged transport copy. The default reports that nothing was
+    /// staged, which is what a provider with an inline-only transport does.
+    /// </summary>
+    public Func<AsrJob, AsrAudioRelease>? OnRelease { get; set; }
+
+    /// <summary>Jobs whose staged copy this provider was asked to release, in order.</summary>
+    public List<AsrJob> Released { get; } = new();
+
     public void EnqueuePoll(params AsrPollResult[] results)
     {
         foreach (var result in results)
@@ -55,6 +64,12 @@ internal sealed class FakeAsrProvider : IAsrProvider
         }
 
         return Task.FromResult(_polls.Count > 0 ? _polls.Dequeue() : AsrPollResult.Pending());
+    }
+
+    public Task<AsrAudioRelease> ReleaseAudioAsync(AsrJob job, CancellationToken cancellationToken = default)
+    {
+        Released.Add(job);
+        return Task.FromResult(OnRelease is not null ? OnRelease(job) : AsrAudioRelease.NotNeeded);
     }
 }
 
@@ -143,6 +158,23 @@ internal sealed class InMemoryAsrJobStore : IAsrJobStore
         }
 
         _jobs[job.Id] = job;
+    }
+
+    public IReadOnlyList<AsrJob> ListCleanupPending(int limit, string? sessionId = null)
+    {
+        if (limit <= 0)
+        {
+            return Array.Empty<AsrJob>();
+        }
+
+        return _jobs.Values
+            .Where(j => j.TosCleanupPending)
+            .Where(j => AsrJobStatuses.IsTerminal(j.Status))
+            .Where(j => sessionId is null || j.SessionId == sessionId)
+            .OrderBy(j => j.CreatedAt)
+            .ThenBy(j => j.Id, StringComparer.Ordinal)
+            .Take(limit)
+            .ToArray();
     }
 
     public int CountByStatus(AsrJobStatus status) => _jobs.Values.Count(j => j.Status == status);

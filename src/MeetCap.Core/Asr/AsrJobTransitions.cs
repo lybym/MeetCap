@@ -76,6 +76,53 @@ public static class AsrJobTransitions
         };
     }
 
+    /// <summary>
+    /// Records the audio transport and the stable identity of any remote copy
+    /// (<c>docs/DATA_MODEL.md</c> section 6.2).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Called once the provider has published the audio, and before the submission is recorded
+    /// as accepted, so a process that dies between the publish and the terminal status still
+    /// knows which object it has to release.
+    /// </para>
+    /// <para>
+    /// The signed URL is deliberately not a parameter: it is usable as a credential, it expires,
+    /// and a restart can re-sign from the bucket and key instead. Only the stable, non-secret
+    /// identity is durable.
+    /// </para>
+    /// </remarks>
+    public static AsrJob RecordAudioTransport(AsrJob job, AsrPublishedAudio audio, DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(job);
+        ArgumentNullException.ThrowIfNull(audio);
+
+        return job with
+        {
+            AudioTransport = audio.Transport,
+            TosBucket = audio.Bucket,
+            TosObjectKey = audio.ObjectKey,
+            // Cleanup is owed only when a remote copy exists. An inline job never manufactures
+            // fake TOS state, and a re-publish of the same job does not forget debt it already
+            // owed.
+            TosCleanupPending = audio.HasRemoteCopy || job.TosCleanupPending,
+            UpdatedAt = now,
+        };
+    }
+
+    /// <summary>
+    /// Clears the durable cleanup debt once the staged copy is confirmed gone.
+    /// </summary>
+    /// <remarks>
+    /// The bucket and object key are deliberately kept: they are what identifies the object in
+    /// the audit trail, and they are not secrets.
+    /// </remarks>
+    public static AsrJob MarkAudioReleased(AsrJob job, DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(job);
+        return job with { TosCleanupPending = false, UpdatedAt = now };
+    }
+
     /// <summary>Records the sanitized request metadata path and moves to <c>submitted</c>.</summary>
     public static AsrJob MarkSubmitted(AsrJob job, string requestMetadataPath, DateTimeOffset now)
     {

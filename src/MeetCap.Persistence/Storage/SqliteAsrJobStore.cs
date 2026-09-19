@@ -136,8 +136,48 @@ public sealed class SqliteAsrJobStore : IAsrJobStore, IAsrQueueInspector
         return ReadAll(cmd);
     }
 
-    public void Update(AsrJob job)
+    public IReadOnlyList<AsrJob> ListCleanupPending(int limit, string? sessionId = null)
     {
+        if (limit <= 0)
+        {
+            return Array.Empty<AsrJob>();
+        }
+
+        using var conn = SqliteConnectionFactory.Open(_dbPath);
+        if (!SqliteConnectionFactory.TableExists(conn, "asr_jobs"))
+        {
+            return Array.Empty<AsrJob>();
+        }
+
+        // Only terminal jobs hold cleanup debt: a job that is still running may still need its
+        // object for another poll, so releasing it early would break the very request it exists
+        // for. `tos_cleanup_pending` is what the job row carries until the delete is confirmed.
+        var sql =
+            $"SELECT {SelectColumns} FROM asr_jobs " +
+            "WHERE tos_cleanup_pending = 1 " +
+            "AND status IN (@succeeded, @failed, @cancelled) ";
+
+        if (sessionId is not null)
+        {
+            sql += "AND session_id = @sessionId ";
+        }
+
+        sql += "ORDER BY created_at, id LIMIT @limit";
+
+        using var cmd = new SqliteCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@succeeded", AsrJobStatuses.ToWire(AsrJobStatus.Succeeded));
+        cmd.Parameters.AddWithValue("@failed", AsrJobStatuses.ToWire(AsrJobStatus.Failed));
+        cmd.Parameters.AddWithValue("@cancelled", AsrJobStatuses.ToWire(AsrJobStatus.Cancelled));
+        cmd.Parameters.AddWithValue("@limit", limit);
+        if (sessionId is not null)
+        {
+            cmd.Parameters.AddWithValue("@sessionId", sessionId);
+        }
+
+        return ReadAll(cmd);
+    }
+
+    public void Update(AsrJob job)    {
         ArgumentNullException.ThrowIfNull(job);
 
         using var conn = SqliteConnectionFactory.Open(_dbPath);

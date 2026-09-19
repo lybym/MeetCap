@@ -59,7 +59,22 @@ internal static class AsrCommand
             .RunDueAsync(maxJobs, sessionId, cancellationToken, ignoreRetrySchedule: force)
             .ConfigureAwait(false);
 
-        if (results.Count == 0 && recovered.Count == 0)
+        // Cleanup debt is finished here rather than inside the queue drain, because a terminal
+        // job that still owns a staged object is not work that makes a session unfinished. The
+        // debt is durable, so a delete that fails now is simply attempted again next time
+        // (docs/DATA_MODEL.md section 6.2).
+        var released = await stack.Processor
+            .CleanupDueAsync(maxJobs, sessionId, cancellationToken)
+            .ConfigureAwait(false);
+
+        foreach (var job in released)
+        {
+            context.Out.WriteLine(
+                $"{job.Id} released staged audio for transport {job.AudioTransport} " +
+                $"({job.TosBucket}/{job.TosObjectKey}).");
+        }
+
+        if (results.Count == 0 && recovered.Count == 0 && released.Count == 0)
         {
             context.Out.WriteLine(
                 sessionId is null

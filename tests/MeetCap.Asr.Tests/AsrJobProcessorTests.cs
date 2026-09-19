@@ -633,4 +633,305 @@ public class AsrJobProcessorTests : IDisposable
         Assert.True(File.Exists(Paths.RawTranscriptJsonl));
         Assert.False(File.Exists(Paths.LiveTranscriptMarkdown));
     }
+
+    [Fact]
+    public async Task Submit_PersistsTheTransportIdentityBeforeTheSubmissionIsAccepted()
+    {
+        // Issue #29 AC "bucket + object key are durable for crash recovery". The provider is the
+        // only component that knows what it published, so the processor has to take the identity
+        // from the submission and commit it with the job.
+        var job = CreateJob();
+        _provider.OnSubmit = request => Submission(request, TosAudio());
+        _provider.EnqueuePoll(Completed());
+
+        var result = await CreateProcessor().ProcessAsync(job);
+
+        Assert.Equal(AsrJobOutcome.Succeeded, result.Outcome);
+
+        // Asserted on the store rather than on the returned job: what survives a crash is the row.
+        var stored = _jobs.Get("job_1")!;
+        Assert.Equal("tos", stored.AudioTransport);
+        Assert.Equal("meetcap-asr", stored.TosBucket);
+        Assert.Equal("meetcap-asr/abc/2026/09/19/job_1.wav", stored.TosObjectKey);
+    }
+
+    [Fact]
+    public async Task Submit_AnInlineJobNeverManufacturesTosState()
+    {
+        var job = CreateJob();
+        _provider.OnSubmit = request => Submission(
+            request,
+            new AsrPublishedAudio { Transport = AsrTransports.Inline, InlineBase64 = "AAAA", Bytes = 4 });
+        _provider.EnqueuePoll(Completed());
+
+        await CreateProcessor().ProcessAsync(job);
+
+        var stored = _jobs.Get("job_1")!;
+        Assert.Equal("inline", stored.AudioTransport);
+        Assert.Null(stored.TosBucket);
+        Assert.Null(stored.TosObjectKey);
+        Assert.False(stored.TosCleanupPending);
+    }
+
+    [Fact]
+    public async Task Submit_NeverPersistsTheSignedUrlAnywhereDurable()
+    {
+        // AC: signed URLs are never persisted. The URL is asserted absent from the job row and
+        // from the sanitized request artifact, which are the two durable records of a submit.
+        var job = CreateJob();
+        var signed = TosAudio();
+        _provider.OnSubmit = request => new AsrSubmission
+        {
+            ProviderRequestId = request.ProviderRequestId,
+            SanitizedRequestJson = "{\"job_id\":\"" + request.JobId + "\",\"transport\":\"tos\"}",
+            Audio = signed,
+        };
+        _provider.EnqueuePoll(Completed());
+
+        await CreateProcessor().ProcessAsync(job);
+
+        var stored = _jobs.Get("job_1")!;
+        var requestJson = File.ReadAllText(stored.RequestMetadataPath!);
+        foreach (var text in new[] { stored.TosObjectKey!, stored.TosBucket!, requestJson })
+        {
+            Assert.DoesNotContain("X-Tos-Signature", text, StringComparison.Ordinal);
+            Assert.DoesNotContain(signed.Url!, text, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public async Task Success_ReleasesTheStagedObjectAndKeepsTheLocalArtifact()
+    {
+        // AC: terminal jobs attempt idempotent DeleteObject cleanup, and the local artifact is
+        // never the thing that gets deleted.
+        var job = CreateJob();
+        var input = Paths.ResolveRelative(job.InputArtifact);
+        _provider.OnSubmit = request => Submission(request, TosAudio());
+        _provider.OnRelease = _ => AsrAudioRelease.Succeeded;
+        _provider.EnqueuePoll(Completed());
+
+        var result = await CreateProcessor().ProcessAsync(job);
+
+        Assert.Equal(AsrJobOutcome.Succeeded, result.Outcome);
+        var released = Assert.Single(_provider.Released);
+        Assert.Equal("meetcap-asr/abc/2026/09/19/job_1.wav", released.TosObjectKey);
+        Assert.False(_jobs.Get("job_1")!.TosCleanupPending);
+        Assert.Contains(SessionEvents.AsrAudioReleased, _artifacts.Events);
+
+        // The durable recording survives cleanup: it is the transcript's provenance.
+        Assert.True(File.Exists(input));
+    }
+
+    [Fact]
+    public async Task Success_CleanupFailureDoesNotInvalidateTheTranscriptAndLeavesTheDebt()
+    {
+        // AC: "a cleanup failure MUST NOT invalidate an otherwise successful transcript; it
+        // remains observable/retryable cleanup work."
+        var job = CreateJob();
+        _provider.OnSubmit = request => Submission(request, TosAudio());
+        _provider.OnRelease = _ => AsrAudioRelease.Failed("TOS is unreachable.");
+        _provider.EnqueuePoll(Completed());
+
+        var result = await CreateProcessor().ProcessAsync(job);
+
+        Assert.Equal(AsrJobOutcome.Succeeded, result.Outcome);
+        Assert.Equal(AsrJobStatus.Succeeded, result.Job.Status);
+        Assert.Equal(1, result.SegmentCount);
+        Assert.True(File.Exists(Paths.JobNormalizedJsonl("job_1")));
+        Assert.True(File.Exists(Paths.RawTranscriptJsonl));
+
+        // The debt is durable and the failure is observable, but the job is not failed.
+        Assert.True(_jobs.Get("job_1")!.TosCleanupPending);
+        Assert.Contains(SessionEvents.AsrAudioReleaseFailed, _artifacts.Events);
+        Assert.Equal(AsrJobStatus.Succeeded, _jobs.Get("job_1")!.Status);
+    }
+
+    [Fact]
+    public async Task Failure_AlsoReleasesAStagedObjectBecauseTheJobCanNeverSubmitAgain()
+    {
+        var job = CreateJob();
+        _provider.OnSubmit = request => Submission(request, TosAudio());
+        _provider.OnRelease = _ => AsrAudioRelease.Succeeded;
+        // A permanent provider rejection after the object was already staged.
+        _provider.EnqueuePoll(AsrPollResult.Failed(new AsrProviderError("45000002", "empty audio", IsTransient: false)));
+
+        var result = await CreateProcessor().ProcessAsync(job);
+
+        Assert.Equal(AsrJobOutcome.Failed, result.Outcome);
+        Assert.Single(_provider.Released);
+        Assert.False(_jobs.Get("job_1")!.TosCleanupPending);
+    }
+
+    [Fact]
+    public async Task CleanupDue_FinishesDebtLeftByAnEarlierProcessAndIsIdempotent()
+    {
+        // The crash window: the terminal status committed, the process died before the delete.
+        // A later resume has to find the debt, release the object once, and then stop finding it.
+        var job = CreateJob(AsrJobStatus.Succeeded) with
+        {
+            AudioTransport = AsrTransports.Tos,
+            TosBucket = "meetcap-asr",
+            TosObjectKey = "meetcap-asr/abc/2026/09/19/job_1.wav",
+            TosCleanupPending = true,
+        };
+        _jobs.Update(job);
+        _provider.OnRelease = _ => AsrAudioRelease.Succeeded;
+
+        var first = await CreateProcessor().CleanupDueAsync(10);
+
+        var released = Assert.Single(first);
+        Assert.Equal("job_1", released.Id);
+        Assert.Single(_provider.Released);
+        Assert.False(_jobs.Get("job_1")!.TosCleanupPending);
+
+        // Idempotent: the debt is gone, so a second pass deletes nothing a second time.
+        var second = await CreateProcessor().CleanupDueAsync(10);
+        Assert.Empty(second);
+        Assert.Single(_provider.Released);
+    }
+
+    [Fact]
+    public async Task CleanupDue_RetriesAfterAFailureInsteadOfGivingUpOnTheObject()
+    {
+        var job = CreateJob(AsrJobStatus.Succeeded) with
+        {
+            AudioTransport = AsrTransports.Tos,
+            TosBucket = "meetcap-asr",
+            TosObjectKey = "meetcap-asr/abc/2026/09/19/job_1.wav",
+            TosCleanupPending = true,
+        };
+        _jobs.Update(job);
+
+        var failing = true;
+        _provider.OnRelease = _ => failing
+            ? AsrAudioRelease.Failed("TOS is unreachable.")
+            : AsrAudioRelease.Succeeded;
+
+        Assert.Empty(await CreateProcessor().CleanupDueAsync(10));
+        Assert.True(_jobs.Get("job_1")!.TosCleanupPending);
+
+        failing = false;
+        var released = await CreateProcessor().CleanupDueAsync(10);
+
+        Assert.Single(released);
+        Assert.False(_jobs.Get("job_1")!.TosCleanupPending);
+    }
+
+    [Fact]
+    public async Task CleanupDue_NeverReleasesAnObjectAStillRunningJobNeeds()
+    {
+        // A job in flight still needs its object for the next poll, so only terminal jobs hold
+        // releasable cleanup debt.
+        var job = CreateJob(AsrJobStatus.Polling) with
+        {
+            AudioTransport = AsrTransports.Tos,
+            TosBucket = "meetcap-asr",
+            TosObjectKey = "meetcap-asr/abc/2026/09/19/job_1.wav",
+            TosCleanupPending = true,
+        };
+        _jobs.Update(job);
+        _provider.OnRelease = _ => AsrAudioRelease.Succeeded;
+
+        Assert.Empty(await CreateProcessor().CleanupDueAsync(10));
+        Assert.Empty(_provider.Released);
+        Assert.True(_jobs.Get("job_1")!.TosCleanupPending);
+    }
+
+    [Fact]
+    public async Task CleanupDue_LeavesJobsOfAnotherProviderAlone()
+    {
+        var job = CreateJob(AsrJobStatus.Succeeded, provider: "other") with
+        {
+            AudioTransport = AsrTransports.Tos,
+            TosBucket = "meetcap-asr",
+            TosObjectKey = "meetcap-asr/abc/2026/09/19/job_1.wav",
+            TosCleanupPending = true,
+        };
+        _jobs.Update(job);
+        _provider.OnRelease = _ => AsrAudioRelease.Succeeded;
+
+        Assert.Empty(await CreateProcessor().CleanupDueAsync(10));
+        Assert.Empty(_provider.Released);
+    }
+
+    [Fact]
+    public async Task AJobThatOwesCleanupIsNotOutstandingWork()
+    {
+        // AC: cleanup debt must not make a finished session look unfinished. Counting cleanup as
+        // outstanding would leave every large-file session permanently "in progress".
+        var job = CreateJob(AsrJobStatus.Succeeded) with
+        {
+            AudioTransport = AsrTransports.Tos,
+            TosBucket = "meetcap-asr",
+            TosObjectKey = "meetcap-asr/abc/2026/09/19/job_1.wav",
+            TosCleanupPending = true,
+        };
+        _jobs.Update(job);
+
+        var processor = CreateProcessor();
+
+        Assert.Equal(0, processor.CountOutstanding("ses_1"));
+        Assert.Empty(await processor.RunDueAsync(10));
+    }
+
+    [Fact]
+    public async Task RecoveredJob_ReleasesItsObjectWithoutReUploadingOrReSubmitting()
+    {
+        // The restart path: the row already carries the transport identity, so the object is
+        // released from durable state alone and no second billable submit happens.
+        var job = CreateJob(AsrJobStatus.Succeeded) with
+        {
+            AudioTransport = AsrTransports.Tos,
+            TosBucket = "meetcap-asr",
+            TosObjectKey = "meetcap-asr/abc/2026/09/19/job_1.wav",
+            TosCleanupPending = true,
+        };
+        _jobs.Update(job);
+        _provider.OnRelease = _ => AsrAudioRelease.Succeeded;
+
+        var result = await CreateProcessor().ProcessAsync(_jobs.Get("job_1")!);
+
+        Assert.Equal(AsrJobOutcome.NoWork, result.Outcome);
+        Assert.Empty(_provider.Submissions);
+        Assert.Empty(_provider.PolledRequestIds);
+        Assert.Single(_provider.Released);
+        Assert.False(_jobs.Get("job_1")!.TosCleanupPending);
+    }
+
+    [Fact]
+    public async Task CleanupAProviderThrowsIsDebtNotAJobFailure()
+    {
+        var job = CreateJob(AsrJobStatus.Succeeded) with
+        {
+            AudioTransport = AsrTransports.Tos,
+            TosBucket = "meetcap-asr",
+            TosObjectKey = "meetcap-asr/abc/2026/09/19/job_1.wav",
+            TosCleanupPending = true,
+        };
+        _jobs.Update(job);
+        _provider.OnRelease = _ => throw new InvalidOperationException("publisher blew up");
+
+        var result = await CreateProcessor().ProcessAsync(_jobs.Get("job_1")!);
+
+        Assert.Equal(AsrJobOutcome.NoWork, result.Outcome);
+        Assert.Equal(AsrJobStatus.Succeeded, _jobs.Get("job_1")!.Status);
+        Assert.True(_jobs.Get("job_1")!.TosCleanupPending);
+        Assert.Contains(SessionEvents.AsrAudioReleaseFailed, _artifacts.Events);
+    }
+
+    private static AsrPublishedAudio TosAudio() => new()
+    {
+        Transport = AsrTransports.Tos,
+        Url = "https://tos.invalid/object?X-Tos-Signature=SECRET-SIGNATURE",
+        Bytes = 22 * 1024 * 1024,
+        Bucket = "meetcap-asr",
+        ObjectKey = "meetcap-asr/abc/2026/09/19/job_1.wav",
+    };
+
+    private static AsrSubmission Submission(AsrFileRequest request, AsrPublishedAudio audio) => new()
+    {
+        ProviderRequestId = request.ProviderRequestId,
+        SanitizedRequestJson = "{\"job_id\":\"" + request.JobId + "\"}",
+        Audio = audio,
+    };
 }

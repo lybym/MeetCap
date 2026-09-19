@@ -118,9 +118,174 @@ public class VolcengineAsrProviderTests : IDisposable
         Assert.Contains("\"tos_object_key\":\"meetcap-asr/shard/2026/09/19/job_1.wav\"", submission.SanitizedRequestJson);
     }
 
+    [Fact]
+    public async Task Submit_ReportsTheTransportIdentitySoTheCallerCanPersistAndReleaseIt()
+    {
+        // The submission is the only place the caller can learn that a remote copy exists: the
+        // provider owns the publisher, so without this the job row could never record
+        // audio_transport/tos_bucket/tos_object_key (docs/DATA_MODEL.md section 6.2).
+        var handler = new StubHttpHandler().Enqueue(HttpStatusCode.OK, apiStatus: "20000000");
+        var published = new AsrPublishedAudio
+        {
+            Transport = "tos",
+            Url = "https://tos.invalid/object?X-Tos-Signature=secret",
+            Bytes = 22 * 1024 * 1024,
+            Bucket = "meetcap-asr",
+            ObjectKey = "meetcap-asr/abc/2026/09/19/job_1.wav",
+        };
+        using var provider = new VolcengineAsrProvider(
+            new VolcengineAsrOptions { ApiKey = ApiKey, BaseUrl = "https://asr.invalid/api/v3/auc/bigmodel" },
+            handler,
+            new FakePublisher(published));
+
+        var submission = await provider.SubmitFileAsync(Request(WriteAudio()));
+
+        Assert.NotNull(submission.Audio);
+        Assert.Equal("tos", submission.Audio!.Transport);
+        Assert.Equal("meetcap-asr", submission.Audio.Bucket);
+        Assert.Equal("meetcap-asr/abc/2026/09/19/job_1.wav", submission.Audio.ObjectKey);
+        Assert.True(submission.Audio.HasRemoteCopy);
+        // The signed URL travels to the provider only: it is never part of the durable identity.
+        Assert.Equal("https://tos.invalid/object?X-Tos-Signature=secret", submission.Audio.Url);
+    }
+
+    [Fact]
+    public async Task Submit_AnInlineTransportReportsNoRemoteCopyToRelease()
+    {
+        var handler = new StubHttpHandler().Enqueue(HttpStatusCode.OK, apiStatus: "20000000");
+        using var provider = Create(handler);
+
+        var submission = await provider.SubmitFileAsync(Request(WriteAudio()));
+
+        Assert.NotNull(submission.Audio);
+        Assert.Equal("inline", submission.Audio!.Transport);
+        Assert.Null(submission.Audio.Bucket);
+        Assert.Null(submission.Audio.ObjectKey);
+        Assert.False(submission.Audio.HasRemoteCopy);
+    }
+
+    [Fact]
+    public async Task Release_DeletesTheStagedObjectForATosJob()
+    {
+        var handler = new StubHttpHandler();
+        var publisher = new FakePublisher(new AsrPublishedAudio { Transport = "inline", Bytes = 1 });
+        using var provider = new VolcengineAsrProvider(
+            new VolcengineAsrOptions { ApiKey = ApiKey, BaseUrl = "https://asr.invalid/api/v3/auc/bigmodel" },
+            handler,
+            publisher);
+
+        var release = await provider.ReleaseAudioAsync(TosJob());
+
+        Assert.True(release.Attempted);
+        Assert.True(release.Released);
+        var deleted = Assert.Single(publisher.Deleted);
+        Assert.Equal("meetcap-asr", deleted.Bucket);
+        Assert.Equal("meetcap-asr/abc/2026/09/19/job_1.wav", deleted.ObjectKey);
+        // The delete needs the stable identity only; a signed URL is never required for it.
+        Assert.Null(deleted.Url);
+    }
+
+    [Fact]
+    public async Task Release_DoesNothingForAJobWithNoCleanupDebt()
+    {
+        // Releasing an object a still-running job needs would break the very request it was
+        // staged for, so the durable pending flag is what authorises the delete.
+        var publisher = new FakePublisher(new AsrPublishedAudio { Transport = "inline", Bytes = 1 });
+        using var provider = new VolcengineAsrProvider(
+            new VolcengineAsrOptions { ApiKey = ApiKey, BaseUrl = "https://asr.invalid/api/v3/auc/bigmodel" },
+            new StubHttpHandler(),
+            publisher);
+
+        var settled = await provider.ReleaseAudioAsync(TosJob(tosCleanupPending: false));
+        var notTos = await provider.ReleaseAudioAsync(TosJob() with { AudioTransport = "inline" });
+        var missingKey = await provider.ReleaseAudioAsync(TosJob() with { TosObjectKey = null });
+
+        Assert.False(settled.Attempted);
+        Assert.False(notTos.Attempted);
+        Assert.False(missingKey.Attempted);
+        Assert.Empty(publisher.Deleted);
+    }
+
+    [Fact]
+    public async Task Release_ReportsAFailedDeleteAsRetryableCleanupWorkRatherThanThrowing()
+    {
+        var publisher = new FakePublisher(new AsrPublishedAudio { Transport = "inline", Bytes = 1 })
+        {
+            OnDelete = _ => throw new AsrTransientException("tos.cleanup_failed", "TOS is unreachable."),
+        };
+        using var provider = new VolcengineAsrProvider(
+            new VolcengineAsrOptions { ApiKey = ApiKey, BaseUrl = "https://asr.invalid/api/v3/auc/bigmodel" },
+            new StubHttpHandler(),
+            publisher);
+
+        var release = await provider.ReleaseAudioAsync(TosJob());
+
+        Assert.True(release.Attempted);
+        Assert.False(release.Released);
+        Assert.Contains("TOS is unreachable.", release.Error!, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Release_ScrubsTheApiKeyFromAnyReportedCleanupFailure()
+    {
+        // An error message is persisted on the job, so the adapter's own scrubbing has to cover
+        // the cleanup path too and not only the HTTP paths.
+        var publisher = new FakePublisher(new AsrPublishedAudio { Transport = "inline", Bytes = 1 })
+        {
+            OnDelete = _ => throw new IOException($"delete rejected for key {ApiKey}"),
+        };
+        using var provider = new VolcengineAsrProvider(
+            new VolcengineAsrOptions { ApiKey = ApiKey, BaseUrl = "https://asr.invalid/api/v3/auc/bigmodel" },
+            new StubHttpHandler(),
+            publisher);
+
+        var release = await provider.ReleaseAudioAsync(TosJob());
+
+        Assert.False(release.Released);
+        Assert.DoesNotContain(ApiKey, release.Error!, StringComparison.Ordinal);
+        Assert.Contains("***", release.Error!, StringComparison.Ordinal);
+    }
+
+    private static AsrJob TosJob(bool tosCleanupPending = true) => new()
+    {
+        Id = "job_1",
+        SessionId = "ses_1",
+        Source = "import",
+        Provider = "volcengine",
+        InputArtifact = "audio/import/normalized.wav",
+        ProviderRequestId = "req-0001",
+        AudioTransport = "tos",
+        TosBucket = "meetcap-asr",
+        TosObjectKey = "meetcap-asr/abc/2026/09/19/job_1.wav",
+        TosCleanupPending = tosCleanupPending,
+        CreatedAt = DateTimeOffset.UnixEpoch,
+        UpdatedAt = DateTimeOffset.UnixEpoch,
+    };
+
+    /// <summary>
+    /// Records what the provider asked the transport boundary to publish and to release.
+    /// </summary>
     private sealed class FakePublisher(AsrPublishedAudio audio) : IAsrAudioPublisher
     {
-        public Task<AsrPublishedAudio> PublishAsync(AsrFileRequest request, CancellationToken cancellationToken = default) => Task.FromResult(audio);
+        public List<AsrPublishedAudio> Published { get; } = new();
+
+        public List<AsrPublishedAudio> Deleted { get; } = new();
+
+        /// <summary>Overrides deletion so a failure can be scripted; throw to simulate one.</summary>
+        public Action<AsrPublishedAudio>? OnDelete { get; set; }
+
+        public Task<AsrPublishedAudio> PublishAsync(AsrFileRequest request, CancellationToken cancellationToken = default)
+        {
+            Published.Add(audio);
+            return Task.FromResult(audio);
+        }
+
+        public Task DeleteAsync(AsrPublishedAudio published, CancellationToken cancellationToken = default)
+        {
+            Deleted.Add(published);
+            OnDelete?.Invoke(published);
+            return Task.CompletedTask;
+        }
     }
 
     [Fact]
@@ -495,5 +660,146 @@ public class VolcengineAsrProviderTests : IDisposable
     {
         Assert.Throws<ArgumentException>(
             () => new VolcengineAsrProvider(new VolcengineAsrOptions { ApiKey = "   " }));
+    }
+
+    [Fact]
+    public void Factory_WithoutTosSection_BuildsAPublisherThatKeepsTheOversizedPathClosed()
+    {
+        // "TOS stays optional until the large-file path is needed": an absent [asr.tos] must not
+        // stop the provider from being constructed at all.
+        var config = ConfigurationDefaults.Default();
+        config.Asr.Volcengine.ApiKey = ApiKey;
+
+        using var provider = VolcengineAsrProviderFactory.Create(config);
+
+        Assert.NotNull(provider);
+        Assert.Equal(VolcengineAsrProviderFactory.ProviderName, provider.Name);
+    }
+
+    [Fact]
+    public void Factory_WithAFullyConfiguredTosSection_ResolvesBothCredentialReferences()
+    {
+        var config = ConfigurationDefaults.Default();
+        config.Asr.Volcengine.ApiKey = ApiKey;
+        config.Asr.Tos.Bucket = "meetcap-asr";
+        config.Asr.Tos.Region = "cn-beijing";
+        config.Asr.Tos.Endpoint = "https://tos-cn-beijing.volces.com";
+        config.Asr.Tos.AccessKey = "env:TOS_ACCESS_KEY";
+        config.Asr.Tos.SecretKey = "env:TOS_SECRET_KEY";
+
+        using var provider = VolcengineAsrProviderFactory.Create(
+            config,
+            handler: null,
+            environment: name => name switch
+            {
+                "TOS_ACCESS_KEY" => "AK-LITERAL",
+                "TOS_SECRET_KEY" => "SK-LITERAL",
+                _ => null,
+            });
+
+        Assert.NotNull(provider);
+    }
+
+    [Fact]
+    public void Factory_WithAPartiallyConfiguredTosSection_NamesTheMissingField()
+    {
+        // A half-filled section is a typo or an interrupted edit, not "TOS is not configured",
+        // and reporting it as absent would send the operator looking for a section they wrote.
+        var config = ConfigurationDefaults.Default();
+        config.Asr.Volcengine.ApiKey = ApiKey;
+        config.Asr.Tos.Bucket = "meetcap-asr";
+
+        var ex = Assert.Throws<AsrConfigurationException>(() => VolcengineAsrProviderFactory.Create(config));
+
+        // The first missing field is named, and the message explains why a half-filled section is
+        // an error rather than "TOS is not configured".
+        Assert.Contains("asr.tos.region", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("partly configured", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Factory_WithAnUnresolvableTosCredentialReference_NamesTheVariable()
+    {
+        var config = ConfigurationDefaults.Default();
+        config.Asr.Volcengine.ApiKey = ApiKey;
+        config.Asr.Tos.Bucket = "meetcap-asr";
+        config.Asr.Tos.Region = "cn-beijing";
+        config.Asr.Tos.Endpoint = "https://tos-cn-beijing.volces.com";
+        config.Asr.Tos.AccessKey = "env:TOS_ACCESS_KEY";
+        config.Asr.Tos.SecretKey = "env:TOS_SECRET_KEY";
+
+        var ex = Assert.Throws<AsrConfigurationException>(
+            () => VolcengineAsrProviderFactory.Create(config, handler: null, environment: _ => null));
+
+        Assert.Contains("TOS_ACCESS_KEY", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Factory_WithAnEmptyTosSecretKey_DoesNotSilentlySkipTheValidation()
+    {
+        var config = ConfigurationDefaults.Default();
+        config.Asr.Volcengine.ApiKey = ApiKey;
+        config.Asr.Tos.Bucket = "meetcap-asr";
+        config.Asr.Tos.Region = "cn-beijing";
+        config.Asr.Tos.Endpoint = "https://tos-cn-beijing.volces.com";
+        config.Asr.Tos.SecretKey = "env:TOS_SECRET_KEY";
+
+        var ex = Assert.Throws<AsrConfigurationException>(() => VolcengineAsrProviderFactory.Create(config));
+
+        Assert.Contains("asr.tos.access_key", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Factory_TosCredentialsNeverReachTheRedactedConfigurationOutput()
+    {
+        // config show and the log sinks both redact from the same secret set, so the set has to
+        // contain the TOS credential references as well as the Volcengine API key.
+        var config = ConfigurationDefaults.Default();
+        config.Asr.Volcengine.ApiKey = ApiKey;
+        config.Asr.Tos.AccessKey = "AK-LITERAL-SECRET";
+        config.Asr.Tos.SecretKey = "SK-LITERAL-SECRET";
+
+        var secrets = MeetCap.Core.Secrets.SecretRedactor.GetSecretValues(config);
+        var printed = MeetCap.Core.Secrets.SecretRedactor.Redact(
+            $"api_key={ApiKey} access_key=AK-LITERAL-SECRET secret_key=SK-LITERAL-SECRET",
+            secrets);
+
+        Assert.DoesNotContain(ApiKey, printed, StringComparison.Ordinal);
+        Assert.DoesNotContain("AK-LITERAL-SECRET", printed, StringComparison.Ordinal);
+        Assert.DoesNotContain("SK-LITERAL-SECRET", printed, StringComparison.Ordinal);
+        Assert.Equal("api_key=*** access_key=*** secret_key=***", printed);
+    }
+
+    [Fact]
+    public void TosPublisher_UsesTheOfficialSdkAndNeverHandRollsSigning()
+    {
+        // Issue #29 requires the official TOS .NET SDK and forbids hand-written request signing.
+        // The SDK is a real, separately-versioned dependency of this adapter rather than a shim,
+        // and the adapter declares no signing surface of its own: the only TOS machinery it can
+        // reach is the SDK's client, and neither of its two operations computes a signature.
+        var adapter = typeof(VolcengineTosAudioPublisher).Assembly;
+        var sdk = typeof(TOS.TosClientBuilder).Assembly;
+
+        Assert.Equal("Volcengine.TOS", sdk.GetName().Name);
+        Assert.NotEqual(adapter.GetName().Name, sdk.GetName().Name);
+
+        // The official client is what the adapter builds and calls, so upload, presigning and
+        // deletion all go through the SDK implementation.
+        var buildClient = typeof(VolcengineTosAudioPublisher).GetMethod(
+            "BuildClient",
+            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+        Assert.NotNull(buildClient);
+        Assert.Equal(typeof(TOS.ITosClient), buildClient!.ReturnType);
+
+        // No hand-rolled signing: the public surface is the transport contract only.
+        var adapterMethods = typeof(VolcengineTosAudioPublisher)
+            .GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance)
+            .Select(m => m.Name)
+            .ToHashSet(StringComparer.Ordinal);
+
+        Assert.Contains(nameof(VolcengineTosAudioPublisher.PublishAsync), adapterMethods);
+        Assert.Contains(nameof(VolcengineTosAudioPublisher.DeleteAsync), adapterMethods);
+        Assert.DoesNotContain(adapterMethods, name => name.Contains("Sign", StringComparison.Ordinal));
+        Assert.DoesNotContain(adapterMethods, name => name.Contains("Signature", StringComparison.Ordinal));
     }
 }

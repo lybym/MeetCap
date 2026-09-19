@@ -66,4 +66,24 @@ public static class SessionEvents
     public const string AsrJobRetryWait = "asr.job.retry_wait";
     public const string AsrJobCompleted = "asr.job.completed";
     public const string AsrJobFailed = "asr.job.failed";
+
+    /// <summary>
+    /// The temporary transport copy staged for a job was released from object storage.
+    /// </summary>
+    /// <remarks>
+    /// The local WAV or batch artifact is untouched: this records the removal of the temporary
+    /// object only (<c>docs/DATA_MODEL.md</c> section 6.2).
+    /// </remarks>
+    public const string AsrAudioReleased = "asr.audio.released";
+
+    /// <summary>
+    /// Releasing a job's temporary transport copy failed, so the durable cleanup debt remains.
+    /// </summary>
+    /// <remarks>
+    /// This is explicitly not a transcription failure. The transcript is already durable and
+    /// the object stays retryable, so the event exists to keep the debt observable rather than
+    /// to change any job's status (<c>docs/DATA_MODEL.md</c> section 6.2,
+    /// <c>docs/RELIABILITY.md</c> section 9).
+    /// </remarks>
+    public const string AsrAudioReleaseFailed = "asr.audio.release_failed";
 }

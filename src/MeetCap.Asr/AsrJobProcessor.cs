@@ -286,7 +286,12 @@ public sealed class AsrJobProcessor
 
         if (AsrJobStatuses.IsTerminal(job.Status))
         {
-            return new AsrJobProcessResult(job, AsrJobOutcome.NoWork, 0, $"Job '{job.Id}' is already {job.Status}.");
+            // A terminal job still may owe a release: the process can die between the terminal
+            // write and the delete, and the debt is durable precisely so this path finishes it.
+            return await WithAudioReleasedAsync(
+                job,
+                new AsrJobProcessResult(job, AsrJobOutcome.NoWork, 0, $"Job '{job.Id}' is already {job.Status}."),
+                cancellationToken).ConfigureAwait(false);
         }
 
 
@@ -340,19 +345,28 @@ public sealed class AsrJobProcessor
         }
         catch (AsrTransientException ex)
         {
-            return HandleTransient(job, ex.Code, ex.Message);
+            return await HandleTransient(job, ex.Code, ex.Message, cancellationToken).ConfigureAwait(false);
         }
         catch (AsrPermanentException ex)
         {
-            return Fail(job, ex.Code, ex.Message);
+            return await Fail(job, ex.Code, ex.Message, cancellationToken).ConfigureAwait(false);
         }
         catch (AsrConfigurationException ex)
         {
-            return Fail(job, ConfigurationErrorCode, ex.Message);
+            return await Fail(job, ConfigurationErrorCode, ex.Message, cancellationToken).ConfigureAwait(false);
         }
 
         var requestPath = paths.JobRequestJson(job.Id);
         WriteText(requestPath, submission.SanitizedRequestJson);
+
+        // The transport identity is committed with the job before the submission is treated as
+        // accepted, so a process that dies here still knows which temporary object it has to
+        // release. Only the stable bucket and key are stored; the signed URL is a credential
+        // and is never durable state (docs/DATA_MODEL.md section 6.2).
+        if (submission.Audio is not null)
+        {
+            job = AsrJobTransitions.RecordAudioTransport(job, submission.Audio, Now());
+        }
 
         // The provider's trace id is retained with the job so a support request about this
         // task can name it without re-reading the exchange (docs/ASR_STRATEGY.md section 13).
@@ -372,6 +386,11 @@ public sealed class AsrJobProcessor
                 ["provider_request_id"] = submission.ProviderRequestId,
                 ["provider_log_id"] = job.ProviderLogId,
                 ["attempt"] = job.AttemptCount,
+                // The transport and the stable object identity are diagnostics-safe: neither
+                // the signed URL nor a credential can appear here.
+                ["audio_transport"] = job.AudioTransport,
+                ["tos_bucket"] = job.TosBucket,
+                ["tos_object_key"] = job.TosObjectKey,
             });
 
         return null;
@@ -405,15 +424,15 @@ public sealed class AsrJobProcessor
             }
             catch (AsrTransientException ex)
             {
-                return HandleTransient(job, ex.Code, ex.Message);
+                return await HandleTransient(job, ex.Code, ex.Message, cancellationToken).ConfigureAwait(false);
             }
             catch (AsrPermanentException ex)
             {
-                return Fail(job, ex.Code, ex.Message);
+                return await Fail(job, ex.Code, ex.Message, cancellationToken).ConfigureAwait(false);
             }
             catch (AsrConfigurationException ex)
             {
-                return Fail(job, ConfigurationErrorCode, ex.Message);
+                return await Fail(job, ConfigurationErrorCode, ex.Message, cancellationToken).ConfigureAwait(false);
             }
 
             switch (poll.State)
@@ -434,26 +453,31 @@ public sealed class AsrJobProcessor
                     continue;
 
                 case AsrPollState.TaskNotFound:
-                    return HandleTransient(
+                    return await HandleTransient(
                         job,
                         TaskNotFoundErrorCode,
                         $"Provider '{_provider.Name}' does not know task '{submission.ProviderRequestId}'; " +
-                        "the submission will be retried.");
+                        "the submission will be retried.",
+                        cancellationToken).ConfigureAwait(false);
                 case AsrPollState.Failed:
                     var error = poll.Error
                         ?? new AsrProviderError("provider.unknown", "Provider reported a failure.", IsTransient: false);
                     return error.IsTransient
-                        ? HandleTransient(job, error.Code, error.Message)
-                        : Fail(job, error.Code, error.Message);
+                        ? await HandleTransient(job, error.Code, error.Message, cancellationToken).ConfigureAwait(false)
+                        : await Fail(job, error.Code, error.Message, cancellationToken).ConfigureAwait(false);
                 case AsrPollState.Completed:
-                    return Complete(job, paths, poll.Completion!, cancellationToken);
+                    return await Complete(job, paths, poll.Completion!, cancellationToken).ConfigureAwait(false);
                 default:
-                    return Fail(job, "provider.unknown_state", $"Unhandled poll state '{poll.State}'.");
+                    return await Fail(
+                        job,
+                        "provider.unknown_state",
+                        $"Unhandled poll state '{poll.State}'.",
+                        cancellationToken).ConfigureAwait(false);
             }
         }
     }
 
-    private AsrJobProcessResult Complete(
+    private async Task<AsrJobProcessResult> Complete(
         AsrJob job,
         SessionArtifactPaths paths,
         AsrCompletion completion,
@@ -489,16 +513,21 @@ public sealed class AsrJobProcessor
         }
         catch (AsrNormalizationException ex)
         {
-            return Fail(
+            return await Fail(
                 job,
                 NormalizationErrorCode,
                 $"{ex.Message} The raw provider response is retained at '{rawResponsePath}', " +
-                "so a parser fix can rebuild the transcript without re-billing.");
+                "so a parser fix can rebuild the transcript without re-billing.",
+                cancellationToken).ConfigureAwait(false);
         }
 
         if (normalized.ErrorCode is not null)
         {
-            return Fail(job, normalized.ErrorCode, normalized.ErrorMessage ?? "Provider reported an error.");
+            return await Fail(
+                job,
+                normalized.ErrorCode,
+                normalized.ErrorMessage ?? "Provider reported an error.",
+                cancellationToken).ConfigureAwait(false);
         }
 
         var normalizedPath = paths.JobNormalizedJsonl(job.Id);
@@ -555,7 +584,13 @@ public sealed class AsrJobProcessor
             });
 
         CompleteSessionIfDone(job.SessionId, paths);
-        return new AsrJobProcessResult(job, AsrJobOutcome.Succeeded, normalized.Segments.Count, null);
+
+        // Releasing the temporary transport copy is the last step of a finished job, and it can
+        // fail without changing anything the user can see (docs/DATA_MODEL.md section 6.2).
+        return await WithAudioReleasedAsync(
+            job,
+            new AsrJobProcessResult(job, AsrJobOutcome.Succeeded, normalized.Segments.Count, null),
+            cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -599,7 +634,11 @@ public sealed class AsrJobProcessor
         _transcripts.WriteJsonl(paths.RawTranscriptJsonl, merged);
     }
 
-    private AsrJobProcessResult HandleTransient(AsrJob job, string code, string message)
+    private async Task<AsrJobProcessResult> HandleTransient(
+        AsrJob job,
+        string code,
+        string message,
+        CancellationToken cancellationToken = default)
     {
         var now = Now();
         if (_options.RetryPolicy.CanRetry(job.AttemptCount))
@@ -621,15 +660,20 @@ public sealed class AsrJobProcessor
             return new AsrJobProcessResult(retried, AsrJobOutcome.AwaitingRetry, 0, message);
         }
 
-        return Fail(
+        return await Fail(
             job,
             code,
-            $"{message} Retry budget of {_options.RetryPolicy.MaxAttempts} attempt(s) is exhausted.");
+            $"{message} Retry budget of {_options.RetryPolicy.MaxAttempts} attempt(s) is exhausted.",
+            cancellationToken)
+            .ConfigureAwait(false);
     }
 
-    private AsrJobProcessResult Fail(AsrJob job, string code, string message)
-    {
-        var failed = AsrJobTransitions.MarkFailed(job, Now(), code, message);
+    private async Task<AsrJobProcessResult> Fail(
+        AsrJob job,
+        string code,
+        string message,
+        CancellationToken cancellationToken = default)
+    {        var failed = AsrJobTransitions.MarkFailed(job, Now(), code, message);
         _jobs.Update(failed);
 
         _artifacts.AppendEvent(
@@ -644,7 +688,151 @@ public sealed class AsrJobProcessor
                 ["error_message"] = message,
             });
 
-        return new AsrJobProcessResult(failed, AsrJobOutcome.Failed, 0, message);
+        // A failed job is terminal too, so it must not keep holding a staged object: the audio
+        // can never be submitted again under this job, and a retry is a fresh job.
+        return await WithAudioReleasedAsync(
+            failed,
+            new AsrJobProcessResult(failed, AsrJobOutcome.Failed, 0, message),
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Finishes a terminal job's transport cleanup, leaving the result untouched.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Cleanup never changes an outcome. A successful transcript stays successful and a failed
+    /// job stays failed, because the staged object is a temporary transport copy and not part of
+    /// the transcript's provenance (<c>docs/DATA_MODEL.md</c> section 6.2,
+    /// <c>docs/RELIABILITY.md</c> section 9).
+    /// </para>
+    /// <para>
+    /// One attempt is made per pass and the debt stays durable when it fails, so a transient TOS
+    /// outage costs a retry rather than the object. Nothing is retried in a tight loop: the next
+    /// <c>meetcap asr resume</c>, or the next pass over that job, tries again.
+    /// </para>
+    /// </remarks>
+    private async Task<AsrJobProcessResult> WithAudioReleasedAsync(
+        AsrJob job,
+        AsrJobProcessResult result,
+        CancellationToken cancellationToken)
+    {
+        if (!job.TosCleanupPending)
+        {
+            return result;
+        }
+
+        var released = await TryReleaseAudioAsync(job, cancellationToken).ConfigureAwait(false);
+        return released is null ? result : result with { Job = released };
+    }
+
+    /// <summary>
+    /// Attempts one release of the job's staged copy, returning the updated job when its durable
+    /// cleanup debt changed and <c>null</c> when it did not.
+    /// </summary>
+    private async Task<AsrJob?> TryReleaseAudioAsync(AsrJob job, CancellationToken cancellationToken)
+    {
+        AsrAudioRelease release;
+        try
+        {
+            release = await _provider.ReleaseAudioAsync(job, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // A provider that throws instead of reporting is still only cleanup debt: the
+            // terminal status and the transcript are already durable and must not be disturbed.
+            release = AsrAudioRelease.Failed(ex.Message);
+        }
+
+        if (!release.Attempted)
+        {
+            // The provider reports that nothing owned a remote copy for this job, so there is no
+            // delete to drive and no debt to keep. The flag cannot stay set, or the row would owe
+            // cleanup for ever; the identity columns stay as the audit trail. This is the path
+            // that clears a row written by a build whose provider staged audio, or one whose
+            // transport is no longer configured for the job at all.
+            if (!release.Released)
+            {
+                return null;
+            }
+
+            var settled = AsrJobTransitions.MarkAudioReleased(job, Now());
+            _jobs.Update(settled);
+            return settled;
+        }
+
+        if (release.Released)
+        {
+            var releasedJob = AsrJobTransitions.MarkAudioReleased(job, Now());
+            _jobs.Update(releasedJob);
+            _artifacts.AppendEvent(
+                new SessionArtifactPaths(_options.DataRoot, job.SessionId),
+                SessionEvents.AsrAudioReleased,
+                job.EndMs,
+                new Dictionary<string, object?>
+                {
+                    ["job_id"] = job.Id,
+                    ["tos_bucket"] = job.TosBucket,
+                    ["tos_object_key"] = job.TosObjectKey,
+                });
+
+            return releasedJob;
+        }
+
+        _artifacts.AppendEvent(
+            new SessionArtifactPaths(_options.DataRoot, job.SessionId),
+            SessionEvents.AsrAudioReleaseFailed,
+            job.EndMs,
+            new Dictionary<string, object?>
+            {
+                ["job_id"] = job.Id,
+                ["tos_bucket"] = job.TosBucket,
+                ["tos_object_key"] = job.TosObjectKey,
+                ["error_message"] = release.Error,
+            });
+
+        return null;
+    }
+
+    /// <summary>
+    /// Finishes cleanup for terminal jobs that still owe it, oldest first.
+    /// </summary>
+    /// <remarks>
+    /// This is the durable half of issue #29's cleanup requirement. A delete that fails — because
+    /// TOS was briefly unreachable, or because this process was started without
+    /// <c>[asr.tos]</c> — leaves the pending flag on the row, so a later
+    /// <c>meetcap asr resume</c> picks the job up again instead of leaking the object. The
+    /// transcript is never in question: this method reports cleanup outcomes only.
+    /// </remarks>
+    public async Task<IReadOnlyList<AsrJob>> CleanupDueAsync(
+        int maxJobs,
+        string? sessionId = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (maxJobs <= 0)
+        {
+            return Array.Empty<AsrJob>();
+        }
+
+        var pending = _jobs.ListCleanupPending(maxJobs, sessionId);
+        var released = new List<AsrJob>(pending.Count);
+        foreach (var job in pending)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!string.Equals(job.Provider, _provider.Name, StringComparison.Ordinal))
+            {
+                // A job owned by a different provider is that provider's cleanup to do.
+                continue;
+            }
+
+            var updated = await TryReleaseAudioAsync(job, cancellationToken).ConfigureAwait(false);
+            if (updated is not null)
+            {
+                released.Add(updated);
+            }
+        }
+
+        return released;
     }
 
     /// <summary>

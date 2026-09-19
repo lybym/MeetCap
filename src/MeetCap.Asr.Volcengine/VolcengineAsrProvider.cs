@@ -152,6 +152,7 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
                 ProviderRequestId = request.ProviderRequestId,
                 SanitizedRequestJson = sanitized,
                 ProviderLogId = response.LogId,
+                Audio = published,
             };
         }
 
@@ -208,6 +209,56 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
         if (_ownsHttpClient)
         {
             _http.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Releases the temporary audio copy this job staged for transport.
+    /// </summary>
+    /// <remarks>
+    /// The publisher owns the object-storage work — this method only decides whether there is
+    /// anything to release, and turns a publisher failure into a durable cleanup debt rather
+    /// than a job failure (<c>docs/DATA_MODEL.md</c> section 6.2). The translated message never
+    /// contains a credential or a signed URL.
+    /// </remarks>
+    public async Task<AsrAudioRelease> ReleaseAudioAsync(
+        AsrJob job,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(job);
+
+        // Both conditions are required. The transport says the job was submitted through a
+        // remote copy at all, and the pending flag is the durable statement that the copy has
+        // not been confirmed gone. Releasing an object a still-running job needs would break
+        // the request it was staged for, so a job with no debt is never touched.
+        if (!job.TosCleanupPending
+            || !string.Equals(job.AudioTransport, AsrTransports.Tos, StringComparison.Ordinal)
+            || string.IsNullOrWhiteSpace(job.TosBucket)
+            || string.IsNullOrWhiteSpace(job.TosObjectKey))
+        {
+            return AsrAudioRelease.NotNeeded;
+        }
+
+        try
+        {
+            await _audioPublisher.DeleteAsync(
+                new AsrPublishedAudio
+                {
+                    Transport = AsrTransports.Tos,
+                    Bucket = job.TosBucket,
+                    ObjectKey = job.TosObjectKey,
+                },
+                cancellationToken).ConfigureAwait(false);
+
+            return AsrAudioRelease.Succeeded;
+        }
+        catch (Exception ex) when (ex is AsrTransientException or AsrConfigurationException or IOException)
+        {
+            // Cleanup debt is never a transcription failure: the job keeps its terminal status
+            // and its transcript, and only the pending flag survives so a later resume retries.
+            // A publisher that threw anything else is caught by the caller, which treats it the
+            // same way, so no cleanup error can ever escape as a job failure.
+            return AsrAudioRelease.Failed(Scrub(ex.Message));
         }
     }
 
@@ -345,7 +396,8 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
             ["audio"] = new JsonObject
             {
                 ["format"] = request.AudioFormat,
-                [audio.Transport == "inline" ? "data" : "url"] = audio.Transport == "inline" ? audio.InlineBase64 : audio.Url,
+                [audio.Transport == AsrTransports.Inline ? "data" : "url"] =
+                    audio.Transport == AsrTransports.Inline ? audio.InlineBase64 : audio.Url,
             },
             ["request"] = BuildProviderRequest(request.RequestSpeakerInfo),
         };
@@ -396,7 +448,7 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
                 ["format"] = request.AudioFormat,
                 ["transport"] = audio.Transport,
                 ["bytes"] = audio.Bytes,
-                ["inline_bytes"] = audio.Transport == "inline" ? audio.Bytes : null,
+                ["inline_bytes"] = audio.Transport == AsrTransports.Inline ? audio.Bytes : null,
                 ["tos_bucket"] = audio.Bucket,
                 ["tos_object_key"] = audio.ObjectKey,
             },

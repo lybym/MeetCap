@@ -64,6 +64,35 @@ public sealed record AsrSubmission
     /// (Volcengine: <c>X-Tt-Logid</c>). Diagnostic only, never a credential.
     /// </summary>
     public string? ProviderLogId { get; init; }
+
+    /// <summary>
+    /// The audio transport this submission actually used, and the stable identity of any
+    /// remote copy. The caller persists it before the request is answered so a restart can
+    /// recover, and release, the copy (<c>docs/DATA_MODEL.md</c> section 6.2).
+    /// </summary>
+    /// <remarks>
+    /// Deliberately the identity and not the payload: the base64 audio and the signed URL are
+    /// both usable secrets and neither is durable state.
+    /// </remarks>
+    public AsrPublishedAudio? Audio { get; init; }
+}
+
+/// <summary>
+/// The outcome of one attempt to release a job's published audio copy.
+/// </summary>
+/// <param name="Attempted">False when the job needed no release, so no call was made.</param>
+/// <param name="Released">True when the copy is gone, or when there was nothing to release.</param>
+/// <param name="Error">Why the release failed, when it did. Never contains a credential or a signed URL.</param>
+public sealed record AsrAudioRelease(bool Attempted, bool Released, string? Error = null)
+{
+    /// <summary>Nothing to do: the job never used a transport that owns a remote copy.</summary>
+    public static AsrAudioRelease NotNeeded { get; } = new(Attempted: false, Released: true);
+
+    /// <summary>The copy is gone.</summary>
+    public static AsrAudioRelease Succeeded { get; } = new(Attempted: true, Released: true);
+
+    /// <summary>The copy may still exist, so the cleanup debt stays durable and retryable.</summary>
+    public static AsrAudioRelease Failed(string error) => new(Attempted: true, Released: false, error);
 }
 
 /// <summary>Where a poll attempt landed.</summary>
@@ -139,6 +168,24 @@ public interface IAsrProvider
         AsrSubmission submission,
         AsrFileRequest request,
         CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Releases the audio copy this job staged for transport, once the job is terminal.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Optional, and a no-op by default: a provider whose every request is inline has nothing
+    /// to release, and neither has a provider that does not stage audio at all.
+    /// </para>
+    /// <para>
+    /// An implementation must be idempotent and must report progress honestly, because the
+    /// cleanup debt recorded on the job is cleared only when this returns
+    /// <see cref="AsrAudioRelease.Released"/>. A failed delete is retryable cleanup work and
+    /// never a transcription failure (<c>docs/DATA_MODEL.md</c> section 6.2).
+    /// </para>
+    /// </remarks>
+    Task<AsrAudioRelease> ReleaseAudioAsync(AsrJob job, CancellationToken cancellationToken = default)
+        => Task.FromResult(AsrAudioRelease.NotNeeded);
 }
 
 /// <summary>Thrown when the provider request failed for a reason that may succeed later.</summary>

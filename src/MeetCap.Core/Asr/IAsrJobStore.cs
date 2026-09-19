@@ -25,6 +25,16 @@ public interface IAsrJobStore
     /// </summary>
     IReadOnlyList<AsrJob> ListResumable(DateTimeOffset now, int limit, string? sessionId = null);
 
+    /// <summary>
+    /// Terminal jobs whose staged transport copy has not been released yet, oldest first.
+    /// </summary>
+    /// <remarks>
+    /// Cleanup debt is deliberately separate from <see cref="ListResumable"/>: a job that is
+    /// <c>succeeded</c> is finished work, so it must never make a session look unfinished just
+    /// because a remote object still has to be deleted (<c>docs/DATA_MODEL.md</c> section 6.2).
+    /// </remarks>
+    IReadOnlyList<AsrJob> ListCleanupPending(int limit, string? sessionId = null);
+
     void Update(AsrJob job);
 
     int CountByStatus(AsrJobStatus status);

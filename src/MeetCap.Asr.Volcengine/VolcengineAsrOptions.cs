@@ -140,22 +140,65 @@ public static class VolcengineAsrProviderFactory
         };
     }
 
+    /// <summary>
+    /// Builds the audio publisher from the effective configuration.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// An absent or empty <c>[asr.tos]</c> is valid: TOS is optional until a normalized WAV
+    /// actually exceeds the inline limit, and the failure that matters is raised in that
+    /// moment, on the job, with the retry/error model around it
+    /// (<c>docs/CONFIGURATION.md</c> section 9).
+    /// </para>
+    /// <para>
+    /// A <em>partially</em> filled <c>[asr.tos]</c> is a different thing and does fail here,
+    /// before any session exists: it is a typo or a half-finished edit, and reporting it as
+    /// "TOS is not configured" would send the operator looking for a section they already
+    /// wrote. The credential references are resolved through the shared secret resolver, so
+    /// an <c>env:</c> reference that names an unset variable is named precisely.
+    /// </para>
+    /// </remarks>
     private static IAsrAudioPublisher BuildAudioPublisher(MeetCapConfiguration configuration, Func<string, string?>? environment)
     {
         var tos = configuration.Asr.Tos;
-        if (string.IsNullOrWhiteSpace(tos.Bucket) && string.IsNullOrWhiteSpace(tos.Region) && string.IsNullOrWhiteSpace(tos.Endpoint)
-            && string.IsNullOrWhiteSpace(tos.AccessKey) && string.IsNullOrWhiteSpace(tos.SecretKey))
+        if (IsEmpty(tos))
+        {
             return new VolcengineTosAudioPublisher(null);
+        }
+
+        // Any non-empty field means the operator intended to configure TOS, so every field is
+        // now required rather than silently ignored.
+        var env = environment ?? Environment.GetEnvironmentVariable;
         try
         {
-            var env = environment ?? Environment.GetEnvironmentVariable;
             return new VolcengineTosAudioPublisher(new VolcengineTosOptions(
-                Required("asr.tos.bucket", tos.Bucket), Required("asr.tos.region", tos.Region), Required("asr.tos.endpoint", tos.Endpoint),
-                CredentialResolver.Resolve(tos.AccessKey, env), CredentialResolver.Resolve(tos.SecretKey, env)));
+                Required("asr.tos.bucket", tos.Bucket),
+                Required("asr.tos.region", tos.Region),
+                Required("asr.tos.endpoint", tos.Endpoint),
+                RequiredSecret("asr.tos.access_key", tos.AccessKey, env),
+                RequiredSecret("asr.tos.secret_key", tos.SecretKey, env)));
         }
-        catch (CredentialResolutionException ex) { throw new AsrConfigurationException(ex.Message); }
+        catch (CredentialResolutionException ex)
+        {
+            throw new AsrConfigurationException(ex.Message);
+        }
     }
 
-    private static string Required(string name, string value) => string.IsNullOrWhiteSpace(value)
-        ? throw new AsrConfigurationException($"{name} is required when [asr.tos] is configured.") : value;
+    private static bool IsEmpty(TosSection tos) =>
+        string.IsNullOrWhiteSpace(tos.Bucket)
+        && string.IsNullOrWhiteSpace(tos.Region)
+        && string.IsNullOrWhiteSpace(tos.Endpoint)
+        && string.IsNullOrWhiteSpace(tos.AccessKey)
+        && string.IsNullOrWhiteSpace(tos.SecretKey);
+
+    private static string Required(string name, string value) =>
+        string.IsNullOrWhiteSpace(value)
+            ? throw new AsrConfigurationException(
+                $"{name} is required: [asr.tos] is partly configured, so it is treated as intended " +
+                "and every field must be present. Remove the section entirely to keep the " +
+                "oversized-file path disabled.")
+            : value;
+
+    private static string RequiredSecret(string name, string value, Func<string, string?> environment) =>
+        CredentialResolver.Resolve(Required(name, value), environment);
 }
