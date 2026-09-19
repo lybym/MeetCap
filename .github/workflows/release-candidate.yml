@@ -12,11 +12,11 @@ on:
       build_ref:
         description: 'Ref (branch or SHA) to build the Release Candidate from'
         required: true
-        default: 'release/v0.1.0'
+        default: 'release/v0.2.0'
       rc_version:
-        description: 'RC version label, e.g. 0.1.0-rc.1'
+        description: 'RC version label, e.g. 0.2.0-rc.1'
         required: true
-        default: '0.1.0-rc.1'
+        default: '0.2.0-rc.1'
 
 jobs:
   build-test-package:

@@ -248,9 +248,9 @@ section 15.1).
 Not implemented in this milestone, and deliberately out of scope:
 
 - legacy console authentication, recording-file 1.0, idle routing, and flash/turbo routing are explicitly removed by #26 rather than promoted into supported modes;
-- issue #29 large-file TOS transport is implemented off-`main` (PR #31) and was not part of the M3
-  deliverable: it keeps one provider request but moves >20 MiB inputs through private TOS +
-  presigned `audio.url`;
+- issue #29 large-file TOS transport was not part of the M3 deliverable and landed after it, merged
+  to `main` by PR #31 for release 0.2.0: it keeps one provider request but moves >20 MiB inputs
+  through private TOS + presigned `audio.url`;
 - automatic splitting of an import that exceeds the provider's actual file/duration limit remains out of scope;
 - hotword tables (M7);
 - any live-capture ASR batching (M4), loopback capture (M5), identity matching (M6),
@@ -546,9 +546,10 @@ Not implemented in this milestone, and deliberately out of scope:
 
 ## Status
 
-Implemented on `feat/29-tos-large-file-transport` (PR #31); not part of the M0-M6 MVP release
-gate and not yet on `main`. The end-to-end real-TOS plus real-Seed-ASR smoke test remains manual
-and is recorded in `docs/M1_WINDOWS_VALIDATION.md`; CI exercises mocks and fakes only.
+Merged to `main` by PR #31 and shipped in release 0.2.0. It was not part of the M0-M6 MVP release
+gate and is a post-MVP enhancement: no milestone is marked complete by it. The end-to-end real-TOS
+plus real-Seed-ASR smoke test remains manual and is recorded as **not run** in
+`docs/M1_WINDOWS_VALIDATION.md`; CI exercises mocks and fakes only.
 
 ## Goal
 
@@ -673,18 +674,20 @@ Do not introduce Python/PyTorch into the default Windows runtime merely to dupli
 
 The first MVP release requires M0 through M6.
 
-As of release 0.1.0, M0 through M6 are implemented and automatically covered. The
+As of release 0.2.0, M0 through M6 are implemented and automatically covered. The
 real-hardware validation checklist in `docs/M1_WINDOWS_VALIDATION.md` (status: not yet run)
 gates end-to-end verification, not implementation; milestones are therefore described as
 *implemented and automatically covered*, not *verified end to end*
-(`docs/DEVELOPMENT.md` section 7).
+(`docs/DEVELOPMENT.md` section 7). Release 0.2.0 adds no milestone completion.
 
 P0 issue #26 (Seed-ASR 2.0 + `X-Api-Key`-only provider contract) has landed, so the Volcengine
 provider is production-aligned with the current official interface at the implementation level.
 The manual real-credential smoke test in `docs/M1_WINDOWS_VALIDATION.md` is still open.
 
 P1 issue #29 is a post-MVP large-file transport enhancement. It MUST NOT become a prerequisite
-for ordinary 300-second live batches or block the M0-M6 release gate.
+for ordinary 300-second live batches or block the M0-M6 release gate. It merged to `main` by
+PR #31 and ships in release 0.2.0 without changing the M0-M6 gate: the required manual real-TOS
+plus real-Seed-ASR smoke test is still **not run** (`docs/M1_WINDOWS_VALIDATION.md` section 15).
 
 M7 may partially land before the release but MUST NOT delay core reliability unless it fixes real transcription quality.
 

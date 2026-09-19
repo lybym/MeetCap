@@ -5,9 +5,9 @@
     <Copyright>Copyright (c) MeetCap contributors. See LICENSE.</Copyright>
     <!-- Single source of truth for the assembly/package version. Every project
          in the solution inherits this; no .csproj sets its own Version. -->
-    <Version>0.1.0</Version>
-    <AssemblyVersion>0.1.0.0</AssemblyVersion>
-    <FileVersion>0.1.0.0</FileVersion>
+    <Version>0.2.0</Version>
+    <AssemblyVersion>0.2.0.0</AssemblyVersion>
+    <FileVersion>0.2.0.0</FileVersion>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
