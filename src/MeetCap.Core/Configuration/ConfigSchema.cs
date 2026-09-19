@@ -19,6 +19,9 @@ public static class ConfigSchema
         "capture.chunk_seconds",
         "capture.buffer_seconds",
         "capture.flush_interval_ms",
+        // Issue #34: the bounded device-recovery window is what makes a Bluetooth endpoint
+        // that returns after a few seconds recoverable instead of already declared fatal.
+        "capture.device_recovery_seconds",
         "capture.offline.microphone_device_id",
         "capture.online.microphone_device_id",
         "capture.online.loopback_mode",

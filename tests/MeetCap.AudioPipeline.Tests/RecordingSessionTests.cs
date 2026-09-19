@@ -239,7 +239,7 @@ public class RecordingSessionTests
     [Fact]
     public async Task RunAsync_DeviceLoss_ClosesTheAudioAlreadyCapturedAndRecovers()
     {
-        using var harness = new SessionHarness(chunkSeconds: 60, maxDeviceRecoveryAttempts: 2);
+        using var harness = new SessionHarness(chunkSeconds: 60, deviceRecoverySeconds: 2);
         var first = new FakeCaptureSource(Format, harness.Device);
         var second = new FakeCaptureSource(Format, harness.Device);
         harness.Sources.Enqueue(first);
@@ -285,7 +285,7 @@ public class RecordingSessionTests
     [Fact]
     public async Task RunAsync_RecoveredDeviceWithADifferentFormat_EndsTheSessionInsteadOfMislabelingAudio()
     {
-        using var harness = new SessionHarness(chunkSeconds: 60, maxDeviceRecoveryAttempts: 2);
+        using var harness = new SessionHarness(chunkSeconds: 60, deviceRecoverySeconds: 2);
         var first = new FakeCaptureSource(Format, harness.Device);
 
         // The endpoint comes back at 44.1 kHz stereo float. The session's chunk headers,
@@ -505,7 +505,7 @@ public class RecordingSessionTests
     [Fact]
     public async Task RunAsync_DeviceLossThatCannotBeRecovered_EndsDegradedButKeepsTheAudio()
     {
-        using var harness = new SessionHarness(chunkSeconds: 60, maxDeviceRecoveryAttempts: 1);
+        using var harness = new SessionHarness(chunkSeconds: 60, deviceRecoverySeconds: 1);
         var source = new FakeCaptureSource(Format, harness.Device);
         harness.Sources.Enqueue(source);
         harness.Sources.EnqueueFailure(new DeviceUnavailableException("no device"));
@@ -539,7 +539,7 @@ public class RecordingSessionTests
     [Fact]
     public async Task RunAsync_CaptureCannotStart_MarksTheSessionInterrupted()
     {
-        using var harness = new SessionHarness(maxDeviceRecoveryAttempts: 0);
+        using var harness = new SessionHarness(deviceRecoverySeconds: 0);
         var source = new FakeCaptureSource(Format, harness.Device)
         {
             StartError = new DeviceUnavailableException("busy"),

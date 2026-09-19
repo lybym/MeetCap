@@ -122,6 +122,15 @@ public sealed class RecordingSession : IDisposable
     /// </summary>
     private readonly Action? _afterPacketWritten;
 
+    /// <summary>
+    /// Test seam: builds the per-track function a track awaits after a device loss and before
+    /// each reopen attempt, so a test can date a whole outage deterministically instead of
+    /// racing the capture loop. It is a factory rather than one function because each track
+    /// must be able to park independently — a single shared seam could only ever hold the
+    /// first track that reached it. Production passes <c>null</c>.
+    /// </summary>
+    private readonly Func<AudioSource, Func<CancellationToken, Task>>? _beforeReopenAttempt;
+
     private CancellationTokenSource? _endCts;
     private SessionRecordingLock? _recordingLock;
     private List<CaptureTrack>? _tracks;
@@ -143,7 +152,8 @@ public sealed class RecordingSession : IDisposable
         SessionManifest manifest,
         int maxDeviceRecoveryAttempts,
         SessionRecordingLock? recordingLock,
-        Action? afterPacketWritten = null)
+        Action? afterPacketWritten = null,
+        Func<AudioSource, Func<CancellationToken, Task>>? beforeReopenAttempt = null)
     {
         _paths = paths ?? throw new ArgumentNullException(nameof(paths));
         _settings = settings ?? throw new ArgumentNullException(nameof(settings));
@@ -161,6 +171,7 @@ public sealed class RecordingSession : IDisposable
         _maxDeviceRecoveryAttempts = Math.Max(0, maxDeviceRecoveryAttempts);
         _recordingLock = recordingLock;
         _afterPacketWritten = afterPacketWritten;
+        _beforeReopenAttempt = beforeReopenAttempt;
 
         _diskMonitor = new DiskSpaceMonitor(platform.DiskSpace, settings.MinimumFreeSpaceBytes);
         _stopSignal = new SessionStopSignal(paths.StopRequestPath);
@@ -348,7 +359,8 @@ public sealed class RecordingSession : IDisposable
                     _maxDeviceRecoveryAttempts,
                     _afterPacketWritten,
                     AnnounceChunk,
-                    RegisterStorageFailure);
+                    RegisterStorageFailure,
+                    _beforeReopenAttempt);
 
                 // Create the source and initialize the track's runtime from its native
                 // format before capture starts. A source that cannot be created aborts the

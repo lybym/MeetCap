@@ -639,6 +639,8 @@ on one job primary key.
 | 15.4 #29 cleanup failure semantics | | |
 | 15.5 #29 TOS outage isolation | | |
 | 15.6 #29 20 MiB boundary | | |
+| 16.2 #34 Bluetooth reconnect recovers | **NOT RUN** (no Bluetooth audio endpoint; section 16.1) | automated coverage only |
+| 16.2 #34 unrecovered outage is a gap | **NOT RUN** (no Bluetooth audio endpoint; section 16.1) | automated coverage only |
 
 M1, M2 and M4 may be described as verified on real hardware only when every row above is filled
 in and passing, or when the residual failure is written down here as a known limitation. The M4
@@ -824,5 +826,79 @@ Checklist line for the issue:
 ```text
 Manual real-TOS + real-Seed-ASR >20 MiB smoke test: NOT RUN | PASSED (<tos_object_key>, <X-Tt-Logid>)
 ```
+
+---
+
+## 16. Issue #34 additions — recovery after a Bluetooth device reconnect
+
+Issue #34's Acceptance Criteria split cleanly into what the automated suite can prove and what
+only real hardware can. The recovery window, the per-track reconnect behaviour, the gap
+quantification and the reporting are covered by the automated suite
+(`tests/MeetCap.AudioPipeline.Tests/DeviceRecoveryWindowTests.cs`). The criterion *"verify with a
+real Bluetooth microphone and loopback render endpoint on Windows"* requires a physical
+Bluetooth audio device and has **not** been run.
+
+### 16.1 Why the real-hardware criterion is not run here
+
+The machine this work was prepared on has no Bluetooth audio endpoint at all: `meetcap devices`
+lists two capture endpoints (Realtek onboard microphone array, Steam Streaming Microphone) and
+four render endpoints (Realtek speakers, an AMD HDMI output, Steam Streaming Microphone and
+Steam Streaming Speakers). None of them is a Bluetooth device, and disconnecting/reconnecting a
+Bluetooth headset cannot be exercised without one.
+
+The issue's own reference artifacts (session `ses_20260919T082247Z_2bd30003`) were produced on a
+machine that did have the Sony WF-1000XM5 configured, and are retained read-only under
+`.manual-validation/hotplug-data/` as the reproduction evidence for the original defect. They
+are input to this fix, not evidence of it.
+
+```text
+Manual real-Bluetooth reconnect test (issue #34): NOT RUN — no Bluetooth audio endpoint on this machine
+```
+
+### 16.2 The run to perform on a machine with the headset
+
+Same shape as the issue's reproduction, with the fix in place and the longer recovery window
+configured:
+
+```toml
+[capture]
+device_recovery_seconds = 20      # the default; a shorter value makes the run cheaper
+
+[capture.online]
+microphone_device_id = "{0.0.1.00000000}.{e285b8cf-2437-48f2-a08a-aa2be8a05d51}"
+loopback_mode = "system"
+render_device_id = "{0.0.0.00000000}.{97644e66-70d1-4286-8854-979a505009d3}"
+
+[asr]
+enabled = false
+```
+
+```powershell
+meetcap start "BT reconnect" --mode online
+# confirm both tracks are recording, then disconnect the headset from Windows Bluetooth
+# wait ~10 s (well past the old three-retry budget), then reconnect it
+meetcap stop
+```
+
+Checklist for the issue:
+
+- [ ] `events.jsonl` contains exactly one `capture.device_lost` per track and **no**
+      `capture.device_lost_fatal`, because the headset returned inside the window.
+- [ ] `events.jsonl` contains one `capture.device_restored` per track, and each carries a
+      `gap_ms` that is approximately the real disconnect duration.
+- [ ] Each track resumed with a new WAV chunk after the restore, so both tracks wrote audio on
+      both sides of the outage (`audio/mic/` and `audio/loopback/`).
+- [ ] `session.json` reports `gap_count >= 1` and `gap_total_ms` approximately the real
+      disconnect duration, rather than `0`.
+- [ ] The session did **not** end with `end_reason = "device_lost"`, and the unaffected track
+      kept recording throughout.
+
+A second run with the headset left switched off until the window expires checks the fatal side:
+
+- [ ] `capture.device_lost_fatal` is written once for the track that stayed gone, and
+      `capture.gap` with `reason = "not_captured"` quantifies the unrecovered outage.
+- [ ] `session.json` reports that outage in `gap_count` / `gap_total_ms` rather than `0`
+      (this is the reporting the issue observed as broken).
+- [ ] The track's already-captured audio is durable as a closed `.wav` with no `.part` left.
 
 ---

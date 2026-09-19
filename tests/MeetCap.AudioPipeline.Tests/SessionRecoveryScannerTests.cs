@@ -3,6 +3,7 @@ using System.Text.Json;
 using MeetCap.AudioPipeline.Tests.TestSupport;
 using MeetCap.AudioPipeline.Wave;
 using MeetCap.Core.Capture;
+using MeetCap.Core.Diagnostics;
 using MeetCap.Core.Sessions;
 using MeetCap.Persistence.Storage;
 using Xunit;
@@ -1046,6 +1047,96 @@ public class SessionRecoveryScannerTests
         SessionManifestStore.TryLoad(paths.ManifestPath, out var manifest, out _);
         Assert.True(manifest!.GapsRemain);
         Assert.NotEmpty(manifest.GapDetails);
+    }
+
+    [Fact]
+    public async Task Scan_DoesNotDoubleCountOrSuppressATerminalGapARealRecordingReported()
+    {
+        // Recovery runs against the sessions issue #34 added: a track that lost its endpoint and
+        // never got it back now ends with a *placed* outage, so its timeline has an origin, closes
+        // its chunks and reaches the recovery audit as an ordinary stopped session — where before
+        // the fix the doomed track placed nothing and `session repair` had no timeline to audit.
+        // Recovery must neither restate that terminal hole as a second gap (double counting the
+        // missing audio) nor write the session off as whole while its own evidence says a stretch
+        // of the timeline has no audio (docs/RELIABILITY.md sections 7 and 8.2).
+        const int OutageSeconds = 12;
+
+        // The seam dates a whole outage without parking: the clock jumps the outage's length at the
+        // first reopen attempt, so the measurement that follows always observes it and the test
+        // needs no shared gate (docs/DEVELOPMENT.md section 6).
+        var dated = 0;
+        SessionHarness? harness = null;
+        harness = new SessionHarness(
+            chunkSeconds: 1,
+            bufferSeconds: 30,
+            deviceRecoverySeconds: OutageSeconds + 1,
+            beforeReopenAttempt: _ => _ =>
+            {
+                if (Interlocked.Exchange(ref dated, 1) == 0)
+                {
+                    harness!.Clock.Advance(TimeSpan.FromSeconds(OutageSeconds));
+                }
+
+                return Task.CompletedTask;
+            });
+
+        using var ownedHarness = harness;
+
+        var source = new FakeCaptureSource(Format, harness.Device);
+        harness.Sources.Enqueue(source);
+
+        var session = harness.PrepareSessionDirect("Terminal gap cross-check");
+        var paths = new SessionPaths(harness.DataRoot, session.SessionId);
+
+        using var cancellation = new CancellationTokenSource();
+        var run = session.RunAsync(cancellation.Token);
+        Assert.True(await Wait.UntilAsync(() => source.StartCount == 1), "capture did not start");
+
+        TestAudio.EmitSeconds(source, Format, 0, milliseconds: 10_000);
+
+        // The endpoint never comes back, so the track measures its outage, spends its window and
+        // ends fatally with the measured stretch named as a gap.
+        harness.Devices.Replace();
+        harness.Sources.EnqueueFailure(new DeviceUnavailableException("bluetooth endpoint disconnected"));
+        harness.Sources.EnqueueFailure(new DeviceUnavailableException("bluetooth endpoint disconnected"));
+        source.Fail(new DeviceUnavailableException("bluetooth endpoint disconnected"));
+
+        await Wait.ForAsync(run, timeoutMs: 60_000, "the terminal-gap recording");
+
+        var eventLog = ReadEvents(paths);
+        Assert.Equal(1, CountEvents(eventLog, SessionEventNames.CaptureDeviceLostFatal));
+
+        var liveGap = Assert.Single(eventLog, e => Name(e) == SessionEventNames.CaptureGap);
+        var liveStart = liveGap.GetProperty("gap_start_ms").GetInt64();
+        var liveEnd = liveGap.GetProperty("gap_end_ms").GetInt64();
+        Assert.Equal(10_000, liveStart);
+        Assert.Equal(10_000 + (OutageSeconds * 1000L), liveEnd);
+
+        // Another process scans the way `meetcap status` does.
+        var otherProcess = new MeetCapDatabase(Path.Combine(harness.DataRoot, "meetcap.db"));
+        var report = new SessionRecoveryScanner(otherProcess, harness.Clock)
+            .Scan(harness.DataRoot, session.SessionId);
+
+        // The terminal gap is the last thing on the track's timeline, so there is no later durable
+        // chunk or chunk-number hole for the audit to find a second opinion in. Recovery therefore
+        // has nothing to report and nothing to repair — which is the correct outcome, not a silent
+        // success: had the audit decided the trailing stretch was a hole, it would have appended a
+        // second `capture.gap` for audio the live recording had already accounted for.
+        Assert.Empty(report.Sessions);
+        Assert.False(report.RecoveryIncomplete);
+
+        var afterScan = ReadEvents(paths);
+        Assert.Equal(1, CountEvents(afterScan, SessionEventNames.CaptureGap));
+        Assert.DoesNotContain(afterScan, e => Name(e) == SessionEventNames.SessionRepairIncomplete);
+
+        // The one gap the session reported is still the ledger: recovery neither added to it nor
+        // wrote the session off as still holding a hole.
+        SessionManifestStore.TryLoad(paths.ManifestPath, out var manifest, out var error);
+        Assert.True(manifest is not null, error);
+        Assert.False(manifest!.GapsRemain);
+        Assert.Empty(manifest.GapDetails);
+        Assert.Equal(1, manifest.GapCount);
+        Assert.Equal(OutageSeconds * 1000L, manifest.GapTotalMs);
     }
 
     [Fact]

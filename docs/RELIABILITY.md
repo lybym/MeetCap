@@ -82,6 +82,63 @@ If the configured device disappears:
 
 Loss must be visible and never silently ignored.
 
+### 8.1 Recovery policy
+
+A configured endpoint that disappears is retried for a **bounded recovery window**
+(`capture.device_recovery_seconds`, default 20 s, `0` disables recovery). A track retries its
+own endpoint once per second for that window; when the window closes with the endpoint still
+gone, the track reports `capture.device_lost_fatal`, marks itself degraded, ends **itself**
+and leaves the other track recording. Only a stop request or a storage failure (shared disk)
+ends the whole session.
+
+The window is the policy and the attempt count is derived from it
+(`CaptureService.RecoveryAttemptsFor`), so a window and the number of retries that spend it
+cannot disagree. The budget is never negative and never shrinks as the window grows: the
+derivation multiplies in `long` and saturates at `int.MaxValue` attempts, so even a window long
+enough to overflow an `int` millisecond count still buys recovery rather than silently buying
+none (`docs/CONFIGURATION.md` section 6).
+
+The window exists because the timescales differ by transport. A wired endpoint that is
+unplugged and a Bluetooth endpoint that Windows is re-enumerating are indistinguishable to
+WASAPI, but a cable replug reappears almost immediately while a Bluetooth headset that is
+switched off and on again — or that walks back into range — takes seconds. A fixed budget of
+three one-second retries therefore reported a returning headset as unrecoverable, which is
+issue #34. The default is deliberately generous and deliberately still bounded: an endpoint
+that never returns must not keep a track alive forever, and the reported gap is what tells a
+reader how much audio was actually lost.
+
+The window is snapshotted at session start with the rest of the capture settings, so a
+recording that is already running keeps the policy it started with
+(`docs/CONFIGURATION.md` section 12).
+
+### 8.2 An outage that never recovers is still a gap
+
+A measured outage is normally placed on the session timeline by the *next* buffer: only then
+is the restarted stream's position known (`docs/RELIABILITY.md` section 7). A track that never
+recovers has no next buffer, so the outage it measured while retrying is applied directly when
+the track ends (`CaptureTimeline.RecordTerminalDeviceLoss`) and written as an explicit
+`capture.gap` event with `reason = "not_captured"`.
+
+Without that, a session whose own log described a multi-second hole reported
+`gap_count: 0` and `gap_total_ms: 0` — which is exactly what issue #34 observed. The number
+reported is the measured outage, not an estimate of what a successful recovery would have
+captured: it is a floor on the missing audio, and it is stated as such.
+
+A track that never placed a buffer reports no terminal gap. There is no span of captured audio
+for anything to be missing from, and inventing one would overstate the loss in exactly the
+direction a reader cannot check.
+
+The same accounting covers a session that is stopped with the outage still unplaced. There are two
+shapes of that: the endpoint never came back and the operator stopped with the recovery window
+still open, and the endpoint *did* come back but the session was stopped before the reopened
+endpoint delivered a single buffer — so there is still no next buffer to place the measured
+outage. Both are recorded the same way as the unrecoverable case, with the same interval and the
+same `reason = "not_captured"`. The reported interval and reason are identical across all three
+terminal cases; only the event's `detail` distinguishes "the device never came back" from "the
+recording was stopped first" from "the endpoint returned at a format the session refused to
+splice". The track is degraded whenever its device was lost, whether or not it recovered, and the
+reported gap accounts for the audio that is missing from the span it did capture.
+
 ## 9. Network loss
 
 Expected behavior:

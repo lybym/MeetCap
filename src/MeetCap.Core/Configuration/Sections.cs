@@ -18,6 +18,28 @@ public sealed class CaptureSection
     public int BufferSeconds { get; set; } = 5;
     public int FlushIntervalMs { get; set; } = 1000;
 
+    /// <summary>
+    /// How long one capture track keeps retrying its configured endpoint after the device
+    /// disappears before it ends that track (docs/RELIABILITY.md section 8).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A wired endpoint that is unplugged and an endpoint that Windows is re-enumerating are
+    /// indistinguishable to WASAPI, but they do not come back on the same timescale. A
+    /// Bluetooth headset that is switched off and on again — or that simply walks back into
+    /// range — takes seconds to reappear as an audio endpoint, which is why the window
+    /// defaults comfortably above the fraction of a second a cable replug needs. Without an
+    /// explicit window the endpoint was reported unrecoverable after three one-second
+    /// retries, so a headset that returned a few seconds later found a track that had
+    /// already ended (issue #34).
+    /// </para>
+    /// <para>
+    /// The window stays bounded: when it closes the endpoint is reported unrecoverable and
+    /// the track ends, exactly as before. <c>0</c> means "do not attempt recovery at all".
+    /// </para>
+    /// </remarks>
+    public int DeviceRecoverySeconds { get; set; } = 20;
+
     public CaptureOfflineSection Offline { get; set; } = new();
     public CaptureOnlineSection Online { get; set; } = new();
 }

@@ -61,6 +61,17 @@ public readonly record struct PacketTiming(
 }
 
 /// <summary>
+/// The hole a device outage left at the end of a track that never recovered, in
+/// session-relative milliseconds.
+/// </summary>
+/// <remarks>
+/// The counterpart of <see cref="PacketTiming"/>'s gap fields for the case where no further
+/// buffer exists to carry them: the track is ending, so the outage is named directly rather
+/// than attached to a buffer that will never arrive.
+/// </remarks>
+public readonly record struct TerminalGap(long GapStartMs, long GapEndMs, long GapMs);
+
+/// <summary>
 /// Maps device positions to session-relative milliseconds for one track.
 /// </summary>
 /// <remarks>
@@ -178,6 +189,51 @@ public sealed class CaptureTimeline
         // A zero downtime still marks a restart: the transport changed even if no time
         // was measurably lost.
         _pendingSegmentRestart = true;
+    }
+
+    /// <summary>
+    /// Records the outage a track measured while trying to recover, for the case where the
+    /// track ends without the device ever coming back.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <see cref="RecordDeviceLoss"/> deliberately defers its gap to the next buffer, because
+    /// only then is the restarted stream's position known. A track that never recovers has no
+    /// next buffer, so the deferral would drop the outage entirely and the session would report
+    /// <c>gap_count: 0</c> for a stretch of its own timeline it knows holds no audio — which is
+    /// exactly what issue #34 observed. This closes that hole by applying the measured outage
+    /// immediately.
+    /// </para>
+    /// <para>
+    /// Only the measured outage is accounted for: it is what the track actually observed while
+    /// it was retrying, so the reported number is a floor on the missing audio rather than an
+    /// estimate of a recovery that never happened.
+    /// </para>
+    /// </remarks>
+    /// <returns>
+    /// The named hole, or <c>null</c> when there is nothing to report: a track that never
+    /// placed a buffer has no session span for audio to be missing <em>from</em>, and a
+    /// sub-millisecond outage is not a hole any gap surface in this codebase can express (see
+    /// <see cref="GapIntervalStart"/>).
+    /// </returns>
+    public TerminalGap? RecordTerminalDeviceLoss(long downtimeMs)
+    {
+        // The track is ending, so a deferred restart can never be applied. Clearing it keeps a
+        // later call from reporting an outage that was already accounted for here.
+        _pendingGapMs = 0;
+        _pendingSegmentRestart = false;
+
+        if (!_hasOrigin || downtimeMs <= 0)
+        {
+            return null;
+        }
+
+        var gapStartMs = _lastEndMs;
+        _lastEndMs += downtimeMs;
+        GapTotalMs += downtimeMs;
+        GapCount++;
+
+        return new TerminalGap(gapStartMs, _lastEndMs, downtimeMs);
     }
 
     /// <summary>Places one buffer on the session timeline.</summary>

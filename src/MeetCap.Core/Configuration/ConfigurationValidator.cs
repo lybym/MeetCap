@@ -108,6 +108,12 @@ public static class ConfigurationValidator
         RequireNonNegative(result, "capture.buffer_seconds", capture.BufferSeconds);
         RequirePositive(result, "capture.flush_interval_ms", capture.FlushIntervalMs);
 
+        // Zero is a supported value and means "do not attempt device recovery at all", which
+        // is a deliberate choice rather than a typo (docs/CONFIGURATION.md section 6). A
+        // negative window has no meaning: it would give a track a retry budget smaller than
+        // no retries at all.
+        RequireNonNegative(result, "capture.device_recovery_seconds", capture.DeviceRecoverySeconds);
+
         if (!s_loopbackModes.Contains(capture.Online.LoopbackMode))
         {
             result.AddError(

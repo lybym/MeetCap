@@ -85,6 +85,39 @@ public class ExampleConfigurationTests
             Assert.True(config.Transcript.IncludeSpeakerLabels);
             Assert.Equal("system", config.Capture.Online.LoopbackMode);
             Assert.Equal(string.Empty, config.Capture.Online.ProcessName);
+
+            // Issue #34: the recovery window is part of the shipped contract, not only of the
+            // schema, so the example must carry the same default the model does.
+            Assert.Equal(20, config.Capture.DeviceRecoverySeconds);
+        }
+        finally
+        {
+            Cleanup(dir);
+        }
+    }
+
+    [Fact]
+    public void ExampleConfig_LoadsANonDefaultDeviceRecoveryWindowIntoTheModel()
+    {
+        var dir = NewDir();
+        try
+        {
+            Directory.CreateDirectory(dir);
+            var toml = File.ReadAllText(ExampleConfigPath())
+                .Replace("device_recovery_seconds = 20", "device_recovery_seconds = 7", StringComparison.Ordinal);
+            File.WriteAllText(Path.Combine(dir, "config.toml"), toml);
+
+            var config = new TomlConfigurationStore(dir).Load().Configuration;
+
+            // The shipped example carries the model default (20), so asserting on it alone cannot
+            // fail even if the mapping were dropped entirely — snake_case deserialization is
+            // generic and a missing binding would land on the default. A value that is not the
+            // default is what makes the user-facing knob a checked contract rather than a
+            // restatement of the default (docs/CONFIGURATION.md section 6). That the parsed
+            // window also reaches the derived retry budget is covered where the derivation
+            // lives, in tests/MeetCap.AudioPipeline.Tests/DeviceRecoveryWindowTests.cs.
+            Assert.Equal(7, config.Capture.DeviceRecoverySeconds);
+            Assert.NotEqual(20, config.Capture.DeviceRecoverySeconds);
         }
         finally
         {

@@ -71,17 +71,27 @@ public sealed class CaptureService
     private readonly CaptureSettings _settings;
     private readonly int _maxDeviceRecoveryAttempts;
 
+    /// <summary>
+    /// Creates the capture service for one session's settings.
+    /// </summary>
+    /// <param name="maxDeviceRecoveryAttempts">
+    /// Test seam: an explicit cap on device-recovery attempts, used by tests that must not
+    /// spend the whole production recovery window in real time. Production passes
+    /// <c>null</c>, and the budget is then derived from
+    /// <see cref="CaptureSettings.DeviceRecoverySeconds"/>
+    /// (docs/RELIABILITY.md section 8).
+    /// </param>
     public CaptureService(
         CapturePlatform platform,
         MeetCapDatabase database,
         CaptureSettings settings,
-        int maxDeviceRecoveryAttempts = 3)
+        int? maxDeviceRecoveryAttempts = null)
     {
         _platform = platform ?? throw new ArgumentNullException(nameof(platform));
         _database = database ?? throw new ArgumentNullException(nameof(database));
         _settings = settings ?? throw new ArgumentNullException(nameof(settings));
 
-        if (maxDeviceRecoveryAttempts < 0)
+        if (maxDeviceRecoveryAttempts is < 0)
         {
             throw new ArgumentOutOfRangeException(
                 nameof(maxDeviceRecoveryAttempts),
@@ -89,10 +99,80 @@ public sealed class CaptureService
                 "Device recovery attempts must not be negative.");
         }
 
-        _maxDeviceRecoveryAttempts = maxDeviceRecoveryAttempts;
+        _maxDeviceRecoveryAttempts = maxDeviceRecoveryAttempts
+            ?? RecoveryAttemptsFor(settings.DeviceRecoverySeconds);
+    }
+
+    /// <summary>
+    /// How many device-recovery attempts realise a recovery window of
+    /// <paramref name="deviceRecoverySeconds"/> seconds.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The window is the policy; the attempt count is only how it is spent. A track waits
+    /// <see cref="CaptureTrack.DeviceRecoveryBackoffMs"/> before each retry, so a window of N
+    /// seconds is N retries and the budget is the window divided by that backoff. The two
+    /// cannot drift apart because neither is configured separately
+    /// (docs/CONFIGURATION.md section 6).
+    /// </para>
+    /// <para>
+    /// The count is the loop bound rather than a wall-clock deadline read from the injected
+    /// clock, because the injected clock is domain time that tests freeze deliberately: a
+    /// deadline read from a frozen clock would never expire and the recovery loop could not
+    /// terminate. A count is bounded whatever the clock does.
+    /// </para>
+    /// <para>
+    /// The multiplication is done in <see cref="long"/> and only then narrowed. Seconds times
+    /// milliseconds overflows <see cref="int"/> above 2,147,483 seconds, and the wrapped value
+    /// is negative — which both downstream consumers clamp to zero, turning an operator's very
+    /// long window into <em>no</em> recovery at all. That is the exact silent inversion of the
+    /// configured policy this derivation exists to remove, so the arithmetic cannot be done in
+    /// <see cref="int"/> (docs/CONFIGURATION.md section 6). Every window validation accepts as a
+    /// non-negative value is therefore honoured: the result is never negative and never
+    /// decreases as the window grows.
+    /// </para>
+    /// <para>
+    /// The narrowing itself is checked rather than clamped. A window of
+    /// <see cref="int.MaxValue"/> seconds — the longest one an <see cref="int"/> can carry, and
+    /// the longest this overload can be given — yields exactly
+    /// <see cref="int.MaxValue"/> attempts, so the checked conversion succeeds for every value
+    /// reachable from configuration and the boundary is exact rather than approximate. A longer
+    /// window, which only a caller handing this overload a <see cref="long"/> could express,
+    /// has no representable attempt count; it throws instead of silently wrapping to a negative
+    /// budget, which is the one failure mode the derivation exists to prevent
+    /// (docs/CONFIGURATION.md section 6).
+    /// </para>
+    /// </remarks>
+    /// <exception cref="OverflowException">
+    /// The window's attempt count exceeds <see cref="int.MaxValue"/> and so cannot be expressed
+    /// as a loop bound. Unreachable from configuration: validation's window is an
+    /// <see cref="int"/> and its longest value is exactly representable.
+    /// </exception>
+    internal static int RecoveryAttemptsFor(int deviceRecoverySeconds)
+        => RecoveryAttemptsFor((long)deviceRecoverySeconds);
+
+    /// <inheritdoc cref="RecoveryAttemptsFor(int)"/>
+    internal static int RecoveryAttemptsFor(long deviceRecoverySeconds)
+    {
+        var attempts = Math.Max(0L, deviceRecoverySeconds) * 1_000L / CaptureTrack.DeviceRecoveryBackoffMs;
+
+        // Not Math.Min: a clamp here could never fire for any window an int can express, so it
+        // would advertise a bound the derivation does not have. Checked narrowing is the guard
+        // that is actually true of the arithmetic (docs/CONFIGURATION.md section 6).
+        return checked((int)attempts);
     }
 
     public CaptureSettings Settings => _settings;
+
+    /// <summary>
+    /// The device-recovery attempt budget this service actually hands to its tracks.
+    /// </summary>
+    /// <remarks>
+    /// Exposed for tests so the derivation can be checked through the production constructor
+    /// rather than only as a standalone calculation
+    /// (<see cref="RecoveryAttemptsFor(int)"/>, docs/CONFIGURATION.md section 6).
+    /// </remarks>
+    internal int MaxDeviceRecoveryAttempts => _maxDeviceRecoveryAttempts;
 
     /// <summary>Active capture endpoints, default first.</summary>
     public IReadOnlyList<CaptureDeviceInfo> ListDevices() => OrderDevices(_platform.Devices.EnumerateCaptureDevices());

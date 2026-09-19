@@ -23,6 +23,19 @@ public class ConfigurationDefaultsTests
     }
 
     [Fact]
+    public void Default_DeviceRecoveryWindowCoversABluetoothReconnect()
+    {
+        // Issue #34: the window has to be long enough that a headset which is switched off and
+        // on again reappears inside it. The pre-fix behaviour was three one-second retries, so a
+        // default that does not clearly exceed that would leave the reported defect in place.
+        var c = ConfigurationDefaults.Default();
+        Assert.Equal(20, c.Capture.DeviceRecoverySeconds);
+        Assert.True(
+            c.Capture.DeviceRecoverySeconds > 3,
+            "the default recovery window must exceed the three retries that produced issue #34");
+    }
+
+    [Fact]
     public void Default_StorageDataRootPlaceholder()
         => Assert.Equal("%LOCALAPPDATA%\\MeetCap", ConfigurationDefaults.Default().Storage.DataRoot);
 

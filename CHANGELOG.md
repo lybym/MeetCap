@@ -16,6 +16,53 @@ milestones are described as the former, never the latter
 
 ### Fixed
 
+- **Capture recovers after a Bluetooth endpoint disappears and returns**
+  ([#34](https://github.com/lybym/MeetCap/issues/34)). Device-loss recovery was a fixed budget
+  of three one-second retries, so an endpoint that needed longer than three seconds to reappear
+  was reported fatally lost: on the machine that reproduced this, a Sony WF-1000XM5 that was
+  disconnected and reconnected ten seconds later left both the microphone and the loopback track
+  with `capture.device_lost_fatal`, and the session was finalized with
+  `end_reason = "device_lost"` even though the same endpoints were listed again by
+  `meetcap devices`. Recovery is now bounded by a configurable window
+  (`capture.device_recovery_seconds`, default 20 s) instead of a hard-coded retry count, and a
+  track whose endpoint returns inside that window reopens it and keeps recording while the
+  unaffected track continues independently (`docs/RELIABILITY.md` section 8.1).
+- **An outage that never recovers is quantified instead of reported as zero**
+  ([#34](https://github.com/lybym/MeetCap/issues/34)). A measured device outage is placed on the
+  session timeline by the *next* buffer, because only then is the restarted stream's position
+  known; a track that never recovered therefore discarded the outage it had measured, and the
+  session reported `gap_count: 0` and `gap_total_ms: 0` for a stretch its own event log
+  described as lost. The measured outage is now applied when the track ends and written as an
+  explicit `capture.gap` with `reason = "not_captured"`
+  (`CaptureTimeline.RecordTerminalDeviceLoss`, `docs/RELIABILITY.md` section 8.2). The same
+  accounting now covers the two other ways a session can end with the outage still unplaced: an
+  endpoint that *did* return, where the session was stopped before the reopened endpoint
+  delivered a single buffer, and a session stopped while the endpoint was still gone with
+  recovery time left in its window. Both outages were measured and neither was placed, and both
+  are no less real than the unrecoverable one.
+- **A terminal gap no longer states the wrong reason why its audio is missing**
+  ([#34](https://github.com/lybym/MeetCap/issues/34)). Every terminal `capture.gap` carries the
+  same interval and the same `reason = "not_captured"`, so its `detail` is the only field that
+  says *why* the audio after the outage is gone. That wording was keyed on whether the endpoint
+  had reopened, so a track that ended because the endpoint came back at a format the session
+  refuses to splice claimed instead that "the session stopped before the reopened endpoint
+  delivered a buffer" — directly contradicting the `capture.format_changed` event and the
+  `end_reason = "device_format_changed"` written beside it. The cause is now recorded with the
+  handoff on the capture thread (`CaptureTrack.TerminalDeviceLossCause`) and each terminal path
+  has its own truthful sentence, asserted by a regression test per path
+  (`docs/RELIABILITY.md` section 8.2).
+- **A very long recovery window no longer silently buys no recovery at all**
+  ([#34](https://github.com/lybym/MeetCap/issues/34)). The attempt budget derived from
+  `capture.device_recovery_seconds` multiplied seconds by milliseconds in `int`, which overflows
+  above 2,147,483 seconds: the wrapped negative count was clamped to zero by both consumers, so a
+  window long enough to overflow produced no retries rather than many — the configured policy
+  inverted, which is the failure this release exists to remove. The derivation now multiplies in
+  `long` and narrows with a checked conversion, so every window validation accepts buys at least
+  as many attempts as any shorter one. The longest window an `int` can carry is also the exact
+  boundary — `int.MaxValue` seconds is `int.MaxValue` attempts — so there is no saturation clamp
+  to advertise; a longer window than any `int` can express throws rather than wrapping negative,
+  which is unreachable from configuration (`CaptureService.RecoveryAttemptsFor`,
+  `docs/CONFIGURATION.md` section 6).
 - **Windows process loopback no longer reports a false discontinuity for every buffer**
   ([#33](https://github.com/lybym/MeetCap/issues/33)). Process loopback captures a process tree
   rather than an endpoint's own stream, and on the machine that reproduced this the audio engine
@@ -40,6 +87,13 @@ milestones are described as the former, never the latter
 
 ### Added
 
+- **`capture.device_recovery_seconds`** configuration key (issue
+  [#34](https://github.com/lybym/MeetCap/issues/34)): how long one capture track keeps retrying
+  its configured endpoint after the device disappears before it reports the device
+  unrecoverable and ends that track. Default `20`, `0` disables recovery, negative values are
+  rejected. The retry budget is derived from the window rather than configured beside it, so the
+  two cannot disagree, and the value is recorded in the session's `config_snapshot`
+  (`docs/CONFIGURATION.md` section 6, `docs/RELIABILITY.md` section 8.1).
 - **`capture.timeline_unusable`** session event: a track whose stream supplies neither a usable
   device position nor a QPC timestamp has no device timing to be placed by, so it ends with this
   one explicit event — carrying the reason and the baseline alternative — rather than writing
@@ -66,6 +120,12 @@ milestones are described as the former, never the latter
   `tests/MeetCap.Core.Tests/Capture/CaptureTimelineTests.cs`,
   `tests/MeetCap.AudioPipeline.Tests/ProcessLoopbackTimelineTests.cs` and
   `tests/MeetCap.WindowsAudio.Tests/NAudioLoopbackClockTests.cs`.
+- Issue [#34](https://github.com/lybym/MeetCap/issues/34)'s real-hardware criterion is **not
+  run**: the machine this work was prepared on has no Bluetooth audio endpoint, so a headset
+  disconnect/reconnect could not be exercised. The recovery window, both tracks' reconnect
+  behaviour, the gap quantification and the reporting are covered by
+  `tests/MeetCap.AudioPipeline.Tests/DeviceRecoveryWindowTests.cs`, and the run to perform on a
+  machine with a headset is written down in `docs/M1_WINDOWS_VALIDATION.md` section 16.
 
 ## [0.2.0] - 2026-09-19
 

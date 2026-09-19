@@ -8,6 +8,11 @@ default_mode = "offline"
 chunk_seconds = 60
 buffer_seconds = 5
 flush_interval_ms = 1000
+# How long one capture track keeps retrying its configured endpoint after the device
+# disappears before it reports the device unrecoverable and ends that track. Bounded by
+# design; a Bluetooth headset takes seconds to reappear, hence the default. 0 disables
+# device recovery entirely.
+device_recovery_seconds = 20
 
 [capture.offline]
 microphone_device_id = "default"

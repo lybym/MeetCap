@@ -49,9 +49,13 @@ session still completes, and the outage is recorded as a degraded flag plus expl
 events. See `docs/RELIABILITY.md` section 8.
 
 `config_snapshot` is a JSON object holding the capture-relevant settings the session
-started with (`data_root`, `chunk_seconds`, `buffer_seconds`, `flush_interval_ms`,
-`minimum_free_space_gb`, `microphone_device_id`, `config_version`). It is written into a
-local artifact, so it never contains secret material.
+started with: `data_root`, `mode`, `chunk_seconds`, `buffer_seconds`, `flush_interval_ms`,
+`device_recovery_seconds`, `minimum_free_space_gb`, `microphone_device_id`, `config_version`,
+and — for an online session — a nested `online` object with `microphone_device_id`,
+`loopback_mode`, `render_device_id` and `process_name`. The key order is the order
+`CaptureConfigSnapshot.ToJson` writes; every key is additive, so a reader written against an
+older session still finds the keys it knows. It is written into a local artifact, so it never
+contains secret material.
 
 ## 2. Session directory
 
@@ -201,9 +205,10 @@ before M2 — or by a recording that never reached its teardown — simply lacks
 ```
 
 - `gap_count` and `gap_total_ms` are what the capture timeline observed while it was alive:
-  one count per discontinuity — a device-position skip or a measured device outage — and the
-  milliseconds they add up to (`docs/ARCHITECTURE.md` section 8.1). The `session.stopped`
-  event carries the same total as `gap_ms`.
+  one count per discontinuity — a device-position skip, a measured device outage, or an outage
+  a track ended on without recovering (section 4.1, issue #34) — and the milliseconds they add
+  up to (`docs/ARCHITECTURE.md` section 8.1). The `session.stopped` event carries the same
+  total as `gap_ms`.
 - `capture_health` is the `AudioBufferHealth` record: the queue bound this session actually
   used (`capacity_packets`, `AudioBufferHealth.CapacityPackets` in C#), the deepest backlog it
   reached (`peak_queued_packets`), the packets the bound refused (`dropped_packets` and the
@@ -366,13 +371,25 @@ events whose name alone is not specific enough. `capture.gap` uses it for the ga
 (`not_captured`, `chunk_unreadable` or `chunk_missing`, section 5.1) and `session.recovered`
 sets `reason=incomplete` when the session still has a known gap.
 
-### 4.1 `capture.gap` has two producers, and they must name the same hole
+### 4.1 `capture.gap` has three producers, and they must name the same hole
 
 A gap is observed twice: the live recording measures it while it is running, and recovery
-re-derives it from the chunk index afterwards (section 5.1). The event therefore carries the
-gap's own interval in `gap_start_ms` / `gap_end_ms` — where audio stopped and where it resumed
-— and `at_ms` remains the position on the timeline the event is placed at, which for the live
-writer is the resume position.
+re-derives it from the chunk index afterwards (section 5.1). The live writer produces two of the
+three cases — a device-position skip between buffers, and a measured outage with no resume
+position — while recovery produces the third. The event therefore carries the gap's own interval
+in `gap_start_ms` / `gap_end_ms` — where audio stopped and where it resumed — and `at_ms` remains
+the position on the timeline the event is placed at, which for the live writer is the resume
+position. When there is no resume position the outage's end is used instead.
+
+The live writer's second case is a configured endpoint that disappeared and never came back
+within its recovery window (`docs/RELIABILITY.md` section 8.2, issue #34) — or that did come back
+after a session had already been asked to stop, so the reopened endpoint never delivered a buffer.
+Either way there is no resume position, so the outage measured while retrying is applied when the
+track stops receiving buffers and written as a `capture.gap` with `reason = "not_captured"` whose
+`gap_start_ms` is where the last captured buffer ended and whose `gap_end_ms` is that position
+plus the measured outage. It exists because the alternative — an outage the track measured but
+never placed, because placing it is the next buffer's job — left `gap_count: 0` on a session whose
+own log described a multi-second hole.
 
 Those are deliberately not the same coordinate. The live writer's `start_ms`, when it sets it
 at all, is the position of the *buffer* it is writing (where audio resumes), while the audit's
