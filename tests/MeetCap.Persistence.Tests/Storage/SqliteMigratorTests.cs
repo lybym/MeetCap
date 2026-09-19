@@ -1,4 +1,5 @@
 using Microsoft.Data.Sqlite;
+using MeetCap.Core.Asr;
 using MeetCap.Persistence.Storage;
 using Xunit;
 
@@ -203,11 +204,318 @@ public class SqliteMigratorTests
             // supported value regardless of what a pre-#26 row stored (docs/DATA_MODEL.md
             // section 6).
             Assert.Equal("standard", new SqliteAsrJobStore(db).Get("job_legacy")!.Tier);
+
+            // Everything migration 0006 added must still be readable through the store after
+            // 0005 replays. This is the regression the CI failure exposed: the 0005 rebuild
+            // recreated `asr_jobs` from its own older shape, DROP TABLE removed the columns a
+            // later migration had added, and the very next `Get` failed with
+            // "no such column: audio_transport".
+            var legacy = new SqliteAsrJobStore(db).Get("job_legacy")!;
+            Assert.Equal("inline", legacy.AudioTransport);
+            Assert.Null(legacy.TosBucket);
+            Assert.Null(legacy.TosObjectKey);
+            Assert.False(legacy.TosCleanupPending);
         }
         finally
         {
             Cleanup(db);
         }
+    }
+
+    [Fact]
+    public void Migrate_ReRunOfBothAsrJobMigrations_PreservesEveryColumnAndValue()
+    {
+        // 0005 and 0006 both rebuild `asr_jobs`, and either can be the one that runs a second
+        // time. Whichever replays, DROP TABLE removes columns it never heard of, so each rebuild
+        // has to declare the whole post-#26 schema *and* copy every later column through
+        // SqliteMigrator's schema-conditional placeholder. Replaying both is the strictest form
+        // of that check: the table has to survive a full round trip with its data intact.
+        var db = NewDb();
+        try
+        {
+            var migrator = new SqliteMigrator();
+            migrator.Migrate(db);
+
+            using var c = Open(db);
+            using (var seed = new SqliteCommand(
+                       "INSERT INTO asr_jobs (id, session_id, source, tier, provider, input_artifact, " +
+                       "status, provider_request_id, created_at, updated_at, provider_log_id, " +
+                       "audio_transport, tos_bucket, tos_object_key, tos_cleanup_pending) " +
+                       "VALUES ('job_tos', 'ses_1', 'import', 'standard', 'volcengine', " +
+                       "'audio/import/a.wav', 'succeeded', 'req-tos', @now, @now, 'LOGID-REAL', " +
+                       "'tos', 'meetcap-asr', 'meetcap-asr/ab/2026/09/19/job_tos.wav', 1)",
+                       c))
+            {
+                seed.Parameters.AddWithValue("@now", "2026-09-15T00:00:00Z");
+                seed.ExecuteNonQuery();
+            }
+
+            ForgetAsrJobMigration(c, "0005_asr_job_provider_log_id.sql");
+            migrator.Migrate(db); // replay of 0005 with 0006's columns present
+            Assert.True(ColumnExists(c, "asr_jobs", "audio_transport"));
+            Assert.True(ColumnExists(c, "asr_jobs", "tos_cleanup_pending"));
+
+            ForgetAsrJobMigration(c, "0006_tos_asr_transport.sql");
+            migrator.Migrate(db); // replay of 0006 with 0005 already committed
+            Assert.True(ColumnExists(c, "asr_jobs", "provider_log_id"));
+
+            // No half-built table may survive either rebuild, and every migration is still
+            // recorded exactly once.
+            Assert.False(TableExists(c, "asr_jobs_new"));
+            Assert.Equal(ExpectedVersions().Count, Count(c, "SELECT COUNT(*) FROM schema_migrations"));
+
+            using (var read = new SqliteCommand(
+                       "SELECT provider_log_id, audio_transport, tos_bucket, tos_object_key, " +
+                       "tos_cleanup_pending, status FROM asr_jobs WHERE id = 'job_tos'",
+                       c))
+            using (var reader = read.ExecuteReader())
+            {
+                Assert.True(reader.Read());
+                Assert.Equal("LOGID-REAL", reader.GetString(0));
+                Assert.Equal("tos", reader.GetString(1));
+                Assert.Equal("meetcap-asr", reader.GetString(2));
+                Assert.Equal("meetcap-asr/ab/2026/09/19/job_tos.wav", reader.GetString(3));
+                // The cleanup debt is durable state, not a transient hint: a replay must not
+                // quietly mark an object as released that is still in the bucket.
+                Assert.Equal(1, reader.GetInt32(4));
+                Assert.Equal("succeeded", reader.GetString(5));
+            }
+
+            // The domain store is the real reader, so it is what proves the columns are usable.
+            var stored = new SqliteAsrJobStore(db).Get("job_tos")!;
+            Assert.Equal("tos", stored.AudioTransport);
+            Assert.Equal("meetcap-asr", stored.TosBucket);
+            Assert.Equal("meetcap-asr/ab/2026/09/19/job_tos.wav", stored.TosObjectKey);
+            Assert.True(stored.TosCleanupPending);
+        }
+        finally
+        {
+            Cleanup(db);
+        }
+    }
+
+    [Fact]
+    public void Migrate_UpgradeFromAPreIssue29Database_AddsTheTransportColumnsWithInlineDefaults()
+    {
+        // The other half of the upgrade story: a data root created before issue #29 has no
+        // transport columns at all. Forward migration must add them, and every existing job must
+        // read back as an inline job with no TOS identity, so nothing is retroactively claimed to
+        // have been staged.
+        var db = NewDb();
+        try
+        {
+            var migrator = new SqliteMigrator();
+            migrator.Migrate(db);
+
+            using (var c = Open(db))
+            {
+                using (var insert = new SqliteCommand(
+                           "INSERT INTO asr_jobs (id, session_id, source, tier, provider, input_artifact, " +
+                           "status, provider_request_id, created_at, updated_at) " +
+                           "VALUES ('job_pre29', 'ses_1', 'import', 'standard', 'volcengine', " +
+                           "'audio/import/a.wav', 'pending', 'req-pre', @now, @now)",
+                           c))
+                {
+                    insert.Parameters.AddWithValue("@now", "2026-09-15T00:00:00Z");
+                    insert.ExecuteNonQuery();
+                }
+
+                // Rewind to the pre-#29 schema: drop 0006's columns and forget its version, which
+                // is exactly the state a data root migrated before this issue is in.
+                foreach (var column in new[] { "audio_transport", "tos_bucket", "tos_object_key", "tos_cleanup_pending" })
+                {
+                    using var drop = new SqliteCommand($"ALTER TABLE asr_jobs DROP COLUMN {column}", c);
+                    drop.ExecuteNonQuery();
+                }
+
+                ForgetAsrJobMigration(c, "0006_tos_asr_transport.sql");
+            }
+
+            migrator.Migrate(db);
+
+            using (var c = Open(db))
+            {
+                Assert.True(ColumnExists(c, "asr_jobs", "audio_transport"));
+                Assert.True(ColumnExists(c, "asr_jobs", "tos_bucket"));
+                Assert.True(ColumnExists(c, "asr_jobs", "tos_object_key"));
+                Assert.True(ColumnExists(c, "asr_jobs", "tos_cleanup_pending"));
+                Assert.True(ColumnExists(c, "asr_jobs", "provider_log_id"));
+
+                // The pre-existing row survived the upgrade with its own values untouched.
+                Assert.Equal("req-pre", ReadString(c, "SELECT provider_request_id FROM asr_jobs WHERE id = 'job_pre29'"));
+                Assert.Equal("inline", ReadString(c, "SELECT audio_transport FROM asr_jobs WHERE id = 'job_pre29'"));
+                Assert.True(ReadIsNull(c, "SELECT tos_bucket FROM asr_jobs WHERE id = 'job_pre29'"));
+            }
+
+            var upgraded = new SqliteAsrJobStore(db).Get("job_pre29")!;
+            Assert.Equal("inline", upgraded.AudioTransport);
+            Assert.Null(upgraded.TosBucket);
+            Assert.Null(upgraded.TosObjectKey);
+            Assert.False(upgraded.TosCleanupPending);
+            Assert.Equal("req-pre", upgraded.ProviderRequestId);
+        }
+        finally
+        {
+            Cleanup(db);
+        }
+    }
+
+    [Fact]
+    public void Migrate_AudioTransportRejectsAnUnknownTransportValue()
+    {
+        // The column is what a reader trusts to decide whether a remote copy exists, so the
+        // CHECK constraint has to reject a value the domain type cannot interpret.
+        var db = NewDb();
+        try
+        {
+            new SqliteMigrator().Migrate(db);
+            using var c = Open(db);
+
+            using var insert = new SqliteCommand(
+                "INSERT INTO asr_jobs (id, session_id, source, tier, provider, input_artifact, status, " +
+                "provider_request_id, audio_transport, created_at, updated_at) " +
+                "VALUES ('job_bad', 'ses_1', 'import', 'standard', 'volcengine', 'audio/import/a.wav', " +
+                "'pending', 'req', 's3', @now, @now)",
+                c);
+            insert.Parameters.AddWithValue("@now", "2026-09-15T00:00:00Z");
+            Assert.ThrowsAny<SqliteException>(() => insert.ExecuteNonQuery());
+        }
+        finally
+        {
+            Cleanup(db);
+        }
+    }
+
+    [Fact]
+    public void ListCleanupPending_ReturnsOnlyTerminalJobsThatStillOweARelease()
+    {
+        // Cleanup debt is deliberately not "outstanding work": a succeeded job that still owns a
+        // staged object must not make a session look unfinished, but it must still be found by
+        // the cleanup pass (docs/DATA_MODEL.md section 6.2).
+        var db = NewDb();
+        try
+        {
+            new SqliteMigrator().Migrate(db);
+            var store = new SqliteAsrJobStore(db);
+            using var c = Open(db);
+
+            InsertTransportJob(c, "job_succeeded_owed", status: "succeeded", pending: 1, createdMinute: 1);
+            InsertTransportJob(c, "job_failed_owed", status: "failed", pending: 1, createdMinute: 2);
+            InsertTransportJob(c, "job_succeeded_settled", status: "succeeded", pending: 0, createdMinute: 3);
+            InsertTransportJob(c, "job_running_owed", status: "polling", pending: 1, createdMinute: 4);
+            InsertTransportJob(c, "job_other_session", status: "succeeded", pending: 1, createdMinute: 5, sessionId: "ses_2");
+
+            var all = store.ListCleanupPending(10).Select(j => j.Id).ToArray();
+            Assert.Equal(new[] { "job_succeeded_owed", "job_failed_owed", "job_other_session" }, all);
+
+            var scoped = store.ListCleanupPending(10, "ses_1").Select(j => j.Id).ToArray();
+            Assert.Equal(new[] { "job_succeeded_owed", "job_failed_owed" }, scoped);
+
+            Assert.Empty(store.ListCleanupPending(0));
+
+            // The limit is honoured oldest-first, so a bounded cleanup pass finishes the oldest
+            // debt rather than an arbitrary subset.
+            Assert.Single(store.ListCleanupPending(1), j => j.Id == "job_succeeded_owed");
+        }
+        finally
+        {
+            Cleanup(db);
+        }
+    }
+
+    [Fact]
+    public void AudioTransportIdentity_RoundTripsThroughTheStoreWithoutTheSignedUrl()
+    {
+        // AC: bucket + object key are durable for crash recovery, and the presigned URL is never
+        // durable state. The row is the only place a restart can learn the stable identity from,
+        // so the read-back is asserted in full.
+        var db = NewDb();
+        try
+        {
+            new SqliteMigrator().Migrate(db);
+            var store = new SqliteAsrJobStore(db);
+
+            var job = new AsrJob
+            {
+                Id = "job_tos",
+                SessionId = "ses_1",
+                Source = "import",
+                Provider = "volcengine",
+                InputArtifact = "audio/import/normalized.wav",
+                ProviderRequestId = "req-tos",
+                Status = AsrJobStatus.Submitted,
+                AudioTransport = "tos",
+                TosBucket = "meetcap-asr",
+                TosObjectKey = "meetcap-asr/deadbeefdeadbeef/2026/09/19/job_tos.wav",
+                TosCleanupPending = true,
+                CreatedAt = DateTimeOffset.Parse("2026-09-15T00:00:00Z"),
+                UpdatedAt = DateTimeOffset.Parse("2026-09-15T00:00:00Z"),
+            };
+
+            store.Create(job);
+            var read = store.Get("job_tos")!;
+
+            Assert.Equal("tos", read.AudioTransport);
+            Assert.Equal("meetcap-asr", read.TosBucket);
+            Assert.Equal("meetcap-asr/deadbeefdeadbeef/2026/09/19/job_tos.wav", read.TosObjectKey);
+            Assert.True(read.TosCleanupPending);
+
+            // A released object clears only the debt: the identity stays for the audit trail.
+            store.Update(AsrJobTransitions.MarkAudioReleased(read, DateTimeOffset.Parse("2026-09-15T01:00:00Z")));
+            var released = store.Get("job_tos")!;
+            Assert.False(released.TosCleanupPending);
+            Assert.Equal("meetcap-asr/deadbeefdeadbeef/2026/09/19/job_tos.wav", released.TosObjectKey);
+
+            // Nothing durable carries a signed URL: the only columns are the stable identity.
+            using var c = Open(db);
+            var ddl = ReadString(c, "SELECT sql FROM sqlite_master WHERE name = 'asr_jobs'")!;
+            Assert.DoesNotContain("signature", ddl, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("presigned", ddl, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("url", ddl, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            Cleanup(db);
+        }
+    }
+
+    private static void InsertTransportJob(
+        SqliteConnection c,
+        string id,
+        string status,
+        int pending,
+        int createdMinute = 0,
+        string sessionId = "ses_1")
+    {
+        using var cmd = new SqliteCommand(
+            "INSERT INTO asr_jobs (id, session_id, source, tier, provider, input_artifact, status, " +
+            "provider_request_id, audio_transport, tos_bucket, tos_object_key, tos_cleanup_pending, " +
+            "created_at, updated_at) " +
+            "VALUES (@id, @sid, 'import', 'standard', 'volcengine', 'audio/import/a.wav', @status, " +
+            "@req, 'tos', 'meetcap-asr', @key, @pending, @now, @now)",
+            c);
+        cmd.Parameters.AddWithValue("@id", id);
+        cmd.Parameters.AddWithValue("@sid", sessionId);
+        cmd.Parameters.AddWithValue("@status", status);
+        cmd.Parameters.AddWithValue("@req", "req-" + id);
+        cmd.Parameters.AddWithValue("@key", "meetcap-asr/ab/2026/09/19/" + id + ".wav");
+        cmd.Parameters.AddWithValue("@pending", pending);
+        // Distinct, ordered timestamps so the oldest-first ordering is asserted rather than
+        // accidentally satisfied by whatever order the rows happen to be inserted in.
+        cmd.Parameters.AddWithValue("@now", $"2026-09-15T00:{createdMinute:D2}:00Z");
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>Forgets one migration's version row, which is how a replay is reached.</summary>
+    private static void ForgetAsrJobMigration(SqliteConnection c, string resourceSuffix)
+    {
+        var version = new SqliteMigrator().GetMigrations()
+            .Single(m => m.ResourceName.EndsWith(resourceSuffix, StringComparison.Ordinal))
+            .Version;
+
+        using var forget = new SqliteCommand("DELETE FROM schema_migrations WHERE version = @v", c);
+        forget.Parameters.AddWithValue("@v", version);
+        forget.ExecuteNonQuery();
     }
 
     [Fact]
