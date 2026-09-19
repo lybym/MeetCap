@@ -48,6 +48,7 @@ built-in defaults
 [media]
 [asr]
 [asr.volcengine]
+[asr.tos]
 [speakers]
 [speakers.identity]
 [speakers.sherpa_onnx]
@@ -222,7 +223,7 @@ resource header:       X-Api-Resource-Id: volc.seedasr.auc
 submit endpoint:        https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit
 query endpoint:         https://openspeech.bytedance.com/api/v3/auc/bigmodel/query
 task id:                UUID persisted before submit and reused for query
-audio transport:        audio.data (Base64)
+audio transport:        <=20 MiB audio.data; >20 MiB TOS presigned audio.url (target #29)
 model_name:             bigmodel
 ```
 
@@ -276,6 +277,65 @@ Because these labels are the default MVP diarization source, `speakers.enabled =
 `request_speaker_info = false` produces a validation warning: recording still succeeds, but no
 anonymous speaker clusters exist for the identity pipeline to match unless a local diarization
 fallback is configured.
+
+## 8.1 TOS large-file ASR transport (target after issue #29)
+
+TOS is optional infrastructure for oversized file-ASR inputs. It is not required for normal
+300-second live batches and does not replace the local session/audio artifact tree.
+
+```toml
+[asr.tos]
+bucket = "meetcap-asr"
+region = "cn-beijing"
+endpoint = "https://tos-cn-beijing.volces.com"
+access_key = "env:TOS_ACCESS_KEY"
+secret_key = "env:TOS_SECRET_KEY"
+```
+
+Transport policy is fixed product behavior rather than additional tuning:
+
+```text
+<= 20 MiB -> Seed-ASR audio.data Base64
+> 20 MiB  -> TOS .NET SDK PutObject(FileStream) -> private object -> presigned GET -> audio.url
+```
+
+The 20 MiB threshold, six-hour presigned-URL validity, object-key format, private ACL policy,
+simple-vs-multipart choice, and cleanup policy are not user-configurable in this issue.
+
+Validation rules:
+
+- omitting `[asr.tos]` is valid while every submitted artifact remains at or below 20 MiB;
+- once a larger artifact requires TOS, `bucket`, `region`, `endpoint`, `access_key`, and
+  `secret_key` must all resolve before provider submission;
+- `access_key` and `secret_key` use the existing secret resolver and are redacted by
+  `meetcap config show`; they MUST NOT be written to session/job artifacts or normal logs;
+- the bucket/object is private; MeetCap never requires public-read access;
+- the deployment credential should be scoped to the configured bucket/prefix and only the
+  required `tos:PutObject`, `tos:GetObject`, and `tos:DeleteObject` operations;
+- MeetCap does not create buckets or mutate bucket IAM/lifecycle configuration.
+
+TOS object keys use the dedicated `meetcap-asr/` prefix plus a randomized component before
+date/job identity to avoid a purely increasing key sequence. Meeting titles and speaker names
+must not be embedded in remote object keys.
+
+The presigned GET URL is ephemeral and MUST NOT be persisted. Durable recovery stores the TOS
+bucket and object key, then regenerates a URL through the official SDK if submission must be
+continued after restart.
+
+A TOS-backed terminal job attempts idempotent object deletion. A cleanup failure is observable
+cleanup debt, not a transcription failure. Operators should configure a three-day lifecycle
+expiration rule for the `meetcap-asr/` prefix as a safety net for orphaned objects.
+
+Official references:
+
+- https://docs.volcengine.com/docs/TorchObjectStorage/SDKOverview-6?lang=zh
+- https://www.volcengine.com/docs/6349/1130432?lang=zh
+- https://www.volcengine.com/docs/6349/1130151?lang=en
+- https://www.volcengine.com/docs/6349/1130756?lang=zh
+- https://www.volcengine.com/docs/6349/1167743?lang=zh
+
+Until issue #29 lands, `main` remains inline-Base64-only; this section defines the target
+configuration contract and must not be read as an implementation-status claim.
 
 ## 9. Speaker architecture
 

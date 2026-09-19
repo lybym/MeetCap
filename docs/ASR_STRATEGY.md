@@ -28,7 +28,7 @@ authentication: X-Api-Key only (new console)
 resource id:    volc.seedasr.auc
 submit:         POST https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit
 query:          POST https://openspeech.bytedance.com/api/v3/auc/bigmodel/query
-audio upload:   audio.data (Base64)
+audio transport: <= 20 MiB audio.data (Base64); > 20 MiB TOS presigned audio.url (#29 target)
 ```
 
 The resource ID and endpoint family are provider protocol constants, not user-tunable settings.
@@ -40,8 +40,11 @@ the submit/query lifecycle. Header presence and sequence semantics MUST match th
 Standard HTTP interface exactly. MeetCap also retains the provider's `X-Tt-Logid` for
 diagnostics while never persisting the API key.
 
-MeetCap keeps its local-first workflow: normalized WAV artifacts are submitted through the
-official `audio.data` Base64 form, so object storage is not required merely to call ASR.
+MeetCap keeps its local-first workflow. Under issue #29, normalized WAV artifacts at or below
+20 MiB stay on the official `audio.data` Base64 path; larger inputs use a private Volcengine TOS
+object uploaded with the official TOS .NET SDK, then submit an SDK-generated presigned GET URL
+through `audio.url`. TOS is therefore a large-file transport fallback, not a prerequisite for
+ordinary 300-second live batches and never a replacement for durable local audio.
 
 Authoritative interface reference:
 
@@ -51,10 +54,15 @@ Related official references:
 
 - https://www.volcengine.com/docs/6561/1354871?lang=zh
 - https://www.volcengine.com/docs/6561/1354868?lang=zh
+- https://docs.volcengine.com/docs/TorchObjectStorage/SDKOverview-6?lang=zh
+- https://www.volcengine.com/docs/6349/1130432?lang=zh
+- https://www.volcengine.com/docs/6349/1130151?lang=en
 
 Implementation alignment landed with issue #26: the adapter sends only `X-Api-Key`, fixes
 `X-Api-Resource-Id` to `volc.seedasr.auc`, speaks the submit/query endpoints above with no
 tier routing, and retains the provider's `X-Tt-Logid` on the job row.
+Large-file TOS transport remains tracked by issue #29; until it lands, the implementation on
+`main` remains inline-Base64-only for file transport.
 
 ## 3. Default live-session algorithm
 
@@ -290,9 +298,40 @@ The source file is copied into `audio/import/` and never modified in place; the 
 normalized artifacts are both recorded in `session.json`. A source that is already in the
 target shape is submitted unchanged, so MeetCap never re-encodes audio it does not have to.
 
-The current implementation submits one provider file request per import and does not split
-oversized inputs: exceeding the provider's single-request or inline-upload limit fails with an
-actionable message. Split mapping with preserved original timestamps remains a later concern.
+The current implementation submits one provider file request per import and remains
+inline-Base64-only. Issue #29 changes the transport, not the one-request preference: inputs at or
+below 20 MiB use `audio.data`; larger inputs use a private TOS object and presigned `audio.url`.
+Automatic splitting remains a later concern, and provider duration/size limits still fail with an
+actionable message rather than being silently bypassed.
+
+### 12.1 Large-file transport target (issue #29)
+
+The target transport decision is deterministic and intentionally not user-tunable:
+
+```text
+<= 20 MiB normalized WAV
+  -> inline publisher
+  -> audio.data Base64
+
+> 20 MiB normalized WAV
+  -> official Volcengine TOS .NET SDK PutObject(FileStream)
+  -> private object under meetcap-asr/<random-shard>/...
+  -> SDK-generated presigned GET URL
+  -> audio.url
+```
+
+The TOS adapter lives outside `VolcengineAsrProvider`; the provider owns only the Seed-ASR
+wire contract. Presigned URLs are ephemeral and MUST NOT be durable job identity. Recovery
+persists stable bucket/object-key state and regenerates a URL when required.
+
+The first implementation uses ordinary SDK upload, not multipart upload: the TOS .NET SDK
+supports stream upload and its simple-upload ceiling is well above the Seed-ASR file range.
+TOS credentials use the existing secret resolver and never enter request artifacts or logs.
+
+After a TOS-backed job reaches a terminal state, MeetCap attempts idempotent `DeleteObject`
+cleanup. Cleanup failure does not invalidate a successful transcript. Deployments should also
+configure a three-day TOS lifecycle expiration on the dedicated `meetcap-asr/` prefix as an
+orphan-cleanup safety net; MeetCap does not mutate bucket lifecycle policy itself.
 
 ## 13. Observability
 
@@ -305,6 +344,8 @@ For every ASR job record:
 - retries;
 - provider request ID;
 - provider log ID (`X-Tt-Logid`);
+- audio transport (`inline` or `tos`) and, for TOS, stable bucket/object-key identity only;
+- never the TOS presigned URL, its signature/query parameters, or TOS credentials;
 - success/error code;
 - whether speaker info was requested/returned;
 - estimated cost;

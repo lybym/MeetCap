@@ -91,9 +91,13 @@ contract is implemented by the provider adapter: the only user-supplied provider
 and the service-tier selector are rejected with a migration message rather than reinterpreted.
 The provider's `X-Tt-Logid` is retained per job for support tracing.
 
-Real Volcengine transcription is still **not** verified end to end: it needs a real API key, a
-real network, and provider quota, none of which exist in CI, so the provider boundary is mocked
-in automated tests. The hardware-dependent acceptance tests are tracked as a
+Large-file transport is separately specified by issue #29. The target keeps files at or below
+20 MiB on inline `audio.data`; larger files are temporarily staged in a private Volcengine TOS
+object using the official TOS .NET SDK and submitted through an SDK-generated presigned
+`audio.url`. TOS is optional for ordinary 300-second live batches, never replaces local durable
+audio, and is not implemented on `main` until #29 lands.
+
+The hardware-dependent acceptance tests are tracked as a
 manual checklist in `docs/M1_WINDOWS_VALIDATION.md`; nothing here claims any milestone is
 verified end to end on real audio hardware or real provider credentials yet.
 
@@ -131,6 +135,7 @@ requires M0 through M6, which this release closes at the implementation level
 - FFmpeg/FFprobe through FFMpegCore for media inspection and normalization
 - Polly for transient provider HTTP resilience
 - Volcengine Seed-ASR 2.0 recording-file **Standard HTTP** ASR for transcription and anonymous speaker labels; new-console `X-Api-Key` authentication only
+- Volcengine TOS .NET SDK as the optional >20 MiB ASR transport target in issue #29 (private object + presigned GET URL; not the local recording store)
 - sherpa-onnx + 3D-Speaker ERes2Net-base for local speaker embeddings and persistent identity matching
 - JSONL + Markdown artifacts
 
