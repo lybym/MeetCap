@@ -20,9 +20,6 @@ public sealed record AsrBatchBuilderOptions
     /// <summary>Configured <c>asr.file_batch_seconds</c> (default 300).</summary>
     public int BatchSeconds { get; init; } = 300;
 
-    /// <summary>Configured <c>asr.service_tier</c>.</summary>
-    public string ServiceTier { get; init; } = "standard";
-
     /// <summary>Configured <c>asr.volcengine.request_speaker_info</c>.</summary>
     public bool RequestSpeakerInfo { get; init; } = true;
 
@@ -67,12 +64,6 @@ public sealed record AsrBatch
     /// predates the field or the batch was not reconstructed from one.
     /// </summary>
     public string? Provider { get; init; }
-
-    /// <summary>
-    /// Service tier the batch was built for, read back from its manifest. Null when the manifest
-    /// predates the field or the batch was not reconstructed from one.
-    /// </summary>
-    public string? Tier { get; init; }
 
     public long DurationMs => EndMs - StartMs;
 }
@@ -302,14 +293,15 @@ public sealed class AsrBatchBuilder
                 continue;
             }
 
-            // The batch's own provider/tier, so a recovered orphan is queued for what the
-            // recording was actually configured with rather than for whatever the resuming
-            // process happens to be using. Falls back to the caller's options when the
-            // manifest predates the fields.
+            // The batch's own provider, so a recovered orphan is queued for what the recording
+            // was actually configured with rather than for whatever the resuming process happens
+            // to be using. Falls back to the caller's options when the manifest predates the
+            // field. A manifest written before issue #26 may still carry a `tier`; it is ignored,
+            // because the service tier is no longer a routing input (docs/DATA_MODEL.md
+            // section 6.1).
             var provenance = options with
             {
                 ProviderName = batch.Provider ?? options.ProviderName,
-                ServiceTier = batch.Tier ?? options.ServiceTier,
             };
 
             var queued = QueueJob(paths, batch, jobs, provenance, events, onQueued: null);
@@ -394,7 +386,6 @@ public sealed class AsrBatchBuilder
                 // Provenance written with the batch. Null for a manifest from a build that did not
                 // record it, in which case the caller falls back to its own configuration.
                 Provider = ReadOptionalString(root, "provider"),
-                Tier = ReadOptionalString(root, "tier"),
             };
         }
         catch (JsonException)
@@ -672,10 +663,11 @@ public sealed class AsrBatchBuilder
             ["duration_ms"] = batch.DurationMs,
             ["data_bytes"] = batch.DataBytes,
             // What this batch was built for. Recorded so an orphan recovered by a later process
-            // is queued for the provider and tier the recording actually used, instead of
-            // silently inheriting whatever the resuming process happens to be configured with.
+            // is queued for the provider the recording actually used, instead of silently
+            // inheriting whatever the resuming process happens to be configured with. There is
+            // no `tier` field: issue #26 removed the service-tier selector, so it would only ever
+            // repeat one constant (docs/DATA_MODEL.md section 6.1).
             ["provider"] = options.ProviderName,
-            ["tier"] = options.ServiceTier,
             ["chunks"] = chunks,
         };
 
@@ -725,7 +717,6 @@ public sealed class AsrBatchBuilder
             Id = JobIdFor(batch.SessionId, batch.Source, batch.RelativePath),
             SessionId = batch.SessionId,
             Source = batch.Source,
-            Tier = options.ServiceTier,
             Provider = options.ProviderName,
             StartMs = batch.StartMs,
             EndMs = batch.EndMs,
@@ -782,8 +773,8 @@ public sealed class AsrBatchBuilder
             EndMs = batch.EndMs,
             Count = batch.Chunks.Count,
             Detail =
-                $"job '{job.Id}' queued for '{batch.RelativePath}'; provider '{job.Provider}', " +
-                $"tier '{job.Tier}'. Submission happens off the capture path.",
+                $"job '{job.Id}' queued for '{batch.RelativePath}'; provider '{job.Provider}'. " +
+                "Submission happens off the capture path.",
         });
 
         onQueued?.Invoke();

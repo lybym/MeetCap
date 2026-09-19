@@ -139,8 +139,7 @@ internal static class StartCommand
             if (transcription is not null)
             {
                 context.Out.WriteLine(
-                    $"asr: file ASR, batch window {load.Configuration.Asr.FileBatchSeconds}s, " +
-                    $"tier {load.Configuration.Asr.ServiceTier}");
+                    $"asr: file ASR, batch window {load.Configuration.Asr.FileBatchSeconds}s");
             }
 
             context.Out.WriteLine("recording. press Ctrl+C or run 'meetcap stop' to finish.");
@@ -221,7 +220,6 @@ internal static class StartCommand
                 DataRoot = dataRoot,
                 ProviderName = host.Processor.ProviderName,
                 BatchSeconds = configuration.Asr.FileBatchSeconds,
-                ServiceTier = configuration.Asr.ServiceTier,
                 RequestSpeakerInfo = configuration.Asr.Volcengine.RequestSpeakerInfo,
                 CostPerHourCny = configuration.Asr.Volcengine.CostPerHourCny,
             });

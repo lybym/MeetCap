@@ -109,8 +109,8 @@ internal sealed class FakeAsrProvider : IAsrProvider
         var sanitized = new JsonObject
         {
             ["provider"] = Name,
-            ["endpoint_tier"] = request.ServiceTier,
-            ["resource_id"] = "volc.bigasr.auc",
+            ["model"] = "bigmodel",
+            ["resource_id"] = "volc.seedasr.auc",
             ["job_id"] = request.JobId,
             ["session_id"] = request.SessionId,
             ["source"] = request.Source,

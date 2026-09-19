@@ -31,15 +31,15 @@ public static class ConfigSchema
         "asr.enabled",
         "asr.strategy",
         "asr.file_batch_seconds",
-        "asr.service_tier",
         "asr.streaming_enabled",
         "asr.retry_max_attempts",
         "asr.retry_initial_seconds",
         "asr.retry_max_seconds",
         "asr.final_full_session_pass",
-        "asr.volcengine.app_id",
-        "asr.volcengine.credential",
-        "asr.volcengine.resource_id",
+        // Issue #26: the new-console API key is the only provider authentication key.
+        // asr.service_tier, asr.volcengine.app_id, asr.volcengine.credential and
+        // asr.volcengine.resource_id were removed and are now reported as legacy keys.
+        "asr.volcengine.api_key",
         "asr.volcengine.hotword_table_id",
         "asr.volcengine.request_speaker_info",
         "asr.volcengine.cost_per_hour_cny",

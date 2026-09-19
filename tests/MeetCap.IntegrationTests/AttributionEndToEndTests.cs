@@ -314,7 +314,6 @@ public class AttributionEndToEndTests : IDisposable
                 DataRoot = _dataRoot,
                 ProviderName = provider.Name,
                 DefaultTitle = "Untitled Meeting",
-                ServiceTier = "standard",
                 RequestSpeakerInfo = true,
                 CostPerHourCny = 0.8,
                 ConfigSnapshotJson = "{\"config_version\":1}",

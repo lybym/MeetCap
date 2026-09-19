@@ -21,15 +21,25 @@ internal sealed class StubHttpHandler : HttpMessageHandler
     /// <summary>Request bodies captured as text, indexed like <see cref="Requests"/>.</summary>
     public List<string> RequestBodies { get; } = new();
 
-    public StubHttpHandler Enqueue(HttpStatusCode statusCode, string body = "", string? apiStatus = null, string? apiMessage = null)
+    public StubHttpHandler Enqueue(
+        HttpStatusCode statusCode,
+        string body = "",
+        string? apiStatus = null,
+        string? apiMessage = null,
+        string? apiLogId = null)
     {
-        _responses.Enqueue(_ => Build(statusCode, body, apiStatus, apiMessage));
+        _responses.Enqueue(_ => Build(statusCode, body, apiStatus, apiMessage, apiLogId));
         return this;
     }
 
-    public StubHttpHandler EnqueueJson(HttpStatusCode statusCode, string body, string apiStatus = "20000000", string? apiMessage = null)
+    public StubHttpHandler EnqueueJson(
+        HttpStatusCode statusCode,
+        string body,
+        string apiStatus = "20000000",
+        string? apiMessage = null,
+        string? apiLogId = null)
     {
-        _responses.Enqueue(_ => Build(statusCode, body, apiStatus, apiMessage));
+        _responses.Enqueue(_ => Build(statusCode, body, apiStatus, apiMessage, apiLogId));
         return this;
     }
 
@@ -65,7 +75,8 @@ internal sealed class StubHttpHandler : HttpMessageHandler
         HttpStatusCode statusCode,
         string body,
         string? apiStatus,
-        string? apiMessage)
+        string? apiMessage,
+        string? apiLogId)
     {
         var response = new HttpResponseMessage(statusCode)
         {
@@ -80,6 +91,11 @@ internal sealed class StubHttpHandler : HttpMessageHandler
         if (apiMessage is not null)
         {
             response.Headers.TryAddWithoutValidation("X-Api-Message", apiMessage);
+        }
+
+        if (apiLogId is not null)
+        {
+            response.Headers.TryAddWithoutValidation("X-Tt-Logid", apiLogId);
         }
 
         return response;

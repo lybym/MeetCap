@@ -894,6 +894,12 @@ The provider request id is supplied by the caller — the persistent job — ins
 generated per HTTP attempt. The same id is the provider's task identifier, so a retry after a
 process restart addresses the same task rather than creating a second billable one.
 
+The provider's trace id (`X-Tt-Logid`) is stored on the job as `provider_log_id`, so a
+provider-side incident can be traced from MeetCap's own durable state
+(`docs/DATA_MODEL.md` section 6). It is diagnostic metadata, never a credential, and it is also
+included in provider error messages so a failed exchange names its log id in the persisted
+`error_message`.
+
 The provider reports timestamps relative to the artifact it was given. `AsrFileRequest` and
 `AsrNormalizationContext` therefore carry `StartOffsetMs`, the artifact's own start position on
 the session timeline, and the normalizer adds it to every provider timestamp. It is zero for an

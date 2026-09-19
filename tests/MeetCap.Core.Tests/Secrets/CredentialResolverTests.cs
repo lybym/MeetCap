@@ -20,8 +20,8 @@ public class CredentialResolverTests
     public void EnvReference_ResolvesThroughTheInjectedLookup()
     {
         var resolved = CredentialResolver.Resolve(
-            "env:MEETCAP_VOLCENGINE_ACCESS_TOKEN",
-            Env(("MEETCAP_VOLCENGINE_ACCESS_TOKEN", "token-value")));
+            "env:MEETCAP_VOLCENGINE_API_KEY",
+            Env(("MEETCAP_VOLCENGINE_API_KEY", "token-value")));
 
         Assert.Equal("token-value", resolved);
     }

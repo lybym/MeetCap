@@ -58,9 +58,11 @@ Related official references:
 - https://www.volcengine.com/docs/6349/1130432?lang=zh
 - https://www.volcengine.com/docs/6349/1130151?lang=en
 
-Protocol alignment is tracked by issue #26. Large-file TOS transport is tracked by issue #29.
-Until those issues land, the implementation on `main` may still contain the superseded legacy
-provider configuration and remains inline-Base64-only for file transport.
+Implementation alignment landed with issue #26: the adapter sends only `X-Api-Key`, fixes
+`X-Api-Resource-Id` to `volc.seedasr.auc`, speaks the submit/query endpoints above with no
+tier routing, and retains the provider's `X-Tt-Logid` on the job row.
+Large-file TOS transport remains tracked by issue #29; until it lands, the implementation on
+`main` remains inline-Base64-only for file transport.
 
 ## 3. Default live-session algorithm
 
@@ -349,15 +351,20 @@ For every ASR job record:
 - estimated cost;
 - raw response path.
 
-The current M3 schema contains `provider`, legacy `tier`, `source`, `duration_ms`,
+The M3 schema contains `provider`, the schema-compatibility `tier`, `source`, `duration_ms`,
 `submitted_at`, `completed_at`, `attempt_count`, `provider_request_id`, `error_code`,
 `error_message`, `speaker_info_requested`, `speaker_info_returned`, `estimated_cost_cny`,
-`raw_response_path`, `normalized_result_path`, `request_metadata_path`. A terminal job also
-emits an `asr.job.completed` or `asr.job.failed` record in `events.jsonl`.
+`provider_log_id`, `raw_response_path`, `normalized_result_path`, `request_metadata_path`. A
+terminal job also emits an `asr.job.completed` or `asr.job.failed` record in `events.jsonl`, and
+`asr.job.submitted` / `asr.job.completed` carry the provider log id.
 
-Under issue #26, `tier` is no longer a product selector (new jobs are Standard only), and
-`X-Tt-Logid` is retained in provider diagnostics/job artifacts. The API key must never appear in
-those artifacts.
+Issue #26 is implemented: `tier` is no longer a product selector (new jobs record the single
+fixed value `standard`), no request carries the legacy `X-Api-App-Key`/`X-Api-Access-Key`
+headers, and `X-Tt-Logid` is persisted as `provider_log_id` — a diagnostic id, never a
+credential. The API key never appears in `request.json`, `response.json`, `events.jsonl`,
+`session.json`, SQLite diagnostic text, or normal logs, and `X-Tt-Logid` is also included in
+provider error messages so a failed exchange can be traced from the persisted `error_message`
+alone.
 
 M4 adds the queue's own state to the report (`docs/ROADMAP.md` M4). `meetcap status` prints:
 

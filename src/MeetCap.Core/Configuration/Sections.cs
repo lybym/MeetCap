@@ -79,9 +79,6 @@ public sealed class AsrSection
 
     public int FileBatchSeconds { get; set; } = 300;
 
-    /// <summary>Allowed: <c>standard</c>, <c>idle</c>, <c>turbo</c>.</summary>
-    public string ServiceTier { get; set; } = "standard";
-
     public bool StreamingEnabled { get; set; } = false;
     public int RetryMaxAttempts { get; set; } = 8;
     public int RetryInitialSeconds { get; set; } = 5;
@@ -91,20 +88,25 @@ public sealed class AsrSection
     public VolcengineSection Volcengine { get; set; } = new();
 }
 
+/// <summary>
+/// Volcengine provider configuration. Only the API key is user-supplied authentication;
+/// the endpoint family, resource id, and request shape are the adapter's fixed contract
+/// (<c>docs/CONFIGURATION.md</c> section 8, issue #26).
+/// </summary>
 public sealed class VolcengineSection
 {
-    public string AppId { get; set; } = string.Empty;
+    /// <summary>
+    /// New-console API key, sent as <c>X-Api-Key</c>. Secret-bearing. May use the
+    /// <c>env:</c> reference scheme.
+    /// </summary>
+    public string ApiKey { get; set; } = "env:MEETCAP_VOLCENGINE_API_KEY";
 
-    /// <summary>Secret-bearing. May use <c>env:</c> or <c>credman:</c> reference schemes.</summary>
-    public string Credential { get; set; } = "env:MEETCAP_VOLCENGINE_ACCESS_TOKEN";
-
-    public string ResourceId { get; set; } = "volc.bigasr.auc";
     public string HotwordTableId { get; set; } = string.Empty;
 
     /// <summary>
-    /// Ask the provider for anonymous speaker information where the configured API
-    /// tier supports it. These labels are the default MVP diarization source and
-    /// stay anonymous session/provider-scoped data, never persistent identities.
+    /// Ask the provider for anonymous speaker information. These labels are the default
+    /// MVP diarization source and stay anonymous session/provider-scoped data, never
+    /// persistent identities.
     /// </summary>
     public bool RequestSpeakerInfo { get; set; } = true;
 

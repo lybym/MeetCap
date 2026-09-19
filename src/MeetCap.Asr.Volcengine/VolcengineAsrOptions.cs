@@ -9,17 +9,51 @@ using MeetCap.Core.Secrets;
 /// root, resource id, protocol limits, transient-retry budget -- lives here and never
 /// reaches domain code (<c>docs/ARCHITECTURE.md</c> section 11).
 /// </summary>
+/// <remarks>
+/// The wire contract is deliberately fixed: one model generation (Seed-ASR 2.0), one
+/// authentication scheme (the new-console <c>X-Api-Key</c>), one file-ASR service
+/// profile (recording-file Standard), and one resource id
+/// (<see cref="ResourceId"/>). None of those is a user-tunable setting, so there is no
+/// compatibility switch to get wrong (<c>docs/ASR_STRATEGY.md</c> sections 2 and 5).
+/// </remarks>
 public sealed record VolcengineAsrOptions
 {
-    /// <summary>Provider endpoint root. Overridable so tests never touch the real service.</summary>
+    /// <summary>
+    /// Provider endpoint root for the recording-file Standard HTTP interface. Overridable
+    /// so tests never touch the real service.
+    /// </summary>
     public const string DefaultBaseUrl = "https://openspeech.bytedance.com/api/v3/auc/bigmodel";
 
-    public required string AppId { get; init; }
+    /// <summary>
+    /// Fixed <c>X-Api-Resource-Id</c> for Seed-ASR 2.0 recording-file Standard.
+    /// Provider protocol, not a user setting.
+    /// </summary>
+    public const string ResourceId = "volc.seedasr.auc";
 
-    /// <summary>Access token. Never logged, never persisted, never written to artifacts.</summary>
-    public required string AccessToken { get; init; }
+    /// <summary>Fixed <c>request.model_name</c> for the Seed-ASR 2.0 endpoint family.</summary>
+    public const string ModelName = "bigmodel";
 
-    public required string ResourceId { get; init; }
+    /// <summary>
+    /// Non-secret MeetCap-owned value sent as <c>user.uid</c>.
+    /// </summary>
+    /// <remarks>
+    /// The API key must never be copied here: <c>request.json</c> is persisted locally, so a
+    /// secret in the body would end up in a session artifact
+    /// (<c>docs/CONFIGURATION.md</c> section 8).
+    /// </remarks>
+    public const string UserId = "meetcap";
+
+    /// <summary>Submit path under <see cref="BaseUrl"/>.</summary>
+    public const string SubmitPath = "/submit";
+
+    /// <summary>Result-query path under <see cref="BaseUrl"/>.</summary>
+    public const string QueryPath = "/query";
+
+    /// <summary>
+    /// New-console API key, sent as <c>X-Api-Key</c>. Never logged, never persisted,
+    /// never written to artifacts.
+    /// </summary>
+    public required string ApiKey { get; init; }
 
     public string BaseUrl { get; init; } = DefaultBaseUrl;
 
@@ -42,56 +76,11 @@ public sealed record VolcengineAsrOptions
     /// </summary>
     public long MaxInlineAudioBytes { get; init; } = 100L * 1024 * 1024;
 
-    /// <summary>Allowed: <c>standard</c>, <c>idle</c>. See <see cref="VolcengineTiers"/>.</summary>
-    public string ToSubmitPath(string tier) => VolcengineTiers.SubmitPath(BaseUrl, tier);
+    /// <summary>The one submit endpoint this adapter speaks.</summary>
+    public string SubmitEndpoint => BaseUrl + SubmitPath;
 
-    public string ToQueryPath(string tier) => VolcengineTiers.QueryPath(BaseUrl, tier);
-}
-
-/// <summary>
-/// Volcengine file-ASR tier routing.
-/// </summary>
-/// <remarks>
-/// <para>
-/// This mapping is provider knowledge and therefore lives inside the adapter. The two
-/// supported tiers share the submit/query lifecycle.
-/// </para>
-/// <para>
-/// The <c>turbo</c> tier is a different, single-shot protocol
-/// (<c>recognize/flash</c>) that this milestone does not implement. It is rejected
-/// with an actionable error instead of being silently mapped onto the submit/query
-/// flow and returning a wrong result.
-/// </para>
-/// </remarks>
-public static class VolcengineTiers
-{
-    public const string Standard = "standard";
-    public const string Idle = "idle";
-    public const string Turbo = "turbo";
-
-    public static bool IsSupported(string tier) =>
-        string.Equals(tier, Standard, StringComparison.Ordinal)
-        || string.Equals(tier, Idle, StringComparison.Ordinal);
-
-    public static string SubmitPath(string baseUrl, string tier) => tier switch
-    {
-        Standard => $"{baseUrl}/submit",
-        Idle => $"{baseUrl}/idle/submit",
-        _ => throw Unsupported(tier),
-    };
-
-    public static string QueryPath(string baseUrl, string tier) => tier switch
-    {
-        Standard => $"{baseUrl}/query",
-        Idle => $"{baseUrl}/idle/query",
-        _ => throw Unsupported(tier),
-    };
-
-    private static AsrConfigurationException Unsupported(string tier) =>
-        new(
-            $"asr service tier '{tier}' is not supported. This milestone implements the '{Standard}' " +
-            $"and '{Idle}' submit/query tiers. The '{Turbo}' (flash, single-shot) endpoint is a different " +
-            $"protocol and is not implemented; set asr.service_tier to '{Standard}' or '{Idle}'.");
+    /// <summary>The one query endpoint this adapter speaks.</summary>
+    public string QueryEndpoint => BaseUrl + QueryPath;
 }
 
 /// <summary>
@@ -106,15 +95,6 @@ public static class VolcengineTiers
 public static class VolcengineAsrProviderFactory
 {
     public const string ProviderName = "volcengine";
-
-    public static void EnsureTierSupported(string tier)
-    {
-        if (!VolcengineTiers.IsSupported(tier))
-        {
-            // Throws with the same actionable message the provider would produce.
-            _ = VolcengineTiers.SubmitPath(VolcengineAsrOptions.DefaultBaseUrl, tier);
-        }
-    }
 
     public static VolcengineAsrProvider Create(
         MeetCapConfiguration configuration,
@@ -140,18 +120,11 @@ public static class VolcengineAsrProviderFactory
         }
 
         var volcengine = configuration.Asr.Volcengine;
-        if (string.IsNullOrWhiteSpace(volcengine.AppId))
-        {
-            throw new AsrConfigurationException(
-                "asr.volcengine.app_id is empty. Set it to the application id issued by the Volcengine " +
-                "speech console.");
-        }
-
-        string accessToken;
+        string apiKey;
         try
         {
-            accessToken = CredentialResolver.Resolve(
-                volcengine.Credential,
+            apiKey = CredentialResolver.Resolve(
+                volcengine.ApiKey,
                 environment ?? Environment.GetEnvironmentVariable);
         }
         catch (CredentialResolutionException ex)
@@ -159,18 +132,9 @@ public static class VolcengineAsrProviderFactory
             throw new AsrConfigurationException(ex.Message);
         }
 
-        if (string.IsNullOrWhiteSpace(volcengine.ResourceId))
-        {
-            throw new AsrConfigurationException(
-                "asr.volcengine.resource_id is empty. Set it to the resource id for the selected service " +
-                "tier (for example 'volc.bigasr.auc').");
-        }
-
         return new VolcengineAsrOptions
         {
-            AppId = volcengine.AppId.Trim(),
-            AccessToken = accessToken,
-            ResourceId = volcengine.ResourceId.Trim(),
+            ApiKey = apiKey,
             HotwordTableId = volcengine.HotwordTableId,
             HttpTimeout = TimeSpan.FromSeconds(volcengine.HttpTimeoutSeconds),
         };

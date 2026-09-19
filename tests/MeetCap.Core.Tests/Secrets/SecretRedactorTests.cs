@@ -7,19 +7,19 @@ namespace MeetCap.Core.Tests.Secrets;
 public class SecretRedactorTests
 {
     [Fact]
-    public void GetSecretValues_ContainsCredentialValue()
+    public void GetSecretValues_ContainsApiKeyValue()
     {
         var secrets = SecretRedactor.GetSecretValues(ConfigurationDefaults.Default());
-        Assert.Contains("env:MEETCAP_VOLCENGINE_ACCESS_TOKEN", secrets);
+        Assert.Contains("env:MEETCAP_VOLCENGINE_API_KEY", secrets);
     }
 
     [Fact]
     public void Redact_ReplacesSecretValueWithMask()
     {
         var secrets = SecretRedactor.GetSecretValues(ConfigurationDefaults.Default());
-        var text = "credential = \"env:MEETCAP_VOLCENGINE_ACCESS_TOKEN\"";
+        var text = "api_key = \"env:MEETCAP_VOLCENGINE_API_KEY\"";
         var redacted = SecretRedactor.Redact(text, secrets);
-        Assert.DoesNotContain("MEETCAP_VOLCENGINE_ACCESS_TOKEN", redacted);
+        Assert.DoesNotContain("MEETCAP_VOLCENGINE_API_KEY", redacted);
         Assert.Contains("***", redacted);
     }
 
@@ -44,10 +44,10 @@ public class SecretRedactorTests
     }
 
     [Fact]
-    public void GetSecretValues_EmptyCredential_NotTreatedAsSecret()
+    public void GetSecretValues_EmptyApiKey_NotTreatedAsSecret()
     {
         var c = ConfigurationDefaults.Default();
-        c.Asr.Volcengine.Credential = string.Empty;
+        c.Asr.Volcengine.ApiKey = string.Empty;
         Assert.Empty(SecretRedactor.GetSecretValues(c));
     }
 
@@ -57,6 +57,6 @@ public class SecretRedactorTests
         var registry = new SecretRegistry();
         Assert.Empty(registry.Values);
         registry.UpdateFrom(ConfigurationDefaults.Default());
-        Assert.Contains("env:MEETCAP_VOLCENGINE_ACCESS_TOKEN", registry.Values);
+        Assert.Contains("env:MEETCAP_VOLCENGINE_API_KEY", registry.Values);
     }
 }

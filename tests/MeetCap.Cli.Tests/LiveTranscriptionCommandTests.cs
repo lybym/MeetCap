@@ -1,5 +1,6 @@
 using MeetCap.AudioPipeline;
 using MeetCap.AudioPipeline.Wave;
+using MeetCap.Core.Asr;
 using MeetCap.Core.Capture;
 using MeetCap.Core.Sessions;
 using MeetCap.Persistence.Storage;
@@ -347,11 +348,13 @@ public class LiveTranscriptionCommandTests
     }
 
     [Fact]
-    public void AsrResume_QueuesARecoveredOrphanForTheProviderAndTierItsManifestRecords()
+    public void AsrResume_QueuesARecoveredOrphanForTheProviderItsManifestRecords()
     {
         // A recovered orphan must not silently inherit the resuming process's configuration: the
         // manifest records what the batch was built for, and that is what its audio is billed to
-        // (docs/ARCHITECTURE.md section 10.1).
+        // (docs/ARCHITECTURE.md section 10.1). A manifest written before issue #26 also carries a
+        // `tier`; it is deliberately ignored, because the service tier is no longer a routing
+        // input and there is exactly one supported profile.
         using var harness = CliHarness.Create();
         harness.WriteLiveAsrConfig(chunkSeconds: 1, fileBatchSeconds: 2);
 
@@ -362,20 +365,18 @@ public class LiveTranscriptionCommandTests
             tier: "idle");
         var database = new MeetCapDatabase(Path.Combine(harness.DataRoot, "meetcap.db"));
 
-        // The running configuration uses `standard` (see WriteLiveAsrConfig), which the job must
-        // not adopt, because its manifest says `idle`.
         var resume = harness.Run("asr", "resume");
         Assert.Equal(0, resume.ExitCode);
 
         var job = Assert.Single(database.AsrJobs.ListBySession(sessionId));
         Assert.Equal("volcengine", job.Provider);
-        Assert.Equal("idle", job.Tier);
+        Assert.Equal(AsrJob.StandardTier, job.Tier);
     }
 
     [Fact]
     public void AsrResume_FallsBackToConfigurationWhenTheManifestRecordsNoProvenance()
     {
-        // A manifest written before the provider/tier fields existed carries no provenance, so
+        // A manifest written before the provider field existed carries no provenance, so
         // recovery uses the running configuration rather than inventing one.
         using var harness = CliHarness.Create();
         harness.WriteLiveAsrConfig(chunkSeconds: 1, fileBatchSeconds: 2);
@@ -388,7 +389,7 @@ public class LiveTranscriptionCommandTests
 
         var job = Assert.Single(database.AsrJobs.ListBySession(sessionId));
         Assert.Equal("volcengine", job.Provider);
-        Assert.Equal("standard", job.Tier);
+        Assert.Equal(AsrJob.StandardTier, job.Tier);
     }
 
     /// <summary>

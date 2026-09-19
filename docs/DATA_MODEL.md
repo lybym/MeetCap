@@ -495,6 +495,7 @@ raw_response_path
 normalized_result_path
 error_code
 error_message
+provider_log_id
 duration_ms
 speaker_info_requested
 speaker_info_returned
@@ -508,10 +509,11 @@ updated_at
 Status values (section 12 of `ARCHITECTURE.md`): `pending`, `submitting`, `submitted`,
 `polling`, `succeeded`, `retry_wait`, `failed`, `cancelled`.
 
-The existing `tier` column is retained as a schema-compatibility field. After issue #26, all new
-Volcengine recording-file jobs use the single fixed value `standard`; it is no longer a user
-choice or routing input. This avoids a destructive migration solely to remove a now-constant
-column.
+The existing `tier` column is retained as a schema-compatibility field. Since issue #26 every
+Volcengine recording-file job uses the single fixed value `standard`; it is no longer a user
+choice or routing input, and the domain type exposes it as a constant rather than a settable
+property, so a stored legacy value is never read back as a route. This avoids a destructive
+migration solely to remove a now-constant column.
 
 Notes:
 
@@ -531,8 +533,13 @@ Notes:
   replaced by its byte count. Under issue #29, TOS-backed requests may record transport type plus
   stable bucket/object-key identity, but MUST NOT persist the presigned URL, its signature/query
   parameters, or TOS credentials.
-- Under issue #26, the Volcengine `X-Tt-Logid` is retained in provider diagnostic metadata (or
-  the retained response envelope) for support tracing. `X-Api-Key` is never persisted there.
+- `provider_log_id` holds the provider's trace id for the last exchange (Volcengine
+  `X-Tt-Logid`), added by migration `0005_asr_job_provider_log_id`. It is what a provider support
+  request about a task is traced by, so it is recorded as soon as the submit answers and is
+  replaced by the query's log id on completion. A response without the header never erases a
+  recorded value. It is a diagnostic id, not a credential: the API key is never persisted in
+  this or any other column, and `X-Tt-Logid` is also carried in provider error messages so a
+  failed exchange is traceable from `error_message` alone.
 - `raw_response_path` and `normalized_result_path` point at `response.json` and
   `normalized.jsonl`. The raw response is written before parsing so a parser fix never
   requires re-billing the same audio.
@@ -579,6 +586,12 @@ back to the audio it was built from:
   ]
 }
 ```
+
+The manifest also records `provider`, so an orphaned batch recovered by a later process is queued
+for the provider the recording was actually configured with rather than for whatever the resuming
+process happens to use. There is deliberately no `tier` field: issue #26 removed the service-tier
+selector, so it could only ever repeat one constant. A manifest written before #26 may still carry
+`tier`; the reader ignores it, and the recovered job records the single supported value.
 
 `start_ms` / `end_ms` are the batch's own span on the session timeline, and each entry's
 `start_ms` / `end_ms` is that capture chunk's own span. A window closes on captured audio time,
@@ -750,6 +763,25 @@ JSONL is the stable machine-consumption format. Agents should not need to parse 
 
 SQLite schema is created and evolved by numbered, embedded SQL migration scripts applied by `SqliteMigrator` (`src/MeetCap.Persistence/Storage/SqliteMigrator.cs`). Applied versions are recorded in `schema_migrations`. Re-running migrations is idempotent; already-applied migrations are skipped.
 
+A skip is not the only protection, because a second process can read `schema_migrations`
+before another process records a version and then run that script too. Every script must
+therefore also be safe to re-run *and* leave existing data intact. When such a script has to
+copy a column that only the later schema has — the usual case for the migration that adds that
+column — it cannot say so in SQL, because SQLite cannot branch on column presence and a
+statement naming an absent column fails while it is prepared. Those scripts use
+`SqliteMigrator`'s schema-conditional placeholder `{{table.column}}`, which expands to the
+column when the schema has it and to `NULL` when it does not.
+
+Two properties of that placeholder are what a script author has to know. First, only a
+mistyped *table* is loud: the placeholder is then left exactly as written, the script reaches
+SQLite unexpanded and fails to prepare, and the migration aborts instead of quietly copying
+`NULL`. A placeholder for a column the named table does not have expands to `NULL` even when
+the author mistyped the name of a column that does exist, because `NULL` is also the correct
+first-run value of the column the migration itself is adding — the mechanism cannot tell the
+two apart, and neither can SQL. Second, the placeholder is substituted over the whole script
+text, comments and string literals included, so `{{table.column}}` is a reserved sequence:
+a script only writes it where it is meant to expand.
+
 Every embedded `*.sql` resource under `Migrations` must carry a parseable version
 (`Migrations.<digits>`), and no two may claim the same one. Both violations are rejected before
 any DDL runs, because either one makes a migration silently not run: a duplicate looks
@@ -767,6 +799,18 @@ already-applied, and an unnumbered script is never considered at all.
   (session_id, speaker_label)` so upsert is idempotent, and `speaker_id` is nullable
   with `ON DELETE SET NULL` so an unknown label has no person and removing a person
   demotes their assignments rather than orphaning them.
+- **0005_asr_job_provider_log_id** (issue #26): adds the nullable `provider_log_id` column to
+  `asr_jobs` (section 6). SQLite has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, and
+  `SqliteMigrator` requires every script to be re-runnable (a second process that read
+  `schema_migrations` before this version was recorded runs the script too), so the migration
+  rebuilds `asr_jobs` instead: every statement is guarded, the rows are copied across unchanged
+  by `INSERT OR IGNORE`, and a re-run is a no-op. A re-run is reached only because another
+  process already committed this rebuild, so between that commit and this run's `DROP TABLE`
+  the rest of MeetCap can have written real `X-Tt-Logid` values; the copy therefore carries
+  `provider_log_id` through the schema-conditional placeholder, so a re-run preserves those
+  values rather than resetting them to `NULL`, and a first run copies `NULL` because no log id
+  exists yet. The legacy `tier` column and all `CHECK`
+  constraints are reproduced byte-for-byte from `0003_asr_jobs`.
 - **M2** requires no new migration. The bounded-buffer accounting and the gap totals live in
   `session.json` and `events.jsonl` (sections 3 and 4), and the gap audit (section 5.1) reads
   the M1 `audio_chunks` index. No table, column or constraint changed, so the applied schema is

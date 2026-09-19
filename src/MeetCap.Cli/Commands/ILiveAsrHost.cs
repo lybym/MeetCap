@@ -18,7 +18,7 @@ using MeetCap.Core.Sessions;
 /// contracts.
 /// </para>
 /// <para>
-/// Construction is where provider, credential, tier, and toolchain problems are reported —
+/// Construction is where provider, API-key, and toolchain problems are reported —
 /// before any session or artifact exists, so a misconfiguration cannot leave half-written
 /// session state (<c>docs/DEVELOPMENT.md</c> section 7).
 /// </para>
@@ -72,7 +72,6 @@ internal static class AsrHostFactory
             context,
             configuration,
             dataRoot,
-            configuration.Asr.ServiceTier,
             requireMedia: false,
             out var stack,
             out exitCode,

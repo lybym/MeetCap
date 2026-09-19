@@ -354,6 +354,10 @@ public sealed class AsrJobProcessor
         var requestPath = paths.JobRequestJson(job.Id);
         WriteText(requestPath, submission.SanitizedRequestJson);
 
+        // The provider's trace id is retained with the job so a support request about this
+        // task can name it without re-reading the exchange (docs/ASR_STRATEGY.md section 13).
+        job = AsrJobTransitions.RecordProviderLogId(job, submission.ProviderLogId, Now());
+
         job = AsrJobTransitions.MarkSubmitted(job, requestPath, Now());
         _jobs.Update(job);
 
@@ -366,6 +370,7 @@ public sealed class AsrJobProcessor
                 ["job_id"] = job.Id,
                 ["provider"] = job.Provider,
                 ["provider_request_id"] = submission.ProviderRequestId,
+                ["provider_log_id"] = job.ProviderLogId,
                 ["attempt"] = job.AttemptCount,
             });
 
@@ -461,6 +466,7 @@ public sealed class AsrJobProcessor
         var rawResponsePath = paths.JobResponseJson(job.Id);
         WriteText(rawResponsePath, completion.RawResponseJson);
         job = AsrJobTransitions.RecordRawResponse(job, rawResponsePath, Now());
+        job = AsrJobTransitions.RecordProviderLogId(job, completion.ProviderLogId, Now());
         _jobs.Update(job);
 
         AsrNormalizationResult normalized;
@@ -544,6 +550,7 @@ public sealed class AsrJobProcessor
                 ["speaker_info_requested"] = job.SpeakerInfoRequested,
                 ["speaker_info_returned"] = job.SpeakerInfoReturned,
                 ["estimated_cost_cny"] = job.EstimatedCostCny,
+                ["provider_log_id"] = job.ProviderLogId,
                 ["raw_response_path"] = rawResponsePath,
             });
 
@@ -682,7 +689,6 @@ public sealed class AsrJobProcessor
         StartOffsetMs = job.StartMs,
         DurationMs = job.DurationMs,
         ProviderRequestId = job.ProviderRequestId,
-        ServiceTier = job.Tier,
         RequestSpeakerInfo = job.SpeakerInfoRequested,
     };
 

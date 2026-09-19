@@ -23,14 +23,70 @@ public class ConfigurationValidatorTests
         Assert.Contains(result.Errors, e => e.Contains("capture.default_mode"));
     }
 
-    [Fact]
-    public void Validate_InvalidServiceTier_Errors()
+    [Theory]
+    [InlineData("asr.service_tier")]
+    [InlineData("asr.volcengine.app_id")]
+    [InlineData("asr.volcengine.credential")]
+    [InlineData("asr.volcengine.resource_id")]
+    public void Validate_LegacyProviderKeys_AreBlockedWithAMigrationMessage(string legacyKey)
     {
-        var c = ConfigurationDefaults.Default();
-        c.Asr.ServiceTier = "premium";
-        var result = ConfigurationValidator.Validate(c);
+        // Issue #26 removed the tier selector, the legacy AppID/Access Token pair, and the
+        // configurable resource id. A v1 configuration that still contains one must not pass
+        // validation and quietly fall back to the new defaults.
+        var result = ConfigurationValidator.Validate(ConfigurationDefaults.Default(), new[] { legacyKey });
+
         Assert.False(result.IsValid);
-        Assert.Contains(result.Errors, e => e.Contains("asr.service_tier"));
+        Assert.Contains(
+            result.Errors,
+            error => error.StartsWith(
+                $"Legacy configuration key '{legacyKey}' is not supported",
+                StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Validate_LegacyCredentialKey_TellsTheUserToRenameItToApiKey()
+    {
+        var result = ConfigurationValidator.Validate(
+            ConfigurationDefaults.Default(),
+            new[] { "asr.volcengine.credential" });
+
+        var error = Assert.Single(result.Errors);
+        Assert.Contains("api_key", error, StringComparison.Ordinal);
+        Assert.Contains("MEETCAP_VOLCENGINE_API_KEY", error, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validate_LegacyAppIdKey_ExplainsThatTheNewConsoleUsesAnApiKey()
+    {
+        var result = ConfigurationValidator.Validate(
+            ConfigurationDefaults.Default(),
+            new[] { "asr.volcengine.app_id" });
+
+        var error = Assert.Single(result.Errors);
+        Assert.Contains("api_key", error, StringComparison.Ordinal);
+        Assert.Contains("X-Api-App-Key", error, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validate_LegacyResourceIdKey_NamesTheFixedSeedAsrResourceId()
+    {
+        var result = ConfigurationValidator.Validate(
+            ConfigurationDefaults.Default(),
+            new[] { "asr.volcengine.resource_id" });
+
+        var error = Assert.Single(result.Errors);
+        Assert.Contains("volc.seedasr.auc", error, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Validate_LegacyServiceTierKey_ExplainsThatThereIsNoTierToSelect()
+    {
+        var result = ConfigurationValidator.Validate(
+            ConfigurationDefaults.Default(),
+            new[] { "asr.service_tier" });
+
+        var error = Assert.Single(result.Errors);
+        Assert.Contains("Seed-ASR 2.0 Standard HTTP", error, StringComparison.Ordinal);
     }
 
     [Fact]

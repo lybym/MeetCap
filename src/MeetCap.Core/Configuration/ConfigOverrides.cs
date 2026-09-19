@@ -36,9 +36,6 @@ public static class ConfigOverrides
                 case "asr.enabled":
                     config.Asr.Enabled = ParseBool(key, raw);
                     break;
-                case "asr.service_tier":
-                    config.Asr.ServiceTier = raw;
-                    break;
                 case "asr.file_batch_seconds":
                     config.Asr.FileBatchSeconds = ParseInt(key, raw);
                     break;
