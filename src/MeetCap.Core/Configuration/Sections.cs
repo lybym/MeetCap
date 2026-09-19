@@ -86,6 +86,18 @@ public sealed class AsrSection
     public bool FinalFullSessionPass { get; set; } = false;
 
     public VolcengineSection Volcengine { get; set; } = new();
+
+    /// <summary>Optional private TOS staging for oversized file-ASR inputs.</summary>
+    public TosSection Tos { get; set; } = new();
+}
+
+public sealed class TosSection
+{
+    public string Bucket { get; set; } = string.Empty;
+    public string Region { get; set; } = string.Empty;
+    public string Endpoint { get; set; } = string.Empty;
+    public string AccessKey { get; set; } = string.Empty;
+    public string SecretKey { get; set; } = string.Empty;
 }
 
 /// <summary>

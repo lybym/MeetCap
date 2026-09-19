@@ -101,6 +101,29 @@ public class VolcengineAsrProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task Submit_UsesEphemeralUrlWithoutPersistingSignedQuery()
+    {
+        var handler = new StubHttpHandler().Enqueue(HttpStatusCode.OK, apiStatus: "20000000");
+        var publisher = new FakePublisher(new AsrPublishedAudio
+        {
+            Transport = "tos", Url = "https://tos.invalid/object?X-Tos-Signature=secret", Bytes = 22 * 1024 * 1024,
+            Bucket = "meetcap-asr", ObjectKey = "meetcap-asr/shard/2026/09/19/job_1.wav",
+        });
+        using var provider = new VolcengineAsrProvider(new VolcengineAsrOptions { ApiKey = ApiKey, BaseUrl = "https://asr.invalid/api/v3/auc/bigmodel" }, handler, publisher);
+
+        var submission = await provider.SubmitFileAsync(Request(WriteAudio()));
+
+        Assert.Contains("\"url\":\"https://tos.invalid/object?X-Tos-Signature=secret\"", handler.RequestBodies[0]);
+        Assert.DoesNotContain("X-Tos-Signature", submission.SanitizedRequestJson, StringComparison.Ordinal);
+        Assert.Contains("\"tos_object_key\":\"meetcap-asr/shard/2026/09/19/job_1.wav\"", submission.SanitizedRequestJson);
+    }
+
+    private sealed class FakePublisher(AsrPublishedAudio audio) : IAsrAudioPublisher
+    {
+        public Task<AsrPublishedAudio> PublishAsync(AsrFileRequest request, CancellationToken cancellationToken = default) => Task.FromResult(audio);
+    }
+
+    [Fact]
     public async Task NoRequestEverSendsTheLegacyAuthenticationHeaders()
     {
         // The whole point of issue #26: one authentication generation, not two. Both the

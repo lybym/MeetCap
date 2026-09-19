@@ -83,8 +83,9 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
     private readonly HttpClient _http;
     private readonly bool _ownsHttpClient;
     private readonly ResiliencePipeline<VolcengineResponse> _pipeline;
+    private readonly IAsrAudioPublisher _audioPublisher;
 
-    public VolcengineAsrProvider(VolcengineAsrOptions options, HttpMessageHandler? handler = null)
+    public VolcengineAsrProvider(VolcengineAsrOptions options, HttpMessageHandler? handler = null, IAsrAudioPublisher? audioPublisher = null)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
         ArgumentException.ThrowIfNullOrWhiteSpace(options.ApiKey);
@@ -95,6 +96,7 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
         // Polly owns the request deadline, so HttpClient's own timeout is disabled to
         // keep exactly one timeout semantic in play.
         _http.Timeout = Timeout.InfiniteTimeSpan;
+        _audioPublisher = audioPublisher ?? new VolcengineTosAudioPublisher(null);
 
         _pipeline = new ResiliencePipelineBuilder<VolcengineResponse>()
             .AddRetry(new RetryStrategyOptions<VolcengineResponse>
@@ -130,30 +132,9 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
                 "cannot be submitted. Re-import the recording.");
         }
 
-        if (audio.Length > _options.MaxInlineAudioBytes)
-        {
-            throw new AsrConfigurationException(
-                $"Audio artifact '{request.InputArtifactPath}' is {audio.Length} bytes, above the " +
-                $"{_options.MaxInlineAudioBytes}-byte inline upload limit. Import a shorter recording; " +
-                "splitting long imports is not implemented yet.");
-        }
-
-        byte[] audioBytes;
-        try
-        {
-            audioBytes = await File.ReadAllBytesAsync(request.InputArtifactPath, cancellationToken)
-                .ConfigureAwait(false);
-        }
-        catch (IOException ex)
-        {
-            throw new AsrTransientException(
-                "audio.unreadable",
-                $"Audio artifact '{request.InputArtifactPath}' could not be read: {ex.Message}",
-                ex);
-        }
-
-        var body = BuildRequestBody(request, Convert.ToBase64String(audioBytes));
-        var sanitized = BuildSanitizedRequestJson(request, audio.Length);
+        var published = await _audioPublisher.PublishAsync(request, cancellationToken).ConfigureAwait(false);
+        var body = BuildRequestBody(request, published);
+        var sanitized = BuildSanitizedRequestJson(request, published);
 
         var response = await SendAsync(
             submitPath,
@@ -354,7 +335,7 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
             : new AsrTransientException(code, message);
     }
 
-    private string BuildRequestBody(AsrFileRequest request, string audioBase64)
+    private string BuildRequestBody(AsrFileRequest request, AsrPublishedAudio audio)
     {
         var body = new JsonObject
         {
@@ -364,7 +345,7 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
             ["audio"] = new JsonObject
             {
                 ["format"] = request.AudioFormat,
-                ["data"] = audioBase64,
+                [audio.Transport == "inline" ? "data" : "url"] = audio.Transport == "inline" ? audio.InlineBase64 : audio.Url,
             },
             ["request"] = BuildProviderRequest(request.RequestSpeakerInfo),
         };
@@ -396,7 +377,7 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
     /// key -- are never included, and the endpoint/resource id are recorded so a later
     /// reader can tell which fixed contract produced the artifact.
     /// </remarks>
-    private string BuildSanitizedRequestJson(AsrFileRequest request, long audioBytes)
+    private string BuildSanitizedRequestJson(AsrFileRequest request, AsrPublishedAudio audio)
     {
         var body = new JsonObject
         {
@@ -413,7 +394,11 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
             ["audio"] = new JsonObject
             {
                 ["format"] = request.AudioFormat,
-                ["inline_bytes"] = audioBytes,
+                ["transport"] = audio.Transport,
+                ["bytes"] = audio.Bytes,
+                ["inline_bytes"] = audio.Transport == "inline" ? audio.Bytes : null,
+                ["tos_bucket"] = audio.Bucket,
+                ["tos_object_key"] = audio.ObjectKey,
             },
             ["request"] = BuildProviderRequest(request.RequestSpeakerInfo),
         };

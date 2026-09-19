@@ -17,6 +17,7 @@
          HTTP execution concerns inside this provider adapter. It is never the
          persistent ASR job queue (see MeetCap.Asr). -->
     <PackageReference Include="Polly.Core" Version="8.8.0" />
+    <PackageReference Include="Volcengine.TOS.SDK" Version="2.1.8" />
   </ItemGroup>
 
   <ItemGroup>

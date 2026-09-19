@@ -74,7 +74,7 @@ public sealed record VolcengineAsrOptions
     /// Maximum size of audio sent inline as base64. Larger imports are rejected with an
     /// actionable message rather than silently truncated; splitting is a later milestone.
     /// </summary>
-    public long MaxInlineAudioBytes { get; init; } = 100L * 1024 * 1024;
+    public long MaxInlineAudioBytes { get; init; } = 20L * 1024 * 1024;
 
     /// <summary>The one submit endpoint this adapter speaks.</summary>
     public string SubmitEndpoint => BaseUrl + SubmitPath;
@@ -103,7 +103,7 @@ public static class VolcengineAsrProviderFactory
     {
         ArgumentNullException.ThrowIfNull(configuration);
         var options = BuildOptions(configuration, environment);
-        return new VolcengineAsrProvider(options, handler);
+        return new VolcengineAsrProvider(options, handler, BuildAudioPublisher(configuration, environment));
     }
 
     public static VolcengineAsrOptions BuildOptions(
@@ -139,4 +139,23 @@ public static class VolcengineAsrProviderFactory
             HttpTimeout = TimeSpan.FromSeconds(volcengine.HttpTimeoutSeconds),
         };
     }
+
+    private static IAsrAudioPublisher BuildAudioPublisher(MeetCapConfiguration configuration, Func<string, string?>? environment)
+    {
+        var tos = configuration.Asr.Tos;
+        if (string.IsNullOrWhiteSpace(tos.Bucket) && string.IsNullOrWhiteSpace(tos.Region) && string.IsNullOrWhiteSpace(tos.Endpoint)
+            && string.IsNullOrWhiteSpace(tos.AccessKey) && string.IsNullOrWhiteSpace(tos.SecretKey))
+            return new VolcengineTosAudioPublisher(null);
+        try
+        {
+            var env = environment ?? Environment.GetEnvironmentVariable;
+            return new VolcengineTosAudioPublisher(new VolcengineTosOptions(
+                Required("asr.tos.bucket", tos.Bucket), Required("asr.tos.region", tos.Region), Required("asr.tos.endpoint", tos.Endpoint),
+                CredentialResolver.Resolve(tos.AccessKey, env), CredentialResolver.Resolve(tos.SecretKey, env)));
+        }
+        catch (CredentialResolutionException ex) { throw new AsrConfigurationException(ex.Message); }
+    }
+
+    private static string Required(string name, string value) => string.IsNullOrWhiteSpace(value)
+        ? throw new AsrConfigurationException($"{name} is required when [asr.tos] is configured.") : value;
 }

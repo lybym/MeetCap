@@ -55,6 +55,14 @@ poll_interval_seconds = 5
 poll_timeout_seconds = 900
 http_timeout_seconds = 30
 
+# Optional: required only for normalized WAV files above 20 MiB. Values may use env: references.
+[asr.tos]
+bucket = ""
+region = ""
+endpoint = ""
+access_key = ""
+secret_key = ""
+
 [speakers]
 enabled = true
 owner_name = ""
