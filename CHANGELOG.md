@@ -16,6 +16,25 @@ milestones are described as the former, never the latter
 
 ### Fixed
 
+- **Capture recovers after a Bluetooth endpoint disappears and returns**
+  ([#34](https://github.com/lybym/MeetCap/issues/34)). Device-loss recovery was a fixed budget
+  of three one-second retries, so an endpoint that needed longer than three seconds to reappear
+  was reported fatally lost: on the machine that reproduced this, a Sony WF-1000XM5 that was
+  disconnected and reconnected ten seconds later left both the microphone and the loopback track
+  with `capture.device_lost_fatal`, and the session was finalized with
+  `end_reason = "device_lost"` even though the same endpoints were listed again by
+  `meetcap devices`. Recovery is now bounded by a configurable window
+  (`capture.device_recovery_seconds`, default 20 s) instead of a hard-coded retry count, and a
+  track whose endpoint returns inside that window reopens it and keeps recording while the
+  unaffected track continues independently (`docs/RELIABILITY.md` section 8.1).
+- **An outage that never recovers is quantified instead of reported as zero**
+  ([#34](https://github.com/lybym/MeetCap/issues/34)). A measured device outage is placed on the
+  session timeline by the *next* buffer, because only then is the restarted stream's position
+  known; a track that never recovered therefore discarded the outage it had measured, and the
+  session reported `gap_count: 0` and `gap_total_ms: 0` for a stretch its own event log
+  described as lost. The measured outage is now applied when the track ends and written as an
+  explicit `capture.gap` with `reason = "not_captured"`
+  (`CaptureTimeline.RecordTerminalDeviceLoss`, `docs/RELIABILITY.md` section 8.2).
 - **Windows process loopback no longer reports a false discontinuity for every buffer**
   ([#33](https://github.com/lybym/MeetCap/issues/33)). Process loopback captures a process tree
   rather than an endpoint's own stream, and on the machine that reproduced this the audio engine
@@ -40,6 +59,13 @@ milestones are described as the former, never the latter
 
 ### Added
 
+- **`capture.device_recovery_seconds`** configuration key (issue
+  [#34](https://github.com/lybym/MeetCap/issues/34)): how long one capture track keeps retrying
+  its configured endpoint after the device disappears before it reports the device
+  unrecoverable and ends that track. Default `20`, `0` disables recovery, negative values are
+  rejected. The retry budget is derived from the window rather than configured beside it, so the
+  two cannot disagree, and the value is recorded in the session's `config_snapshot`
+  (`docs/CONFIGURATION.md` section 6, `docs/RELIABILITY.md` section 8.1).
 - **`capture.timeline_unusable`** session event: a track whose stream supplies neither a usable
   device position nor a QPC timestamp has no device timing to be placed by, so it ends with this
   one explicit event — carrying the reason and the baseline alternative — rather than writing
@@ -66,6 +92,12 @@ milestones are described as the former, never the latter
   `tests/MeetCap.Core.Tests/Capture/CaptureTimelineTests.cs`,
   `tests/MeetCap.AudioPipeline.Tests/ProcessLoopbackTimelineTests.cs` and
   `tests/MeetCap.WindowsAudio.Tests/NAudioLoopbackClockTests.cs`.
+- Issue [#34](https://github.com/lybym/MeetCap/issues/34)'s real-hardware criterion is **not
+  run**: the machine this work was prepared on has no Bluetooth audio endpoint, so a headset
+  disconnect/reconnect could not be exercised. The recovery window, both tracks' reconnect
+  behaviour, the gap quantification and the reporting are covered by
+  `tests/MeetCap.AudioPipeline.Tests/DeviceRecoveryWindowTests.cs`, and the run to perform on a
+  machine with a headset is written down in `docs/M1_WINDOWS_VALIDATION.md` section 16.
 
 ## [0.2.0] - 2026-09-19
 

@@ -260,6 +260,12 @@ public class SessionArtifactTests : IDisposable
         using var document = JsonDocument.Parse(json);
         Assert.Equal(60, document.RootElement.GetProperty("chunk_seconds").GetInt32());
         Assert.Equal("mic-1", document.RootElement.GetProperty("microphone_device_id").GetString());
+
+        // Issue #34: the device-recovery window is part of how a session behaved after a device
+        // loss, so a session read later can state how long its tracks kept retrying before they
+        // reported the endpoint unrecoverable (docs/CONFIGURATION.md section 12).
+        Assert.Equal(20, document.RootElement.GetProperty("device_recovery_seconds").GetInt32());
+
         Assert.DoesNotContain("credential", json, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("token", json, StringComparison.OrdinalIgnoreCase);
     }

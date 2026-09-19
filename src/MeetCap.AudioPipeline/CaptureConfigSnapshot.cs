@@ -30,6 +30,12 @@ public static class CaptureConfigSnapshot
             writer.WriteNumber("chunk_seconds", settings.ChunkSeconds);
             writer.WriteNumber("buffer_seconds", settings.BufferSeconds);
             writer.WriteNumber("flush_interval_ms", settings.FlushIntervalMs);
+            // The recovery window is part of how this session behaved after a device loss, so
+            // it belongs in the snapshot rather than only in the live configuration: a session
+            // read months later has to be able to say how long its tracks kept retrying before
+            // they reported the endpoint unrecoverable (issue #34, docs/CONFIGURATION.md
+            // section 12).
+            writer.WriteNumber("device_recovery_seconds", settings.DeviceRecoverySeconds);
             writer.WriteNumber("minimum_free_space_gb", settings.MinimumFreeSpaceGb);
             writer.WriteString("microphone_device_id", settings.MicrophoneDeviceId);
             writer.WriteNumber("config_version", settings.ConfigVersion);

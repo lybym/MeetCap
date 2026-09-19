@@ -100,6 +100,33 @@ public class ConfigurationValidatorTests
     }
 
     [Fact]
+    public void Validate_NegativeDeviceRecoveryWindow_Errors()
+    {
+        // A negative window has no meaning: it would give a track a retry budget smaller than no
+        // retries at all (issue #34, docs/CONFIGURATION.md section 6).
+        var c = ConfigurationDefaults.Default();
+        c.Capture.DeviceRecoverySeconds = -1;
+
+        var result = ConfigurationValidator.Validate(c);
+
+        Assert.False(result.IsValid);
+        Assert.Contains(result.Errors, e => e.Contains("capture.device_recovery_seconds"));
+    }
+
+    [Fact]
+    public void Validate_ZeroDeviceRecoveryWindow_IsAcceptedAsNoRecovery()
+    {
+        // Zero is a deliberate choice ("do not attempt device recovery at all"), not a typo, so
+        // it must pass validation (docs/CONFIGURATION.md section 6).
+        var c = ConfigurationDefaults.Default();
+        c.Capture.DeviceRecoverySeconds = 0;
+
+        var result = ConfigurationValidator.Validate(c);
+
+        Assert.True(result.IsValid, string.Join(" | ", result.Errors));
+    }
+
+    [Fact]
     public void Validate_InvalidLogLevel_Errors()
     {
         var c = ConfigurationDefaults.Default();

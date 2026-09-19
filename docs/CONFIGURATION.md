@@ -101,6 +101,7 @@ process
 chunk_seconds = 60
 buffer_seconds = 5
 flush_interval_ms = 1000
+device_recovery_seconds = 20
 ```
 
 Validation must reject unsafe values.
@@ -132,6 +133,28 @@ existing `buffer_seconds`:
 
 There is deliberately no separate stall-timeout or backpressure key: the queue bound and the
 stall threshold are one quantity, and separate keys would only let them disagree.
+
+`device_recovery_seconds` (issue #34) is how long one capture track keeps retrying its
+configured endpoint after the device disappears before it reports the device unrecoverable and
+ends that track (`docs/RELIABILITY.md` section 8.1). It bounds the recovery window as a whole
+rather than exposing a retry count:
+
+- a track retries its endpoint once per second, so a window of N seconds is N retries. The
+  attempt budget is **derived** from the window (`CaptureService.RecoveryAttemptsFor`), never
+  configured beside it, because two independent keys would only let the window and the retries
+  that are supposed to spend it disagree;
+- `0` is a supported value and means "do not attempt device recovery at all". A negative window
+  is rejected, because it would buy less than nothing;
+- validation accepts any non-negative value. Unlike the other three durability keys there is no
+  upper bound to enforce: a very long window is a deliberate choice to wait a long time for a
+  device, and the risk it carries is bounded because the track ends as soon as the window
+  closes;
+- the default of 20 s is chosen for Bluetooth. A wired endpoint that is unplugged comes back
+  almost immediately, but a headset that is switched off and on again — or that walks back into
+  range — takes seconds, and the previous fixed budget of three retries reported a returning
+  headset as fatally lost;
+- the value is part of the session's `config_snapshot`, so a session read later can state how
+  long its tracks kept retrying before they gave up on the device.
 
 ## 7. ASR
 

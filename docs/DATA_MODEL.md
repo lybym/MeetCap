@@ -201,9 +201,10 @@ before M2 — or by a recording that never reached its teardown — simply lacks
 ```
 
 - `gap_count` and `gap_total_ms` are what the capture timeline observed while it was alive:
-  one count per discontinuity — a device-position skip or a measured device outage — and the
-  milliseconds they add up to (`docs/ARCHITECTURE.md` section 8.1). The `session.stopped`
-  event carries the same total as `gap_ms`.
+  one count per discontinuity — a device-position skip, a measured device outage, or an outage
+  a track ended on without recovering (section 4.1, issue #34) — and the milliseconds they add
+  up to (`docs/ARCHITECTURE.md` section 8.1). The `session.stopped` event carries the same
+  total as `gap_ms`.
 - `capture_health` is the `AudioBufferHealth` record: the queue bound this session actually
   used (`capacity_packets`, `AudioBufferHealth.CapacityPackets` in C#), the deepest backlog it
   reached (`peak_queued_packets`), the packets the bound refused (`dropped_packets` and the
@@ -373,6 +374,15 @@ re-derives it from the chunk index afterwards (section 5.1). The event therefore
 gap's own interval in `gap_start_ms` / `gap_end_ms` — where audio stopped and where it resumed
 — and `at_ms` remains the position on the timeline the event is placed at, which for the live
 writer is the resume position.
+
+The live writer has one more case beyond "the device skipped audio between buffers": a
+configured endpoint that disappeared and never came back within its recovery window
+(`docs/RELIABILITY.md` section 8.2, issue #34). There is no resume position there, so the
+outage measured while retrying is applied when the track ends and written as a `capture.gap`
+with `reason = "not_captured"` whose `gap_start_ms` is where the last captured buffer ended and
+whose `gap_end_ms` is that position plus the measured outage. It exists because the alternative
+— an outage the track measured but never placed, because placing it is the next buffer's job —
+left `gap_count: 0` on a session whose own log described a multi-second hole.
 
 Those are deliberately not the same coordinate. The live writer's `start_ms`, when it sets it
 at all, is the position of the *buffer* it is writing (where audio resumes), while the audit's

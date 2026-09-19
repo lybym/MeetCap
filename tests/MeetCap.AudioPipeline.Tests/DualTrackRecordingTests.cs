@@ -81,7 +81,7 @@ public class DualTrackRecordingTests
         // so the loopback track ends fatally while the microphone track keeps recording —
         // the loss of one track is explicit and never silently corrupts the other
         // (docs/RELIABILITY.md section 8, docs/ROADMAP.md M5).
-        using var harness = new SessionHarness(chunkSeconds: 60, maxDeviceRecoveryAttempts: 1, mode: "online");
+        using var harness = new SessionHarness(chunkSeconds: 60, deviceRecoverySeconds: 1, mode: "online");
         var micSource = new FakeCaptureSource(Format, harness.Device, AudioSource.Mic);
         var loopbackSource = new FakeCaptureSource(Format, harness.RenderDevice, AudioSource.Loopback);
         harness.Sources.Enqueue(micSource);
@@ -188,7 +188,7 @@ public class DualTrackRecordingTests
         // "the audio already captured still closed" claim (docs/RELIABILITY.md section 8).
         using var harness = new SessionHarness(
             chunkSeconds: 30,
-            maxDeviceRecoveryAttempts: 1,
+            deviceRecoverySeconds: 1,
             mode: "online");
         var micSource = new FakeCaptureSource(Format, harness.Device, AudioSource.Mic);
         var loopbackSource = new FakeCaptureSource(Format, harness.RenderDevice, AudioSource.Loopback);

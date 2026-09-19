@@ -122,6 +122,13 @@ public sealed class RecordingSession : IDisposable
     /// </summary>
     private readonly Action? _afterPacketWritten;
 
+    /// <summary>
+    /// Test seam: awaited by every track after a device loss and before each reopen attempt,
+    /// so a test can date a whole outage deterministically instead of racing the capture loop.
+    /// Production passes <c>null</c>.
+    /// </summary>
+    private readonly Func<CancellationToken, Task>? _beforeReopenAttempt;
+
     private CancellationTokenSource? _endCts;
     private SessionRecordingLock? _recordingLock;
     private List<CaptureTrack>? _tracks;
@@ -143,7 +150,8 @@ public sealed class RecordingSession : IDisposable
         SessionManifest manifest,
         int maxDeviceRecoveryAttempts,
         SessionRecordingLock? recordingLock,
-        Action? afterPacketWritten = null)
+        Action? afterPacketWritten = null,
+        Func<CancellationToken, Task>? beforeReopenAttempt = null)
     {
         _paths = paths ?? throw new ArgumentNullException(nameof(paths));
         _settings = settings ?? throw new ArgumentNullException(nameof(settings));
@@ -161,6 +169,7 @@ public sealed class RecordingSession : IDisposable
         _maxDeviceRecoveryAttempts = Math.Max(0, maxDeviceRecoveryAttempts);
         _recordingLock = recordingLock;
         _afterPacketWritten = afterPacketWritten;
+        _beforeReopenAttempt = beforeReopenAttempt;
 
         _diskMonitor = new DiskSpaceMonitor(platform.DiskSpace, settings.MinimumFreeSpaceBytes);
         _stopSignal = new SessionStopSignal(paths.StopRequestPath);
@@ -348,7 +357,8 @@ public sealed class RecordingSession : IDisposable
                     _maxDeviceRecoveryAttempts,
                     _afterPacketWritten,
                     AnnounceChunk,
-                    RegisterStorageFailure);
+                    RegisterStorageFailure,
+                    _beforeReopenAttempt);
 
                 // Create the source and initialize the track's runtime from its native
                 // format before capture starts. A source that cannot be created aborts the

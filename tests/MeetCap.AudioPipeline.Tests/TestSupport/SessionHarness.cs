@@ -17,15 +17,17 @@ internal sealed class SessionHarness : IDisposable
         int flushIntervalMs = 1_000,
         double minimumFreeSpaceGb = 5,
         string microphoneDeviceId = "mic-default",
-        int maxDeviceRecoveryAttempts = 3,
+        int deviceRecoverySeconds = 3,
         TempWorkspace? workspace = null,
         string? mode = null,
         string? renderDeviceId = null,
         string? loopbackMode = null,
-        string? loopbackProcessName = null)
+        string? loopbackProcessName = null,
+        Func<CancellationToken, Task>? beforeReopenAttempt = null)
     {
         _workspace = workspace ?? new TempWorkspace();
         OwnsWorkspace = workspace is null;
+        _beforeReopenAttempt = beforeReopenAttempt;
 
         Clock = new FakeClock();
         Disk = new FakeDiskSpaceProbe();
@@ -55,11 +57,16 @@ internal sealed class SessionHarness : IDisposable
             microphoneDeviceId,
             configVersion: 1,
             mode: isOnline ? SessionModes.Online : SessionModes.Offline,
-            online: online);
+            online: online,
+            deviceRecoverySeconds: deviceRecoverySeconds);
 
         Platform = new CapturePlatform(Devices, Sources, Disk, Clock);
         Database = _workspace.Database;
-        Service = new CaptureService(Platform, Database, Settings, maxDeviceRecoveryAttempts);
+
+        // The service derives its retry budget from the settings, exactly as production does,
+        // so a test that changes the recovery window exercises the shipped derivation instead
+        // of a parallel one (docs/RELIABILITY.md section 8).
+        Service = new CaptureService(Platform, Database, Settings);
     }
 
     public bool OwnsWorkspace { get; }
@@ -104,6 +111,89 @@ internal sealed class SessionHarness : IDisposable
                 () => AudioDeviceResolver.TryResolve(Devices, Settings.MicrophoneDeviceId)),
         };
 
+    /// <summary>
+    /// The retry budget production derives for this harness's recovery window
+    /// (<see cref="CaptureService.RecoveryAttemptsFor"/>). Exposed so a test that constructs a
+    /// <see cref="RecordingSession"/> directly spends the same budget production would.
+    /// </summary>
+    public int DeviceRecoveryAttempts => CaptureService.RecoveryAttemptsFor(Settings.DeviceRecoverySeconds);
+
+    /// <summary>
+    /// Creates an unstarted <see cref="RecordingSession"/> for this harness's own session
+    /// artifacts, taking its liveness marker as the service does. Tests that need to observe a
+    /// recovery attempt directly use this instead of <see cref="CaptureService.PrepareSession"/>
+    /// so the outage-gating seam can be installed.
+    /// </summary>
+    /// <param name="online">
+    /// When true, builds both the microphone and the loopback track spec, so a dual-track test
+    /// can install the seam on both tracks. The harness must have been constructed with
+    /// <c>mode: "online"</c>.
+    /// </param>
+    public RecordingSession PrepareSessionDirect(string title = "Direct Session", bool online = false)
+    {
+        var paths = Workspace.Paths;
+        var tracks = online ? new[] { AudioSources.Mic, AudioSources.Loopback } : new[] { AudioSources.Mic };
+        var manifest = new SessionManifest
+        {
+            SessionId = paths.SessionId,
+            Title = title,
+            Mode = Settings.Mode,
+            SourceType = SessionSourceTypes.Live,
+            Status = SessionStatus.Created,
+            ConfigVersion = Settings.ConfigVersion,
+            Tracks = tracks,
+            ChunkSeconds = Settings.ChunkSeconds,
+        };
+        SessionManifestStore.Save(paths.ManifestPath, manifest);
+
+        var recordingLock = SessionRecordingLock.TryAcquire(paths.RecordingLockPath);
+        if (recordingLock is null)
+        {
+            throw new InvalidOperationException(
+                "the direct session could not claim its liveness marker; another session is running");
+        }
+
+        return new RecordingSession(
+            paths,
+            Settings,
+            Platform,
+            Database,
+            new JsonlSessionEventSink(paths.EventsPath),
+            online ? MicAndLoopbackTrackSpecs() : MicTrackSpecs(),
+            Clock,
+            manifest,
+            DeviceRecoveryAttempts,
+            recordingLock,
+            afterPacketWritten: null,
+            beforeReopenAttempt: _beforeReopenAttempt);
+    }
+
+    /// <summary>
+    /// The microphone and loopback track specs, in the order the composition root produces them
+    /// (microphone first, loopback second; docs/ROADMAP.md M5).
+    /// </summary>
+    public IReadOnlyList<CaptureTrackSpec> MicAndLoopbackTrackSpecs()
+    {
+        var renderDeviceId = Settings.Online?.RenderDeviceId ?? "default";
+        var loopbackMode = LoopbackModes.Parse(Settings.Online?.LoopbackMode ?? "system");
+        var processName = Settings.Online?.ProcessName ?? string.Empty;
+
+        return new[]
+        {
+            new CaptureTrackSpec(
+                AudioSource.Mic,
+                Device,
+                device => Platform.CaptureSources.Create(AudioSource.Mic, device),
+                () => AudioDeviceResolver.TryResolve(Devices, Settings.MicrophoneDeviceId)),
+            new CaptureTrackSpec(
+                AudioSource.Loopback,
+                RenderDevice,
+                device => Platform.CaptureSources.CreateLoopback(
+                    new LoopbackCaptureRequest(device, loopbackMode, processName)),
+                () => AudioDeviceResolver.TryResolveRender(Devices, renderDeviceId)),
+        };
+    }
+
     public void Dispose()
     {
         if (OwnsWorkspace)
@@ -112,5 +202,6 @@ internal sealed class SessionHarness : IDisposable
         }
     }
 
+    private readonly Func<CancellationToken, Task>? _beforeReopenAttempt;
     private readonly TempWorkspace _workspace;
 }

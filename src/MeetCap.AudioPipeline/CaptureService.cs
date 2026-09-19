@@ -71,17 +71,27 @@ public sealed class CaptureService
     private readonly CaptureSettings _settings;
     private readonly int _maxDeviceRecoveryAttempts;
 
+    /// <summary>
+    /// Creates the capture service for one session's settings.
+    /// </summary>
+    /// <param name="maxDeviceRecoveryAttempts">
+    /// Test seam: an explicit cap on device-recovery attempts, used by tests that must not
+    /// spend the whole production recovery window in real time. Production passes
+    /// <c>null</c>, and the budget is then derived from
+    /// <see cref="CaptureSettings.DeviceRecoverySeconds"/>
+    /// (docs/RELIABILITY.md section 8).
+    /// </param>
     public CaptureService(
         CapturePlatform platform,
         MeetCapDatabase database,
         CaptureSettings settings,
-        int maxDeviceRecoveryAttempts = 3)
+        int? maxDeviceRecoveryAttempts = null)
     {
         _platform = platform ?? throw new ArgumentNullException(nameof(platform));
         _database = database ?? throw new ArgumentNullException(nameof(database));
         _settings = settings ?? throw new ArgumentNullException(nameof(settings));
 
-        if (maxDeviceRecoveryAttempts < 0)
+        if (maxDeviceRecoveryAttempts is < 0)
         {
             throw new ArgumentOutOfRangeException(
                 nameof(maxDeviceRecoveryAttempts),
@@ -89,8 +99,31 @@ public sealed class CaptureService
                 "Device recovery attempts must not be negative.");
         }
 
-        _maxDeviceRecoveryAttempts = maxDeviceRecoveryAttempts;
+        _maxDeviceRecoveryAttempts = maxDeviceRecoveryAttempts
+            ?? RecoveryAttemptsFor(settings.DeviceRecoverySeconds);
     }
+
+    /// <summary>
+    /// How many device-recovery attempts realise a recovery window of
+    /// <paramref name="deviceRecoverySeconds"/> seconds.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The window is the policy; the attempt count is only how it is spent. A track waits
+    /// <see cref="CaptureTrack.DeviceRecoveryBackoffMs"/> before each retry, so a window of N
+    /// seconds is N retries and the budget is the window divided by that backoff. The two
+    /// cannot drift apart because neither is configured separately
+    /// (docs/CONFIGURATION.md section 6).
+    /// </para>
+    /// <para>
+    /// The count is the loop bound rather than a wall-clock deadline read from the injected
+    /// clock, because the injected clock is domain time that tests freeze deliberately: a
+    /// deadline read from a frozen clock would never expire and the recovery loop could not
+    /// terminate. A count is bounded whatever the clock does.
+    /// </para>
+    /// </remarks>
+    internal static int RecoveryAttemptsFor(int deviceRecoverySeconds)
+        => Math.Max(0, deviceRecoverySeconds) * 1000 / CaptureTrack.DeviceRecoveryBackoffMs;
 
     public CaptureSettings Settings => _settings;
 

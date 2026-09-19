@@ -41,7 +41,8 @@ public sealed class CaptureSettings
         string microphoneDeviceId,
         int configVersion,
         string mode = SessionModes.Offline,
-        OnlineCaptureSettings? online = null)
+        OnlineCaptureSettings? online = null,
+        int deviceRecoverySeconds = 20)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(dataRoot);
 
@@ -68,6 +69,14 @@ public sealed class CaptureSettings
                 "Minimum free space must be greater than 0.");
         }
 
+        if (deviceRecoverySeconds < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(deviceRecoverySeconds),
+                deviceRecoverySeconds,
+                "Device recovery seconds must not be negative. Use 0 to disable device recovery.");
+        }
+
         if (!SessionModes.IsKnown(mode))
         {
             throw new ArgumentException(
@@ -92,6 +101,7 @@ public sealed class CaptureSettings
         ConfigVersion = configVersion;
         Mode = mode;
         Online = online;
+        DeviceRecoverySeconds = deviceRecoverySeconds;
     }
 
     public string DataRoot { get; }
@@ -107,6 +117,24 @@ public sealed class CaptureSettings
     public string MicrophoneDeviceId { get; }
 
     public int ConfigVersion { get; }
+
+    /// <summary>
+    /// The bounded device-recovery window, in seconds, that every track of this session
+    /// retries its configured endpoint for after the device disappears
+    /// (docs/RELIABILITY.md section 8.1). <c>0</c> means "do not attempt recovery".
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the policy an operator configures, and the retry budget is derived from it
+    /// rather than configured separately, so a window and the number of attempts that spend
+    /// it can never disagree (docs/CONFIGURATION.md section 6).
+    /// </para>
+    /// <para>
+    /// It is snapshotted at session start with the rest of the settings, so a recording that
+    /// is already running keeps the policy it started with (docs/CONFIGURATION.md section 12).
+    /// </para>
+    /// </remarks>
+    public int DeviceRecoverySeconds { get; }
 
     /// <summary>
     /// The session mode these settings started a recording in: <c>offline</c> or
@@ -179,7 +207,8 @@ public sealed class CaptureSettings
                 microphoneDeviceId,
                 configuration.ConfigVersion,
                 effectiveMode,
-                online);
+                online,
+                capture.DeviceRecoverySeconds);
         }
         catch (ArgumentOutOfRangeException ex)
         {

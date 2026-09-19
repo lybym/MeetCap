@@ -59,6 +59,14 @@ internal sealed class CaptureTrack : IDisposable
     internal const int PacketsPerSecondEstimate = 100;
 
     /// <summary>Backoff between device-recovery attempts.</summary>
+    /// <remarks>
+    /// One second, so a <see cref="CaptureSettings.DeviceRecoverySeconds"/> window of N
+    /// seconds is N retries (<see cref="CaptureService.RecoveryAttemptsFor"/>). The value is
+    /// fixed rather than configurable because the retry <em>rate</em> is not the policy an
+    /// operator cares about — the recovery window is — and a one-second cadence is short
+    /// enough that an endpoint which is coming back is noticed promptly
+    /// (docs/RELIABILITY.md section 8).
+    /// </remarks>
     internal const int DeviceRecoveryBackoffMs = 1_000;
 
     /// <summary>Rate limit for repeated stalled-consumer events.</summary>
@@ -79,6 +87,12 @@ internal sealed class CaptureTrack : IDisposable
     private readonly Action<ClosedAudioChunk> _onChunkClosed;
     private readonly Action<Exception> _onStorageFailure;
 
+    /// <summary>
+    /// Test seam: awaited after a device loss and before each reopen attempt, so a test can
+    /// date a whole outage deterministically. Production passes <c>null</c>.
+    /// </summary>
+    private readonly Func<CancellationToken, Task>? _beforeReopenAttempt;
+
     private Action<AudioPacket>? _packetHandler;
     private EventHandler<CaptureStoppedEventArgs>? _stoppedHandler;
 
@@ -93,6 +107,7 @@ internal sealed class CaptureTrack : IDisposable
     private Exception? _segmentFault;
 
     private int _deviceRestarted;
+    private int _terminalDeviceLoss;
     private int _flushRequested;
     private int _overflowSignalled;
     private int _timelineUnusable;
@@ -121,7 +136,8 @@ internal sealed class CaptureTrack : IDisposable
         int maxDeviceRecoveryAttempts,
         Action? afterPacketWritten,
         Action<ClosedAudioChunk> onChunkClosed,
-        Action<Exception> onStorageFailure)
+        Action<Exception> onStorageFailure,
+        Func<CancellationToken, Task>? beforeReopenAttempt = null)
     {
         _paths = paths ?? throw new ArgumentNullException(nameof(paths));
         _settings = settings ?? throw new ArgumentNullException(nameof(settings));
@@ -137,6 +153,7 @@ internal sealed class CaptureTrack : IDisposable
         _afterPacketWritten = afterPacketWritten;
         _onChunkClosed = onChunkClosed ?? throw new ArgumentNullException(nameof(onChunkClosed));
         _onStorageFailure = onStorageFailure ?? throw new ArgumentNullException(nameof(onStorageFailure));
+        _beforeReopenAttempt = beforeReopenAttempt;
     }
 
     public AudioSource Source => _source;
@@ -382,6 +399,13 @@ internal sealed class CaptureTrack : IDisposable
         }
         finally
         {
+            // A track that ended on its own (device loss, format change) measured an outage
+            // it never got to place on the timeline, because placing an outage is what the
+            // <em>next</em> buffer does. There will be no next buffer, so the outage has to be
+            // accounted for here — on the consumer thread, in the same finally that closes this
+            // track's final chunk, after every packet the track will ever receive has been
+            // placed (docs/RELIABILITY.md section 7).
+            ApplyTerminalDeviceLoss();
             CloseActiveChunk();
         }
     }
@@ -514,6 +538,14 @@ internal sealed class CaptureTrack : IDisposable
         {
             attempts++;
 
+            if (_beforeReopenAttempt is { } seam)
+            {
+                // Test seam only: it parks a test's clock control between the outage's start and
+                // its measurement, which is the one window the recovery path cannot otherwise be
+                // dated from outside (docs/DEVELOPMENT.md section 7).
+                await seam(cancellationToken).ConfigureAwait(false);
+            }
+
             var replacement = await TryReopenDeviceAsync(attempts, cancellationToken).ConfigureAwait(false);
             if (replacement is null)
             {
@@ -531,7 +563,7 @@ internal sealed class CaptureTrack : IDisposable
                 return (null, attempts, false);
             }
 
-            var downtimeMs = (long)Math.Max(0, (_clock.UtcNow - downtimeStart).TotalMilliseconds);
+            var downtimeMs = MeasuredDowntime(downtimeStart);
             Interlocked.Add(ref _pendingGapMs, downtimeMs);
 
             // Signals the consumer that the next buffer starts a fresh device stream, so
@@ -548,8 +580,21 @@ internal sealed class CaptureTrack : IDisposable
             return (replacement, attempts, false);
         }
 
+        // The recovery window closed with the endpoint still gone. The outage measured while
+        // retrying is real missing audio even though no buffer will ever place it, so it is
+        // carried to the consumer — which owns the timeline — instead of vanishing with the
+        // track (docs/RELIABILITY.md section 7).
+        Interlocked.Add(ref _pendingGapMs, MeasuredDowntime(downtimeStart));
         return (null, attempts, true);
     }
+
+    /// <summary>
+    /// How long the device has been gone, as read from the same clock the outage is stamped
+    /// with. Never negative: an injected clock that moves backwards must not produce a
+    /// backwards gap.
+    /// </summary>
+    private long MeasuredDowntime(DateTimeOffset downtimeStart)
+        => (long)Math.Max(0, (_clock.UtcNow - downtimeStart).TotalMilliseconds);
 
     private async Task<IAudioCaptureSource?> TryReopenDeviceAsync(int attempt, CancellationToken cancellationToken)
     {
@@ -640,6 +685,59 @@ internal sealed class CaptureTrack : IDisposable
     {
         _degraded = true;
         Interlocked.CompareExchange(ref _endReason, reason, null);
+
+        // The track is ending, so no further buffer can place a measured outage on the
+        // timeline. The flag hands whatever was measured to the consumer, which is the only
+        // thread that writes the timeline, so the outage is counted exactly once instead of
+        // being lost (docs/RELIABILITY.md section 7).
+        Interlocked.Exchange(ref _terminalDeviceLoss, 1);
+    }
+
+    /// <summary>
+    /// Accounts for the outage that was still unplaced when this track ended, and names it in
+    /// the event log.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Runs on the consumer thread, in the same <c>finally</c> that closes this track's final
+    /// chunk and after every packet it will ever receive has been placed: the capture loop has
+    /// returned and the writer is complete, so the timeline has no writer left but this one
+    /// (docs/ARCHITECTURE.md section 7.2). Recording the outage anywhere else would race the
+    /// consumer's own <c>Observe</c> calls.
+    /// </para>
+    /// <para>
+    /// A track that placed no buffer reports no gap: there is no span of captured audio for
+    /// anything to be missing <em>from</em>, and inventing one would overstate the loss in
+    /// exactly the direction a reader cannot check (docs/RELIABILITY.md section 7).
+    /// </para>
+    /// </remarks>
+    private void ApplyTerminalDeviceLoss()
+    {
+        if (Interlocked.Exchange(ref _terminalDeviceLoss, 0) == 0)
+        {
+            return;
+        }
+
+        var pending = Interlocked.Exchange(ref _pendingGapMs, 0);
+        var gap = _timeline?.RecordTerminalDeviceLoss(pending);
+        if (gap is not { } terminal)
+        {
+            return;
+        }
+
+        _events.Write(new SessionEvent(SessionEventNames.CaptureGap, terminal.GapEndMs)
+        {
+            Source = _source.ToWireName(),
+            GapStartMs = terminal.GapStartMs,
+            GapEndMs = terminal.GapEndMs,
+            GapMs = terminal.GapMs,
+            Reason = AudioGapReasons.NotCaptured,
+            Detail =
+                "the configured capture device did not return within the recovery window, so this " +
+                "stretch of the track's timeline has no captured audio. The track ends here; the " +
+                "outage is what was measured while retrying, not an estimate of what a successful " +
+                "recovery would have captured.",
+        });
     }
 
     /// <summary>

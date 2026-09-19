@@ -85,6 +85,10 @@ public class ExampleConfigurationTests
             Assert.True(config.Transcript.IncludeSpeakerLabels);
             Assert.Equal("system", config.Capture.Online.LoopbackMode);
             Assert.Equal(string.Empty, config.Capture.Online.ProcessName);
+
+            // Issue #34: the recovery window is part of the shipped contract, not only of the
+            // schema, so the example must carry the same default the model does.
+            Assert.Equal(20, config.Capture.DeviceRecoverySeconds);
         }
         finally
         {
