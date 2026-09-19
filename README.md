@@ -99,11 +99,16 @@ contract is implemented by the provider adapter: the only user-supplied provider
 and the service-tier selector are rejected with a migration message rather than reinterpreted.
 The provider's `X-Tt-Logid` is retained per job for support tracing.
 
-Large-file transport is separately specified by issue #29. The target keeps files at or below
-20 MiB on inline `audio.data`; larger files are temporarily staged in a private Volcengine TOS
-object using the official TOS .NET SDK and submitted through an SDK-generated presigned
-`audio.url`. TOS is optional for ordinary 300-second live batches, never replaces local durable
-audio, and is not implemented on `main` until #29 lands.
+Large-file transport is specified and implemented by issue #29 (branch
+`feat/29-tos-large-file-transport`, PR #31; not yet on `main`). Files at or below 20 MiB stay on
+inline `audio.data`; larger files are temporarily staged in a private Volcengine TOS object using
+the official TOS .NET SDK and submitted through an SDK-generated presigned `audio.url`. TOS is
+optional for ordinary 300-second live batches and never replaces local durable audio. The job row
+keeps the stable bucket and object key — never the signed URL — so a restart can re-sign and can
+finish the idempotent `DeleteObject` cleanup; a cleanup failure is recorded retryable debt and does
+not invalidate a successful transcript.
+
+Until that branch merges, `main` remains inline-Base64-only for file transport.
 
 The hardware-dependent acceptance tests are tracked as a
 manual checklist in `docs/M1_WINDOWS_VALIDATION.md`; nothing here claims any milestone is
@@ -143,7 +148,7 @@ requires M0 through M6, which this release closes at the implementation level
 - FFmpeg/FFprobe through FFMpegCore for media inspection and normalization
 - Polly for transient provider HTTP resilience
 - Volcengine Seed-ASR 2.0 recording-file **Standard HTTP** ASR for transcription and anonymous speaker labels; new-console `X-Api-Key` authentication only
-- Volcengine TOS .NET SDK as the optional >20 MiB ASR transport target in issue #29 (private object + presigned GET URL; not the local recording store)
+- Volcengine TOS .NET SDK as the optional >20 MiB ASR transport added by issue #29 (streamed private object + SDK presigned GET URL + idempotent delete; not the local recording store)
 - sherpa-onnx + 3D-Speaker ERes2Net-base for local speaker embeddings and persistent identity matching
 - JSONL + Markdown artifacts
 

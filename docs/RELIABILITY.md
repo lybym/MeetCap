@@ -121,10 +121,26 @@ ASR succeeds but TOS DeleteObject fails
  -> later cleanup retry or bucket lifecycle safety net removes the orphan
 ```
 
+The delete is idempotent (`DeleteObject` succeeds for an absent key), so a retry after a partial
+failure never reports a phantom object. Where the cleanup is driven from is part of the same
+guarantee: the job row carries `tos_cleanup_pending`, `AsrJobProcessor` attempts the release once
+per pass, and `meetcap asr resume` runs a cleanup pass over terminal jobs that still owe it. A
+release failure emits `asr.audio.release_failed` and clears nothing, so the debt survives a
+restart; a success emits `asr.audio.released` and clears the flag.
+
+Cleanup debt is deliberately not "outstanding work": `CountOutstanding` and the resumable-job
+query ignore it, because a `succeeded` job is finished work and a finished session must not look
+unfinished merely because a temporary object still has to be deleted.
+
 Presigned URLs and TOS credentials are never recovery state. A URL may expire safely because the
 stable bucket/object key is what is persisted. The deployment should apply a three-day
 lifecycle expiration to the dedicated `meetcap-asr/` prefix as a second line of orphan cleanup;
 MeetCap itself does not mutate bucket lifecycle policy.
+
+One residual gap is worth stating plainly: an object staged by a process that dies before the
+job row records the identity is not referenced by any job, so MeetCap cannot find it to delete
+it. That orphan is exactly what the three-day prefix lifecycle rule is for, which is why the
+rule is documented as a deployment requirement rather than an optimisation.
 
 ## 10. Disk-space policy
 
