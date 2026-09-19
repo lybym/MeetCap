@@ -551,6 +551,25 @@ meetcap start "M5 process loopback" --mode online
       `end_reason: capture_start_failed` and an empty `audio/loopback/`.
 - [ ] If the running Windows/NAudio combination does not support process loopback, the failure
       is actionable, not a silent fallback to system loopback.
+- [ ] Stable process audio does **not** mark the loopback track degraded. `session.json` reports
+      the loopback entry with `degraded: false`, `gap_count: 0` and no `end_reason`, and
+      `events.jsonl` carries no repeated `capture.discontinuity` for the loopback source.
+      Process loopback reports no device position of its own, so this track is placed by its QPC
+      timestamp (docs/ARCHITECTURE.md section 8.1); one "device position moved backwards" event
+      per buffer is the defect this row checks for, not an acceptable warning.
+      ```powershell
+      Select-String -Path <data-root>\sessions\<id>\events.jsonl -Pattern 'capture.discontinuity'
+      # expect at most the one stream-start flags event per track, never one per buffer
+      ```
+- [ ] The loopback track's chunks cover the same session span as the microphone track's, so the
+      QPC-placed timeline is complete rather than merely free of events. Compare the chunk index:
+      ```powershell
+      meetcap status --session <id>
+      ```
+- [ ] A real drop stays observable: stop the target process's audio for a second while capture
+      runs, and the loopback track reports one `capture.gap` with the missing milliseconds and is
+      marked degraded. Missing audio is reported, never absorbed by shifting later timestamps
+      (docs/RELIABILITY.md section 7).
 
 ### 13.6 Two sessions into one data root both get their transcript
 

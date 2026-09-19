@@ -388,7 +388,11 @@ Implemented (issue #7):
   baseline) and `.WithProcessLoopback` (process, the additive option), reusing the same
   span-based `WasapiRecorder` callback and the same MeetCap-owned `NAudioCaptureSource`
   adapter the microphone uses — no raw `ActivateAudioInterfaceAsync` / COM plumbing
-  (docs/ARCHITECTURE.md section 2);
+  (docs/ARCHITECTURE.md section 2). The two paths declare different capture clocks: system
+  loopback reports the render endpoint's device position, while process loopback reports
+  none and is placed by its QPC timestamp, so the process track's timeline is monotonic
+  instead of flagging one backwards device position per buffer (issue #33,
+  docs/ARCHITECTURE.md section 8.1);
 - `RecordingSession` orchestrates one `CaptureTrack` per source (mic for offline; mic +
   loopback for online). Each track owns its own capture callback, bounded queue, chunk
   spool, timeline and device-loss recovery, so one capture callback never waits for the
@@ -428,7 +432,10 @@ render endpoint, or real process loopback. The manual Windows checklist for M5 i
 machine with a render endpoint and, for the process row, a running meeting application).
 The process-loopback path uses NAudio's `WithProcessLoopback`, so a real Windows/NAudio
 environment is required to confirm it can target a meeting application's process tree
-(`docs/DEVELOPMENT.md` section 7).
+(`docs/DEVELOPMENT.md` section 7). Section 13.5 additionally carries the process-loopback
+timeline rows added for issue #33; the timing behaviour behind them was reproduced on real
+hardware and is recorded in docs/ARCHITECTURE.md section 8.1, but the checklist itself is
+still unrun.
 
 ---
 

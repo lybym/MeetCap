@@ -12,6 +12,53 @@ manual checklist in `docs/M1_WINDOWS_VALIDATION.md` has been run on real hardwar
 milestones are described as the former, never the latter
 (`docs/DEVELOPMENT.md` section 7).
 
+## [Unreleased]
+
+### Fixed
+
+- **Windows process loopback no longer reports a false discontinuity for every buffer**
+  ([#33](https://github.com/lybym/MeetCap/issues/33)). Process loopback captures a process tree
+  rather than an endpoint's own stream, and on the machine that reproduced this the audio engine
+  reported `device_position_frames = 0` for every one of 1797 buffers while the QPC timestamp
+  advanced by exactly 10 ms per buffer. The track was placed by device position, so every buffer
+  after the first read as a backwards jump: `events.jsonl` held one `capture.discontinuity`
+  ("device position moved backwards") per buffer and the loopback track was reported
+  `degraded (unknown)` even though its audio was fine. A capture source now declares the device
+  timing it actually provides (`IAudioCaptureSource.Clock`, `CaptureClock.DevicePosition` or
+  `CaptureClock.Qpc`), and `CaptureTimeline` is built with that clock: process loopback is placed
+  by QPC, which reproduces the system-loopback baseline's timeline for the same audio
+  (`docs/ARCHITECTURE.md` section 8.1). Session logs now record the clock per track in the
+  `session.started` detail.
+
+### Added
+
+- **`capture.timeline_unusable`** session event: a track whose stream supplies neither a usable
+  device position nor a QPC timestamp has no device timing to be placed by, so it ends with this
+  one explicit event — carrying the reason and the baseline alternative — rather than writing
+  audio at a wall-clock-derived position or silently degrading. The microphone track keeps
+  recording and the failed track's already-captured chunk stays durable
+  (`docs/ARCHITECTURE.md` section 8.1, `docs/DATA_MODEL.md` section 4).
+- **Process-loopback failures name what to do next.** A process-loopback activation failure now
+  says that the machine needs a Windows/NAudio combination supporting process loopback plus a
+  running target process, and that the baseline `capture.online.loopback_mode = "system"` is
+  still available.
+
+### Notes
+
+- Real drops stay observable on a process-loopback track: a stretch of missing QPC time is one
+  `capture.gap` carrying the missing milliseconds, and a single missing 10 ms buffer is reported
+  as 10 ms of missing audio rather than absorbed by the timeline.
+- The residual Windows/NAudio limitation cannot be fixed in code and is documented rather than
+  implied: QPC is a time, so a process-loopback timeline is resolved to the millisecond instead
+  of to the exact frame (`docs/ARCHITECTURE.md` section 8.1).
+- No persisted schema change: `track_health` in `session.json` and the `events.jsonl` vocabulary
+  are extended by values, not by columns, so no migration is added.
+- The manual M5 process-loopback checklist (`docs/M1_WINDOWS_VALIDATION.md` section 13.5) gained
+  rows for this behaviour and is still **not run**; the automated coverage is
+  `tests/MeetCap.Core.Tests/Capture/CaptureTimelineTests.cs`,
+  `tests/MeetCap.AudioPipeline.Tests/ProcessLoopbackTimelineTests.cs` and
+  `tests/MeetCap.WindowsAudio.Tests/NAudioLoopbackClockTests.cs`.
+
 ## [0.2.0] - 2026-09-19
 
 The second MVP-track release. It adds one post-MVP transport feature and one

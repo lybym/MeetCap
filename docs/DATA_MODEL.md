@@ -329,6 +329,21 @@ removed along with the manifest it cannot be paired with, because a WAV with no 
 timeline and `RecoverFinalizedBatches` refuses it; if even that removal fails, the same event names
 the leftover artifact so it is not left silently on disk.
 
+M5 adds one event to the capture vocabulary:
+
+```text
+capture.timeline_unusable  the track's buffers cannot be placed on the session timeline by
+                           the device timing its stream reports, so the track ends instead
+                           of writing audio at an invented position. This is the
+                           unsupported-process-loopback case: a capture stream that
+                           supplies neither a usable device position nor a QPC timestamp
+                           (docs/ARCHITECTURE.md section 8.1). `detail` carries the reason
+                           and the baseline alternative. It is written once per track, and
+                           it is deliberately not a degradation of otherwise healthy
+                           audio: without it the unsupported environment would be
+                           indistinguishable from a track that recorded normally.
+```
+
 `session.repair.incomplete` is written by startup recovery and by `meetcap session repair`
 when the session's timeline still holds a provable gap after every repair that could be
 attempted — including for a session that had already stopped cleanly and merely held a stray
