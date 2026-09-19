@@ -295,6 +295,62 @@ public class SqliteMigratorTests
     }
 
     [Fact]
+    public void Migrate_EveryAsrJobsRebuild_ReproducesTheSameColumnSetInTheSameOrder()
+    {
+        // Both 0005 and 0006 rebuild `asr_jobs` (create `asr_jobs_new`, copy, drop, rename), and
+        // each rebuild has to declare the *whole* current schema: DROP TABLE does not care which
+        // migration added a column, so a rebuild that knows only some of them silently removes the
+        // rest. docs/DATA_MODEL.md section 14 states the rule — a future asr_jobs column must be
+        // added to both rebuilds — but until now only convention and that prose kept the two in
+        // step, and the earlier revision of 0005 that reproduced 0003 + provider_log_id showed
+        // exactly how quietly it fails.
+        //
+        // This test is the check that goes red when they diverge. It reads the column list of the
+        // freshly migrated table as the baseline, then replays each rebuild on its own through the
+        // public migrator and requires the ordered column list to be identical. Order matters as
+        // much as membership: the copy in each script is positional, so if a column the baseline
+        // has is declared in a different slot by a rebuild, the post-replay table's order is what
+        // a later positional `INSERT ... SELECT` or a by-name reader disagreement would hit.
+        var db = NewDb();
+        try
+        {
+            var migrator = new SqliteMigrator();
+            migrator.Migrate(db);
+
+            using var c = Open(db);
+            var baseline = AsrJobColumnNames(c);
+
+            // Sanity: the baseline is the real post-#29 schema, so a migration that stopped
+            // creating the table at all cannot make the parity assertions below vacuously pass.
+            // These are the columns every rebuild has to reproduce; a column only one rebuild
+            // knows about fails here as well as in the replay comparison.
+            Assert.Equal(ExpectedAsrJobColumns(), baseline);
+
+            // Replay of 0005 with 0006's columns already present. This is the direction the CI
+            // failure came from: 0005 rebuilt the table from its own older shape and the transport
+            // columns disappeared, and the next read failed with "no such column: audio_transport".
+            ForgetAsrJobMigration(c, "0005_asr_job_provider_log_id.sql");
+            migrator.Migrate(db);
+            Assert.Equal(baseline, AsrJobColumnNames(c));
+
+            // Replay of 0006 with 0005 already committed: the mirror direction. A column known
+            // only to 0005 (provider_log_id) is what DROP TABLE would take away here if 0006's
+            // declaration fell behind.
+            ForgetAsrJobMigration(c, "0006_tos_asr_transport.sql");
+            migrator.Migrate(db);
+            Assert.Equal(baseline, AsrJobColumnNames(c));
+
+            // The rebuilds must also leave nothing half-swapped behind, so the parity above is
+            // asserted against the final table and not against a temporary `asr_jobs_new`.
+            Assert.False(TableExists(c, "asr_jobs_new"));
+        }
+        finally
+        {
+            Cleanup(db);
+        }
+    }
+
+    [Fact]
     public void Migrate_UpgradeFromAPreIssue29Database_AddsTheTransportColumnsWithInlineDefaults()
     {
         // The other half of the upgrade story: a data root created before issue #29 has no
@@ -460,10 +516,15 @@ public class SqliteMigratorTests
             Assert.Equal("meetcap-asr/deadbeefdeadbeef/2026/09/19/job_tos.wav", read.TosObjectKey);
             Assert.True(read.TosCleanupPending);
 
-            // A released object clears only the debt: the identity stays for the audit trail.
+            // A released object clears only the debt: the identity stays for the audit trail, so a
+            // later reader can still say which object was staged and released. Asserting only the
+            // object key would leave the bucket unverified, and the bucket is half the identity a
+            // release message and an operator both need.
             store.Update(AsrJobTransitions.MarkAudioReleased(read, DateTimeOffset.Parse("2026-09-15T01:00:00Z")));
             var released = store.Get("job_tos")!;
             Assert.False(released.TosCleanupPending);
+            Assert.Equal("tos", released.AudioTransport);
+            Assert.Equal("meetcap-asr", released.TosBucket);
             Assert.Equal("meetcap-asr/deadbeefdeadbeef/2026/09/19/job_tos.wav", released.TosObjectKey);
 
             // Nothing durable carries a signed URL: the only columns are the stable identity.
@@ -722,6 +783,65 @@ public class SqliteMigratorTests
 
         return false;
     }
+
+    /// <summary>
+    /// The ordered column names of `asr_jobs`, read through the same mechanism the migrator uses
+    /// to decide whether a schema-conditional placeholder expands to a column. `pragma_table_info`
+    /// resolves its argument case-insensitively and returns the declaration order, which is what
+    /// makes a rebuild that reorders or drops a column observable.
+    /// </summary>
+    private static string[] AsrJobColumnNames(SqliteConnection c)
+    {
+        using var cmd = new SqliteCommand("SELECT name FROM pragma_table_info('asr_jobs')", c);
+        using var reader = cmd.ExecuteReader();
+        var names = new List<string>();
+        while (reader.Read())
+        {
+            names.Add(reader.GetString(0));
+        }
+
+        Assert.NotEmpty(names);
+        return names.ToArray();
+    }
+
+    /// <summary>
+    /// The post-#29 `asr_jobs` schema, in declaration order, as a freshly migrated database
+    /// produces it. Every rebuild in the migration set has to reproduce exactly this: a column
+    /// held by only one of 0005 and 0006 is what a replay of the other drops.
+    /// </summary>
+    private static string[] ExpectedAsrJobColumns() =>
+    [
+        "id",
+        "session_id",
+        "source",
+        "tier",
+        "provider",
+        "start_ms",
+        "end_ms",
+        "input_artifact",
+        "status",
+        "provider_request_id",
+        "attempt_count",
+        "next_retry_at",
+        "request_metadata_path",
+        "raw_response_path",
+        "normalized_result_path",
+        "error_code",
+        "error_message",
+        "duration_ms",
+        "speaker_info_requested",
+        "speaker_info_returned",
+        "estimated_cost_cny",
+        "submitted_at",
+        "completed_at",
+        "created_at",
+        "updated_at",
+        "provider_log_id",
+        "audio_transport",
+        "tos_bucket",
+        "tos_object_key",
+        "tos_cleanup_pending",
+    ];
 
     [Fact]
     public void ParseMigrations_OrdersByVersionAndIgnoresNonMigrationResources()

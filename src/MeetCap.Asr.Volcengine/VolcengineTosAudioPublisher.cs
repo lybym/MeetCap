@@ -47,7 +47,58 @@ public sealed class VolcengineTosAudioPublisher : IAsrAudioPublisher
 
     private readonly VolcengineTosOptions? _options;
 
+    /// <summary>
+    /// Test-only client seam, or <c>null</c> in production. See the internal constructor overload
+    /// for why it exists.
+    /// </summary>
+    private readonly Func<VolcengineTosOptions, ITosClient>? _clientFactory;
+
     public VolcengineTosAudioPublisher(VolcengineTosOptions? options) => _options = options;
+
+    /// <summary>
+    /// Test-only seam that substitutes the TOS client, mirroring the way
+    /// <see cref="VolcengineAsrProvider"/> accepts an <see cref="System.Net.Http.HttpMessageHandler"/>
+    /// for the same reason.
+    /// </summary>
+    /// <param name="options">
+    /// The TOS configuration, or <c>null</c> to keep the publisher unconfigured. It is passed
+    /// through to <paramref name="clientFactory"/> unchanged so a test can assert that the
+    /// publisher actually used the configured bucket.
+    /// </param>
+    /// <param name="clientFactory">
+    /// Builds the TOS client from the configuration. A test passes a recording fake so the
+    /// transport policy (stream, not buffered bytes; exactly one <c>PutObject</c>; fixed
+    /// presigned lifetime; stable bucket and key) is asserted without a bucket, credentials, or
+    /// network access. Pass <c>null</c> to build the real client.
+    /// </param>
+    /// <remarks>
+    /// <para>
+    /// The real upload, signing and delete cannot be exercised in CI: the environment has no TOS
+    /// bucket or credentials, and inventing a bucket URL or a fake success would violate
+    /// <c>docs/DEVELOPMENT.md</c> section 7 ("No fake success"). The seam exists so the
+    /// <em>shape</em> of the SDK calls <see cref="PublishAsync"/> issues is still proven in CI,
+    /// while the real round trip to a live bucket stays the documented manual step in
+    /// <c>docs/M1_WINDOWS_VALIDATION.md</c>.
+    /// </para>
+    /// <para>
+    /// This is the same trade-off <see cref="VolcengineAsrProvider"/> already makes for the ASR
+    /// HTTP boundary in <c>VolcengineAsrProviderTests</c>. It buys that coverage at the cost of a
+    /// second constructor, which is kept <c>internal</c> so the production surface is still the
+    /// single public <see cref="VolcengineTosAudioPublisher(VolcengineTosOptions?)"/> overload.
+    /// </para>
+    /// <para>
+    /// Production behaviour is unchanged: <see cref="CreateClient"/> delegates to
+    /// <see cref="BuildClient"/> — the real <see cref="TosClientBuilder"/> path — whenever the
+    /// factory is <c>null</c>, which is every non-test construction site.
+    /// </para>
+    /// </remarks>
+    internal VolcengineTosAudioPublisher(
+        VolcengineTosOptions? options,
+        Func<VolcengineTosOptions, ITosClient>? clientFactory)
+    {
+        _options = options;
+        _clientFactory = clientFactory;
+    }
 
     /// <summary>True when TOS is configured, i.e. the oversized path can be served.</summary>
     public bool IsConfigured => _options is not null;
@@ -93,7 +144,7 @@ public sealed class VolcengineTosAudioPublisher : IAsrAudioPublisher
         }
 
         var key = BuildObjectKey(request.JobId, DateTime.UtcNow);
-        var client = BuildClient(_options);
+        var client = CreateClient(_options);
 
         try
         {
@@ -171,7 +222,7 @@ public sealed class VolcengineTosAudioPublisher : IAsrAudioPublisher
                 "run 'meetcap asr resume' to finish the cleanup; the local transcript is unaffected.");
         }
 
-        var client = BuildClient(_options);
+        var client = CreateClient(_options);
         try
         {
             // Idempotent by contract: TOS DeleteObject succeeds for an absent key, so a retry
@@ -229,6 +280,21 @@ public sealed class VolcengineTosAudioPublisher : IAsrAudioPublisher
         var shard = Convert.ToHexStringLower(hash.AsSpan(0, 8));
         return shard;
     }
+
+    /// <summary>
+    /// Creates the TOS client for one publish or delete, honouring the test-only
+    /// <see cref="_clientFactory"/> seam when one was supplied.
+    /// </summary>
+    /// <remarks>
+    /// The factory branch is the only thing the seam changes. With a <c>null</c> factory this
+    /// delegates to <see cref="BuildClient"/>, which is exactly the real
+    /// <see cref="TosClientBuilder"/> path production has always taken, so the seam cannot alter
+    /// production behaviour. <see cref="BuildClient"/> itself is deliberately left untouched: it
+    /// stays the single static proof that this adapter reaches the official SDK rather than a
+    /// hand-rolled signer.
+    /// </remarks>
+    private ITosClient CreateClient(VolcengineTosOptions options) =>
+        _clientFactory is not null ? _clientFactory(options) : BuildClient(options);
 
     private static ITosClient BuildClient(VolcengineTosOptions options) =>
         TosClientBuilder.Builder()

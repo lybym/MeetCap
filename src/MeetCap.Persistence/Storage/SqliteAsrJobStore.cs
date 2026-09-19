@@ -177,7 +177,8 @@ public sealed class SqliteAsrJobStore : IAsrJobStore, IAsrQueueInspector
         return ReadAll(cmd);
     }
 
-    public void Update(AsrJob job)    {
+    public void Update(AsrJob job)
+    {
         ArgumentNullException.ThrowIfNull(job);
 
         using var conn = SqliteConnectionFactory.Open(_dbPath);

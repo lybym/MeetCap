@@ -20,6 +20,34 @@ public class VolcengineAsrProviderTests : IDisposable
 {
     private const string ApiKey = "SECRET-API-KEY-0123456789";
 
+    /// <summary>
+    /// A presigned GET URL with the shape TOS actually mints: the credential is the whole query
+    /// string, and the object is private, so this string is the only thing that opens it.
+    /// </summary>
+    private const string SignedUrl =
+        "https://meetcap-asr.tos-cn-beijing.volces.com/meetcap-asr/ab/2026/09/19/job_1.wav" +
+        "?X-Tos-Algorithm=TOS4-HMAC-SHA256&X-Tos-Date=20260919T101500Z&X-Tos-Expires=21600" +
+        "&X-Tos-Signature=deadbeefcafef00d&X-Tos-Credential=AKLT-SECRET%2F20260919%2Fcn-beijing%2Ftos%2Frequest";
+
+    private const string SignedUrlQuery =
+        "X-Tos-Algorithm=TOS4-HMAC-SHA256&X-Tos-Date=20260919T101500Z&X-Tos-Expires=21600" +
+        "&X-Tos-Signature=deadbeefcafef00d&X-Tos-Credential=AKLT-SECRET%2F20260919%2Fcn-beijing%2Ftos%2Frequest";
+
+    private const string SignedUrlUnderHttp =
+        "http://meetcap-asr.tos-cn-beijing.volces.com/meetcap-asr/ab/2026/09/19/job_1.wav" +
+        "?" + SignedUrlQuery;
+
+    /// <summary>
+    /// Query values that are fixed protocol text rather than credential material, so an error
+    /// message may legitimately still contain them after the credential itself is masked.
+    /// </summary>
+    private static readonly HashSet<string> NonSecretQueryValues = new(StringComparer.Ordinal)
+    {
+        "TOS4-HMAC-SHA256",
+        "20260919T101500Z",
+        "21600",
+    };
+
     private readonly string _audioRoot = Path.Combine(
         Path.GetTempPath(),
         "meetcap-volcengine-test-" + Guid.NewGuid().ToString("N"));
@@ -41,7 +69,7 @@ public class VolcengineAsrProviderTests : IDisposable
         return path;
     }
 
-    private static VolcengineAsrProvider Create(StubHttpHandler handler) =>
+    private static VolcengineAsrProvider Create(StubHttpHandler handler, string? signedUrl = null) =>
         new(
             new VolcengineAsrOptions
             {
@@ -51,7 +79,19 @@ public class VolcengineAsrProviderTests : IDisposable
                 InitialBackoff = TimeSpan.FromMilliseconds(1),
                 HttpTimeout = TimeSpan.FromSeconds(5),
             },
-            handler);
+            handler,
+            // A null publisher keeps the ordinary inline path, which is what every test that does
+            // not care about the transport boundary wants.
+            signedUrl is null ? null : new FakePublisher(TosAudio(signedUrl)));
+
+    private static AsrPublishedAudio TosAudio(string signedUrl) => new()
+    {
+        Transport = AsrTransports.Tos,
+        Url = signedUrl,
+        Bytes = 22 * 1024 * 1024,
+        Bucket = "meetcap-asr",
+        ObjectKey = "meetcap-asr/ab/2026/09/19/job_1.wav",
+    };
 
     private static AsrFileRequest Request(string path) => new()
     {
@@ -491,6 +531,138 @@ public class VolcengineAsrProviderTests : IDisposable
 
         Assert.DoesNotContain(ApiKey, ex.Message, StringComparison.Ordinal);
         Assert.Contains("***", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ResponseBodiesThatEchoThePresignedUrl_AreScrubbedFromErrors()
+    {
+        // The mirror of the API-key case above, and the shape review finding P1-1 described: the
+        // signed URL is put into the request body, so a Seed-ASR rejection that could not fetch
+        // `audio.url` quotes the parameter it rejected. The API key alone is not enough here --
+        // the adapter holds the URL and the AK/SK are nowhere in this options type -- so the URL
+        // itself has to join the scrub set. The message this produces is written to
+        // asr_jobs.error_message and to the append-only events.jsonl, so a live 6-hour credential
+        // reaching it cannot be recalled.
+        var handler = new StubHttpHandler().Enqueue(
+            HttpStatusCode.BadRequest,
+            body: $$"""{"code":"45000010","message":"failed to fetch { "audio.url" : "{{SignedUrl}}" }"}""",
+            apiStatus: "45000010",
+            apiMessage: "invalid audio url");
+        using var provider = Create(handler, SignedUrl);
+
+        var ex = await Assert.ThrowsAsync<AsrPermanentException>(
+            () => provider.SubmitFileAsync(Request(WriteAudio())));
+
+        AssertNoSignedUrl(ex.Message);
+        Assert.Contains("***", ex.Message, StringComparison.Ordinal);
+        // The scrubbing must not cost the operator the diagnosis: the provider's own code and
+        // message survive, and the rejection is still clearly reported.
+        Assert.Contains("45000010", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("invalid audio url", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("asr.volcengine.api_key", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ProviderStatusFailuresThatEchoThePresignedUrl_AreScrubbedFromErrors()
+    {
+        // The other error path that carries the response body into a durable message: HTTP 200
+        // with a non-success X-Api-Status-Code, which is how the provider reports a rejected
+        // parameter after it accepted the request.
+        var handler = new StubHttpHandler().Enqueue(
+            HttpStatusCode.OK,
+            body: $$"""{"message":"audio.url unreachable: {{SignedUrl}}"}""",
+            apiStatus: "55000010",
+            apiMessage: "cannot retrieve audio");
+        using var provider = Create(handler, SignedUrl);
+
+        var ex = await Assert.ThrowsAsync<AsrTransientException>(
+            () => provider.SubmitFileAsync(Request(WriteAudio())));
+
+        AssertNoSignedUrl(ex.Message);
+        Assert.Contains("55000010", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("cannot retrieve audio", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    // The provider re-spells the URL it was handed: rewritten scheme, only the query quoted, or
+    // the query with its `&` separators JSON-escaped. Each of these still contains a live
+    // signature, so each has to be masked; a match against MeetCap's own single spelling of the
+    // URL would leave them intact. The replacement is asserted in full, which is what pins down
+    // both halves: the credential is gone and the diagnosis around it survives.
+    [InlineData("the URL as it was sent", "cannot fetch", SignedUrl, "cannot fetch ***")]
+    [InlineData("the same URL under http", "cannot fetch", SignedUrlUnderHttp, "cannot fetch ***")]
+    [InlineData("the query quoted on its own", "could not fetch signed url", SignedUrlQuery, "could not fetch signed url ***")]
+    [InlineData(
+        "the query with escaped separators",
+        "cannot fetch",
+        "X-Tos-Algorithm=TOS4-HMAC-SHA256\\u0026X-Tos-Date=20260919T101500Z\\u0026X-Tos-Expires=21600" +
+        "\\u0026X-Tos-Signature=deadbeefcafef00d\\u0026X-Tos-Credential=AKLT-SECRET%2F20260919%2Fcn-beijing%2Ftos%2Frequest",
+        "cannot fetch ***")]
+    public async Task PresignedUrlEchoedInAnySpelling_IsMaskedWithoutLosingTheDiagnosis(
+        string shape,
+        string lead,
+        string echoed,
+        string expected)
+    {
+        Assert.NotEmpty(shape);
+        var handler = new StubHttpHandler().Enqueue(
+            HttpStatusCode.BadRequest,
+            body: "{\"message\":\"" + lead + " " + echoed + "\"}",
+            apiStatus: "45000010");
+        using var provider = Create(handler, SignedUrl);
+
+        var ex = await Assert.ThrowsAsync<AsrPermanentException>(
+            () => provider.SubmitFileAsync(Request(WriteAudio())));
+
+        AssertNoSignedUrl(ex.Message);
+        Assert.Contains(expected, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AnInlineSubmissionCarriesNoUrlForAnErrorToLeak()
+    {
+        // The inline path never mints a credential, so the scrub set is the API key only and the
+        // adapter must not treat the (absent) URL as if it had one.
+        var handler = new StubHttpHandler().Enqueue(
+            HttpStatusCode.BadRequest,
+            body: "{\"message\":\"bad audio.data\"}",
+            apiStatus: "45000001");
+        using var provider = Create(handler);
+
+        var ex = await Assert.ThrowsAsync<AsrPermanentException>(
+            () => provider.SubmitFileAsync(Request(WriteAudio())));
+
+        Assert.Contains("bad audio.data", ex.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Fails when any part of the presigned credential survives into a durable message.
+    /// </summary>
+    /// <remarks>
+    /// The query is the credential, spread across its parameters, so this asserts on the
+    /// <em>values</em> rather than on parameter names: a parameter name is not a secret, and a
+    /// provider that escapes <c>&amp;</c> to <c>\u0026</c> in a JSON body leaves the name readable
+    /// around the mask. What may not survive is the credential material itself — the signature, the
+    /// signed key, or the query as one contiguous string — under any scheme or encoding.
+    /// </remarks>
+    private static void AssertNoSignedUrl(string message)
+    {
+        Assert.DoesNotContain(SignedUrlQuery, message, StringComparison.Ordinal);
+        Assert.DoesNotContain(SignedUrl, message, StringComparison.Ordinal);
+        Assert.DoesNotContain(SignedUrlUnderHttp, message, StringComparison.Ordinal);
+
+        foreach (var parameter in SignedUrlQuery.Split('&'))
+        {
+            // `name=value`; anything whose value is not one of the fixed non-secret protocol
+            // values is credential material and must have been replaced.
+            var value = parameter[(parameter.IndexOf('=', StringComparison.Ordinal) + 1)..];
+            if (NonSecretQueryValues.Contains(value))
+            {
+                continue;
+            }
+
+            Assert.DoesNotContain(value, message, StringComparison.Ordinal);
+        }
     }
 
     [Fact]

@@ -544,6 +544,15 @@ Notes:
   recorded value. It is a diagnostic id, not a credential: the API key is never persisted in
   this or any other column, and `X-Tt-Logid` is also carried in provider error messages so a
   failed exchange is traceable from `error_message` alone.
+- `error_message` is scrubbed, not raw. The adapter removes the ASR API key and, on the submit
+  path, the **currently live presigned URL** it just minted — as the full URL, under either
+  scheme, and as its query string with `&` spelled either way — before the message becomes
+  durable here, in the append-only `events.jsonl`, or in the console log. The provider can quote
+  the `audio.url` parameter back when it rejects a request it could not fetch, and a presigned URL
+  is the only credential that opens the private object, so the message is the one place it must
+  never survive: `events.jsonl` cannot be un-appended after the fact. A per-call scrub is
+  sufficient because a URL is only alive for the process that minted it, and the TOS AK/SK never
+  reach this adapter at all.
 - `raw_response_path` and `normalized_result_path` point at `response.json` and
   `normalized.jsonl`. The raw response is written before parsing so a parser fix never
   requires re-billing the same audio.
@@ -854,7 +863,12 @@ already-applied, and an unnumbered script is never considered at all.
   replays, the result is the same table. Any future migration that adds a column to `asr_jobs`
   must add it to both rebuilds as well. The regression tests are
   `SqliteMigratorTests.Migrate_ReRunOfBothAsrJobMigrations_PreservesEveryColumnAndValue` and
-  `SqliteMigratorTests.Migrate_UpgradeFromAPreIssue29Database_AddsTheTransportColumnsWithInlineDefaults`.
+  `SqliteMigratorTests.Migrate_UpgradeFromAPreIssue29Database_AddsTheTransportColumnsWithInlineDefaults`,
+  and the rule itself is enforced — rather than merely documented — by
+  `SqliteMigratorTests.Migrate_EveryAsrJobsRebuild_ReproducesTheSameColumnSetInTheSameOrder`, which
+  records `asr_jobs`'s ordered column list from a fresh database and then replays 0005 and 0006 in
+  turn, asserting the same list in the same order each time. A column added to only one rebuild
+  makes that test red at the position where the lists diverge.
 - A migration may not simply skip itself when its column is already present either, and this is
   why the rebuild is unconditional rather than guarded by "does `provider_log_id` exist yet". On a
   fresh database 0006 commits first, so 0005's rebuild still has to run to add `provider_log_id`

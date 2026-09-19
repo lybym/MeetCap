@@ -875,6 +875,124 @@ public class AsrJobProcessorTests : IDisposable
     }
 
     [Fact]
+    public async Task ResumePass_ReportsReleasingACleanupOnlySessionsObjectRatherThanNothingToDo()
+    {
+        // What `meetcap asr resume` decides its "No ASR jobs need work" line from: the queue drain
+        // reports nothing for a session whose only remaining work is cleanup debt, so the cleanup
+        // pass has to be the thing that reports the work. If it did not, a session that still owns
+        // a staged object would be told there is nothing to do while its object stayed in the
+        // bucket (docs/DATA_MODEL.md section 6.2, AsrCommand.ResumeAsync).
+        var job = CreateJob(AsrJobStatus.Succeeded) with
+        {
+            AudioTransport = AsrTransports.Tos,
+            TosBucket = "meetcap-asr",
+            TosObjectKey = "meetcap-asr/abc/2026/09/19/job_1.wav",
+            TosCleanupPending = true,
+        };
+        _jobs.Update(job);
+        _provider.OnRelease = _ => AsrAudioRelease.Succeeded;
+
+        var processor = CreateProcessor();
+
+        // The queue drain has nothing to re-drive: the job is terminal, not resumable.
+        Assert.Empty(await processor.RunDueAsync(10));
+
+        var released = await processor.CleanupDueAsync(10);
+
+        var finished = Assert.Single(released);
+        Assert.Equal("job_1", finished.Id);
+        Assert.False(_jobs.Get("job_1")!.TosCleanupPending);
+    }
+
+    [Fact]
+    public async Task CleanupDue_ReleasesTheBatchAndKeepsTheDebtOfWhateverFailedInIt()
+    {
+        // A batch is not all-or-nothing: TOS can accept one delete and reject the next, so the
+        // pass has to release what it can and leave the rest owing cleanup. Treating the batch as
+        // atomic would either lose a successful release or silently forget a failed one.
+        _jobs.Update(TransportJob("job_a", createdMinute: 1));
+        _jobs.Update(TransportJob("job_b", createdMinute: 2));
+        _jobs.Update(TransportJob("job_c", createdMinute: 3));
+        _provider.OnRelease = job => job.Id == "job_b"
+            ? AsrAudioRelease.Failed("TOS is unreachable.")
+            : AsrAudioRelease.Succeeded;
+
+        var released = await CreateProcessor().CleanupDueAsync(10);
+
+        Assert.Equal(new[] { "job_a", "job_c" }, released.Select(j => j.Id));
+        Assert.False(_jobs.Get("job_a")!.TosCleanupPending);
+        Assert.False(_jobs.Get("job_c")!.TosCleanupPending);
+        // The failed delete keeps its durable debt, so the next resume retries it rather than
+        // leaving the object behind for ever.
+        Assert.True(_jobs.Get("job_b")!.TosCleanupPending);
+        // Every job in the batch was attempted exactly once.
+        Assert.Equal(new[] { "job_a", "job_b", "job_c" }, _provider.Released.Select(j => j.Id));
+    }
+
+    [Fact]
+    public async Task CleanupDue_AMaxJobsCutOffTruncatesWithoutDiscardingTheRemainingDebt()
+    {
+        // A bounded pass drains the oldest debt first. The point of the bound is to keep one resume
+        // short, not to give up on the rest: a job the pass never reached must still owe cleanup.
+        _jobs.Update(TransportJob("job_1", createdMinute: 1));
+        _jobs.Update(TransportJob("job_2", createdMinute: 2));
+        _jobs.Update(TransportJob("job_3", createdMinute: 3));
+        _provider.OnRelease = _ => AsrAudioRelease.Succeeded;
+
+        var first = await CreateProcessor().CleanupDueAsync(2);
+
+        Assert.Equal(new[] { "job_1", "job_2" }, first.Select(j => j.Id));
+        Assert.Equal(new[] { "job_1", "job_2" }, _provider.Released.Select(j => j.Id));
+        // The truncated job is untouched: it was neither released nor had its debt cleared.
+        Assert.True(_jobs.Get("job_3")!.TosCleanupPending);
+
+        var second = await CreateProcessor().CleanupDueAsync(2);
+
+        Assert.Equal(new[] { "job_3" }, second.Select(j => j.Id));
+        Assert.False(_jobs.Get("job_3")!.TosCleanupPending);
+
+        // Nothing left to do, so a third pass neither releases nor reports anything.
+        Assert.Empty(await CreateProcessor().CleanupDueAsync(2));
+    }
+
+    [Fact]
+    public async Task CleanupDue_ANonPositiveBoundReleasesNothing()
+    {
+        // `maxJobs` is a real bound and zero is not "unbounded": the command reads the same value
+        // for the queue drain and the cleanup pass, so a zero must mean no work rather than all.
+        _jobs.Update(TransportJob("job_1", createdMinute: 1));
+        _provider.OnRelease = _ => AsrAudioRelease.Succeeded;
+
+        var processor = CreateProcessor();
+
+        Assert.Empty(await processor.CleanupDueAsync(0));
+        Assert.Empty(await processor.CleanupDueAsync(-1));
+        Assert.Empty(_provider.Released);
+        Assert.True(_jobs.Get("job_1")!.TosCleanupPending);
+    }
+
+    /// <summary>A terminal TOS job with a distinct created_at, so batch ordering is asserted.</summary>
+    private static AsrJob TransportJob(string jobId, int createdMinute) => new()
+    {
+        Id = jobId,
+        SessionId = "ses_1",
+        Source = AudioTrackName.Import,
+        Provider = "volcengine",
+        StartMs = 0,
+        EndMs = 754_000,
+        InputArtifact = "audio/import/normalized.wav",
+        Status = AsrJobStatus.Succeeded,
+        ProviderRequestId = "req-" + jobId,
+        AudioTransport = AsrTransports.Tos,
+        TosBucket = "meetcap-asr",
+        TosObjectKey = "meetcap-asr/ab/2026/09/19/" + jobId + ".wav",
+        TosCleanupPending = true,
+        DurationMs = 754_000,
+        CreatedAt = s_now.AddMinutes(createdMinute),
+        UpdatedAt = s_now.AddMinutes(createdMinute),
+    };
+
+    [Fact]
     public async Task RecoveredJob_ReleasesItsObjectWithoutReUploadingOrReSubmitting()
     {
         // The restart path: the row already carries the transport identity, so the object is

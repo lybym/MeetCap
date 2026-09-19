@@ -70,12 +70,6 @@ public sealed record VolcengineAsrOptions
 
     public TimeSpan InitialBackoff { get; init; } = TimeSpan.FromSeconds(1);
 
-    /// <summary>
-    /// Maximum size of audio sent inline as base64. Larger imports are rejected with an
-    /// actionable message rather than silently truncated; splitting is a later milestone.
-    /// </summary>
-    public long MaxInlineAudioBytes { get; init; } = 20L * 1024 * 1024;
-
     /// <summary>The one submit endpoint this adapter speaks.</summary>
     public string SubmitEndpoint => BaseUrl + SubmitPath;
 

@@ -673,7 +673,8 @@ public sealed class AsrJobProcessor
         string code,
         string message,
         CancellationToken cancellationToken = default)
-    {        var failed = AsrJobTransitions.MarkFailed(job, Now(), code, message);
+    {
+        var failed = AsrJobTransitions.MarkFailed(job, Now(), code, message);
         _jobs.Update(failed);
 
         _artifacts.AppendEvent(
