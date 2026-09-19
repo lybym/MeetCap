@@ -248,8 +248,9 @@ section 15.1).
 Not implemented in this milestone, and deliberately out of scope:
 
 - legacy console authentication, recording-file 1.0, idle routing, and flash/turbo routing are explicitly removed by #26 rather than promoted into supported modes;
-- issue #29 large-file TOS transport is intentionally post-M3: it keeps one provider request
-  but moves >20 MiB inputs through private TOS + presigned `audio.url`;
+- issue #29 large-file TOS transport is implemented off-`main` (PR #31) and was not part of the M3
+  deliverable: it keeps one provider request but moves >20 MiB inputs through private TOS +
+  presigned `audio.url`;
 - automatic splitting of an import that exceeds the provider's actual file/duration limit remains out of scope;
 - hotword tables (M7);
 - any live-capture ASR batching (M4), loopback capture (M5), identity matching (M6),
@@ -545,7 +546,9 @@ Not implemented in this milestone, and deliberately out of scope:
 
 ## Status
 
-Planned on a separate branch; not part of the M0-M6 MVP release gate.
+Implemented on `feat/29-tos-large-file-transport` (PR #31); not part of the M0-M6 MVP release
+gate and not yet on `main`. The end-to-end real-TOS plus real-Seed-ASR smoke test remains manual
+and is recorded in `docs/M1_WINDOWS_VALIDATION.md`; CI exercises mocks and fakes only.
 
 ## Goal
 
@@ -558,7 +561,7 @@ transport that follows the official Volcengine TOS .NET SDK contract.
 - official TOS .NET SDK for `PutObject(FileStream)`, presigned GET URL, and `DeleteObject`;
 - private bucket/object only; no public-read fallback;
 - optional `[asr.tos]` configuration with secret-resolver-backed AK/SK;
-- randomized `meetcap-asr/` object keys;
+- `meetcap-asr/` object keys with a stable per-job shard;
 - durable bucket/object-key state; never persist a presigned URL;
 - new forward SQLite migration for TOS transport/cleanup state;
 - idempotent terminal cleanup; cleanup failure does not fail a successful transcript;
@@ -579,6 +582,13 @@ transport that follows the official Volcengine TOS .NET SDK contract.
 A >20 MiB imported/ASR artifact can survive upload, process restart, fresh URL generation,
 Seed-ASR submit/query, transcript persistence, and eventual TOS cleanup without exposing
 credentials or signed URLs; a TOS outage does not stop live recording.
+
+## Residual risk
+
+An object staged by a process that dies between the upload and the job row recording its identity
+is not referenced by any job, so MeetCap cannot find it to delete it. The three-day prefix
+lifecycle rule is the documented mitigation, which is why it is a deployment requirement rather
+than an optimisation.
 
 ---
 # M7 - ASR quality controls

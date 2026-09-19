@@ -223,7 +223,7 @@ resource header:       X-Api-Resource-Id: volc.seedasr.auc
 submit endpoint:        https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit
 query endpoint:         https://openspeech.bytedance.com/api/v3/auc/bigmodel/query
 task id:                UUID persisted before submit and reused for query
-audio transport:        <=20 MiB audio.data; >20 MiB TOS presigned audio.url (target #29)
+audio transport:        <=20 MiB audio.data; >20 MiB TOS presigned audio.url (issue #29)
 model_name:             bigmodel
 ```
 
@@ -278,7 +278,7 @@ Because these labels are the default MVP diarization source, `speakers.enabled =
 anonymous speaker clusters exist for the identity pipeline to match unless a local diarization
 fallback is configured.
 
-## 8.1 TOS large-file ASR transport (target after issue #29)
+## 8.1 TOS large-file ASR transport
 
 TOS is optional infrastructure for oversized file-ASR inputs. It is not required for normal
 300-second live batches and does not replace the local session/audio artifact tree.
@@ -304,26 +304,40 @@ simple-vs-multipart choice, and cleanup policy are not user-configurable in this
 
 Validation rules:
 
-- omitting `[asr.tos]` is valid while every submitted artifact remains at or below 20 MiB;
-- once a larger artifact requires TOS, `bucket`, `region`, `endpoint`, `access_key`, and
-  `secret_key` must all resolve before provider submission;
+- omitting `[asr.tos]`, or leaving every field empty as `config init` does, is valid while every
+  submitted artifact remains at or below 20 MiB. The provider is built successfully and the
+  oversized path fails only when an oversized artifact actually needs it;
+- a *partly* filled `[asr.tos]` is rejected when the provider is built, before any session exists:
+  `bucket`, `region`, `endpoint`, `access_key`, and `secret_key` must all be present or the section
+  must be empty. A half-filled section is a typo or an interrupted edit, and reporting it as "TOS
+  is not configured" would send the operator looking for a section they already wrote;
 - `access_key` and `secret_key` use the existing secret resolver and are redacted by
-  `meetcap config show`; they MUST NOT be written to session/job artifacts or normal logs;
-- the bucket/object is private; MeetCap never requires public-read access;
+  `meetcap config show` and by the log sinks; they MUST NOT be written to session/job artifacts or
+  normal logs. Both credential references are registered with `SecretRedactor` alongside the
+  Volcengine API key, which is what makes `config show`, `session.import.json` and the console log
+  redact them from the same source;
+- the failure when an oversized artifact is submitted without TOS names `[asr.tos]` and states
+  that MeetCap will not split, downsample, or change the ASR mode instead;
+- the bucket/object is private; MeetCap never requires public-read access, and no ACL is set on
+  upload;
 - the deployment credential should be scoped to the configured bucket/prefix and only the
   required `tos:PutObject`, `tos:GetObject`, and `tos:DeleteObject` operations;
 - MeetCap does not create buckets or mutate bucket IAM/lifecycle configuration.
 
-TOS object keys use the dedicated `meetcap-asr/` prefix plus a randomized component before
-date/job identity to avoid a purely increasing key sequence. Meeting titles and speaker names
-must not be embedded in remote object keys.
+TOS object keys are `meetcap-asr/<shard>/<yyyy>/<MM>/<dd>/<job>.wav`, where `<shard>` is a stable
+16-hex-digit hash of the job id. A stable shard keeps keys out of a purely increasing sequence
+without making a re-publish after a crash scatter a second object under a fresh random name, and
+it also means no meeting title, speaker name, or credential can appear in a remote key: the only
+identifying component is MeetCap's own opaque job id.
 
 The presigned GET URL is ephemeral and MUST NOT be persisted. Durable recovery stores the TOS
 bucket and object key, then regenerates a URL through the official SDK if submission must be
 continued after restart.
 
 A TOS-backed terminal job attempts idempotent object deletion. A cleanup failure is observable
-cleanup debt, not a transcription failure. Operators should configure a three-day lifecycle
+cleanup debt, not a transcription failure: the job keeps its status and transcript, the row keeps
+`tos_cleanup_pending = 1`, `asr.audio.release_failed` is appended to `events.jsonl`, and the next
+`meetcap asr resume` retries the delete. Operators should configure a three-day lifecycle
 expiration rule for the `meetcap-asr/` prefix as a safety net for orphaned objects.
 
 Official references:
@@ -334,8 +348,11 @@ Official references:
 - https://www.volcengine.com/docs/6349/1130756?lang=zh
 - https://www.volcengine.com/docs/6349/1167743?lang=zh
 
-Until issue #29 lands, `main` remains inline-Base64-only; this section defines the target
-configuration contract and must not be read as an implementation-status claim.
+Issue #29 implements this contract. The TOS .NET SDK 2.1.8 exposes only a synchronous
+`ITosClient` (there is no `PutObjectAsync`), so the adapter dispatches the blocking upload, sign,
+and delete calls to the thread pool. That is what keeps a tens-of-megabytes upload off whichever
+thread entered the publisher — in particular off the capture callback path — and it is why the
+transport contract is asynchronous even though the SDK surface is not.
 
 ## 9. Speaker architecture
 

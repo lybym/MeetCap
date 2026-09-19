@@ -20,6 +20,34 @@ public class VolcengineAsrProviderTests : IDisposable
 {
     private const string ApiKey = "SECRET-API-KEY-0123456789";
 
+    /// <summary>
+    /// A presigned GET URL with the shape TOS actually mints: the credential is the whole query
+    /// string, and the object is private, so this string is the only thing that opens it.
+    /// </summary>
+    private const string SignedUrl =
+        "https://meetcap-asr.tos-cn-beijing.volces.com/meetcap-asr/ab/2026/09/19/job_1.wav" +
+        "?X-Tos-Algorithm=TOS4-HMAC-SHA256&X-Tos-Date=20260919T101500Z&X-Tos-Expires=21600" +
+        "&X-Tos-Signature=deadbeefcafef00d&X-Tos-Credential=AKLT-SECRET%2F20260919%2Fcn-beijing%2Ftos%2Frequest";
+
+    private const string SignedUrlQuery =
+        "X-Tos-Algorithm=TOS4-HMAC-SHA256&X-Tos-Date=20260919T101500Z&X-Tos-Expires=21600" +
+        "&X-Tos-Signature=deadbeefcafef00d&X-Tos-Credential=AKLT-SECRET%2F20260919%2Fcn-beijing%2Ftos%2Frequest";
+
+    private const string SignedUrlUnderHttp =
+        "http://meetcap-asr.tos-cn-beijing.volces.com/meetcap-asr/ab/2026/09/19/job_1.wav" +
+        "?" + SignedUrlQuery;
+
+    /// <summary>
+    /// Query values that are fixed protocol text rather than credential material, so an error
+    /// message may legitimately still contain them after the credential itself is masked.
+    /// </summary>
+    private static readonly HashSet<string> NonSecretQueryValues = new(StringComparer.Ordinal)
+    {
+        "TOS4-HMAC-SHA256",
+        "20260919T101500Z",
+        "21600",
+    };
+
     private readonly string _audioRoot = Path.Combine(
         Path.GetTempPath(),
         "meetcap-volcengine-test-" + Guid.NewGuid().ToString("N"));
@@ -41,7 +69,7 @@ public class VolcengineAsrProviderTests : IDisposable
         return path;
     }
 
-    private static VolcengineAsrProvider Create(StubHttpHandler handler) =>
+    private static VolcengineAsrProvider Create(StubHttpHandler handler, string? signedUrl = null) =>
         new(
             new VolcengineAsrOptions
             {
@@ -51,7 +79,19 @@ public class VolcengineAsrProviderTests : IDisposable
                 InitialBackoff = TimeSpan.FromMilliseconds(1),
                 HttpTimeout = TimeSpan.FromSeconds(5),
             },
-            handler);
+            handler,
+            // A null publisher keeps the ordinary inline path, which is what every test that does
+            // not care about the transport boundary wants.
+            signedUrl is null ? null : new FakePublisher(TosAudio(signedUrl)));
+
+    private static AsrPublishedAudio TosAudio(string signedUrl) => new()
+    {
+        Transport = AsrTransports.Tos,
+        Url = signedUrl,
+        Bytes = 22 * 1024 * 1024,
+        Bucket = "meetcap-asr",
+        ObjectKey = "meetcap-asr/ab/2026/09/19/job_1.wav",
+    };
 
     private static AsrFileRequest Request(string path) => new()
     {
@@ -98,6 +138,194 @@ public class VolcengineAsrProviderTests : IDisposable
         Assert.Contains("\"enable_ddc\":true", body, StringComparison.Ordinal);
         Assert.Contains("\"format\":\"wav\"", body, StringComparison.Ordinal);
         Assert.Contains("\"data\":", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Submit_UsesEphemeralUrlWithoutPersistingSignedQuery()
+    {
+        var handler = new StubHttpHandler().Enqueue(HttpStatusCode.OK, apiStatus: "20000000");
+        var publisher = new FakePublisher(new AsrPublishedAudio
+        {
+            Transport = "tos", Url = "https://tos.invalid/object?X-Tos-Signature=secret", Bytes = 22 * 1024 * 1024,
+            Bucket = "meetcap-asr", ObjectKey = "meetcap-asr/shard/2026/09/19/job_1.wav",
+        });
+        using var provider = new VolcengineAsrProvider(new VolcengineAsrOptions { ApiKey = ApiKey, BaseUrl = "https://asr.invalid/api/v3/auc/bigmodel" }, handler, publisher);
+
+        var submission = await provider.SubmitFileAsync(Request(WriteAudio()));
+
+        Assert.Contains("\"url\":\"https://tos.invalid/object?X-Tos-Signature=secret\"", handler.RequestBodies[0]);
+        Assert.DoesNotContain("X-Tos-Signature", submission.SanitizedRequestJson, StringComparison.Ordinal);
+        Assert.Contains("\"tos_object_key\":\"meetcap-asr/shard/2026/09/19/job_1.wav\"", submission.SanitizedRequestJson);
+    }
+
+    [Fact]
+    public async Task Submit_ReportsTheTransportIdentitySoTheCallerCanPersistAndReleaseIt()
+    {
+        // The submission is the only place the caller can learn that a remote copy exists: the
+        // provider owns the publisher, so without this the job row could never record
+        // audio_transport/tos_bucket/tos_object_key (docs/DATA_MODEL.md section 6.2).
+        var handler = new StubHttpHandler().Enqueue(HttpStatusCode.OK, apiStatus: "20000000");
+        var published = new AsrPublishedAudio
+        {
+            Transport = "tos",
+            Url = "https://tos.invalid/object?X-Tos-Signature=secret",
+            Bytes = 22 * 1024 * 1024,
+            Bucket = "meetcap-asr",
+            ObjectKey = "meetcap-asr/abc/2026/09/19/job_1.wav",
+        };
+        using var provider = new VolcengineAsrProvider(
+            new VolcengineAsrOptions { ApiKey = ApiKey, BaseUrl = "https://asr.invalid/api/v3/auc/bigmodel" },
+            handler,
+            new FakePublisher(published));
+
+        var submission = await provider.SubmitFileAsync(Request(WriteAudio()));
+
+        Assert.NotNull(submission.Audio);
+        Assert.Equal("tos", submission.Audio!.Transport);
+        Assert.Equal("meetcap-asr", submission.Audio.Bucket);
+        Assert.Equal("meetcap-asr/abc/2026/09/19/job_1.wav", submission.Audio.ObjectKey);
+        Assert.True(submission.Audio.HasRemoteCopy);
+        // The signed URL travels to the provider only: it is never part of the durable identity.
+        Assert.Equal("https://tos.invalid/object?X-Tos-Signature=secret", submission.Audio.Url);
+    }
+
+    [Fact]
+    public async Task Submit_AnInlineTransportReportsNoRemoteCopyToRelease()
+    {
+        var handler = new StubHttpHandler().Enqueue(HttpStatusCode.OK, apiStatus: "20000000");
+        using var provider = Create(handler);
+
+        var submission = await provider.SubmitFileAsync(Request(WriteAudio()));
+
+        Assert.NotNull(submission.Audio);
+        Assert.Equal("inline", submission.Audio!.Transport);
+        Assert.Null(submission.Audio.Bucket);
+        Assert.Null(submission.Audio.ObjectKey);
+        Assert.False(submission.Audio.HasRemoteCopy);
+    }
+
+    [Fact]
+    public async Task Release_DeletesTheStagedObjectForATosJob()
+    {
+        var handler = new StubHttpHandler();
+        var publisher = new FakePublisher(new AsrPublishedAudio { Transport = "inline", Bytes = 1 });
+        using var provider = new VolcengineAsrProvider(
+            new VolcengineAsrOptions { ApiKey = ApiKey, BaseUrl = "https://asr.invalid/api/v3/auc/bigmodel" },
+            handler,
+            publisher);
+
+        var release = await provider.ReleaseAudioAsync(TosJob());
+
+        Assert.True(release.Attempted);
+        Assert.True(release.Released);
+        var deleted = Assert.Single(publisher.Deleted);
+        Assert.Equal("meetcap-asr", deleted.Bucket);
+        Assert.Equal("meetcap-asr/abc/2026/09/19/job_1.wav", deleted.ObjectKey);
+        // The delete needs the stable identity only; a signed URL is never required for it.
+        Assert.Null(deleted.Url);
+    }
+
+    [Fact]
+    public async Task Release_DoesNothingForAJobWithNoCleanupDebt()
+    {
+        // Releasing an object a still-running job needs would break the very request it was
+        // staged for, so the durable pending flag is what authorises the delete.
+        var publisher = new FakePublisher(new AsrPublishedAudio { Transport = "inline", Bytes = 1 });
+        using var provider = new VolcengineAsrProvider(
+            new VolcengineAsrOptions { ApiKey = ApiKey, BaseUrl = "https://asr.invalid/api/v3/auc/bigmodel" },
+            new StubHttpHandler(),
+            publisher);
+
+        var settled = await provider.ReleaseAudioAsync(TosJob(tosCleanupPending: false));
+        var notTos = await provider.ReleaseAudioAsync(TosJob() with { AudioTransport = "inline" });
+        var missingKey = await provider.ReleaseAudioAsync(TosJob() with { TosObjectKey = null });
+
+        Assert.False(settled.Attempted);
+        Assert.False(notTos.Attempted);
+        Assert.False(missingKey.Attempted);
+        Assert.Empty(publisher.Deleted);
+    }
+
+    [Fact]
+    public async Task Release_ReportsAFailedDeleteAsRetryableCleanupWorkRatherThanThrowing()
+    {
+        var publisher = new FakePublisher(new AsrPublishedAudio { Transport = "inline", Bytes = 1 })
+        {
+            OnDelete = _ => throw new AsrTransientException("tos.cleanup_failed", "TOS is unreachable."),
+        };
+        using var provider = new VolcengineAsrProvider(
+            new VolcengineAsrOptions { ApiKey = ApiKey, BaseUrl = "https://asr.invalid/api/v3/auc/bigmodel" },
+            new StubHttpHandler(),
+            publisher);
+
+        var release = await provider.ReleaseAudioAsync(TosJob());
+
+        Assert.True(release.Attempted);
+        Assert.False(release.Released);
+        Assert.Contains("TOS is unreachable.", release.Error!, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Release_ScrubsTheApiKeyFromAnyReportedCleanupFailure()
+    {
+        // An error message is persisted on the job, so the adapter's own scrubbing has to cover
+        // the cleanup path too and not only the HTTP paths.
+        var publisher = new FakePublisher(new AsrPublishedAudio { Transport = "inline", Bytes = 1 })
+        {
+            OnDelete = _ => throw new IOException($"delete rejected for key {ApiKey}"),
+        };
+        using var provider = new VolcengineAsrProvider(
+            new VolcengineAsrOptions { ApiKey = ApiKey, BaseUrl = "https://asr.invalid/api/v3/auc/bigmodel" },
+            new StubHttpHandler(),
+            publisher);
+
+        var release = await provider.ReleaseAudioAsync(TosJob());
+
+        Assert.False(release.Released);
+        Assert.DoesNotContain(ApiKey, release.Error!, StringComparison.Ordinal);
+        Assert.Contains("***", release.Error!, StringComparison.Ordinal);
+    }
+
+    private static AsrJob TosJob(bool tosCleanupPending = true) => new()
+    {
+        Id = "job_1",
+        SessionId = "ses_1",
+        Source = "import",
+        Provider = "volcengine",
+        InputArtifact = "audio/import/normalized.wav",
+        ProviderRequestId = "req-0001",
+        AudioTransport = "tos",
+        TosBucket = "meetcap-asr",
+        TosObjectKey = "meetcap-asr/abc/2026/09/19/job_1.wav",
+        TosCleanupPending = tosCleanupPending,
+        CreatedAt = DateTimeOffset.UnixEpoch,
+        UpdatedAt = DateTimeOffset.UnixEpoch,
+    };
+
+    /// <summary>
+    /// Records what the provider asked the transport boundary to publish and to release.
+    /// </summary>
+    private sealed class FakePublisher(AsrPublishedAudio audio) : IAsrAudioPublisher
+    {
+        public List<AsrPublishedAudio> Published { get; } = new();
+
+        public List<AsrPublishedAudio> Deleted { get; } = new();
+
+        /// <summary>Overrides deletion so a failure can be scripted; throw to simulate one.</summary>
+        public Action<AsrPublishedAudio>? OnDelete { get; set; }
+
+        public Task<AsrPublishedAudio> PublishAsync(AsrFileRequest request, CancellationToken cancellationToken = default)
+        {
+            Published.Add(audio);
+            return Task.FromResult(audio);
+        }
+
+        public Task DeleteAsync(AsrPublishedAudio published, CancellationToken cancellationToken = default)
+        {
+            Deleted.Add(published);
+            OnDelete?.Invoke(published);
+            return Task.CompletedTask;
+        }
     }
 
     [Fact]
@@ -306,6 +534,138 @@ public class VolcengineAsrProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task ResponseBodiesThatEchoThePresignedUrl_AreScrubbedFromErrors()
+    {
+        // The mirror of the API-key case above, and the shape review finding P1-1 described: the
+        // signed URL is put into the request body, so a Seed-ASR rejection that could not fetch
+        // `audio.url` quotes the parameter it rejected. The API key alone is not enough here --
+        // the adapter holds the URL and the AK/SK are nowhere in this options type -- so the URL
+        // itself has to join the scrub set. The message this produces is written to
+        // asr_jobs.error_message and to the append-only events.jsonl, so a live 6-hour credential
+        // reaching it cannot be recalled.
+        var handler = new StubHttpHandler().Enqueue(
+            HttpStatusCode.BadRequest,
+            body: $$"""{"code":"45000010","message":"failed to fetch { "audio.url" : "{{SignedUrl}}" }"}""",
+            apiStatus: "45000010",
+            apiMessage: "invalid audio url");
+        using var provider = Create(handler, SignedUrl);
+
+        var ex = await Assert.ThrowsAsync<AsrPermanentException>(
+            () => provider.SubmitFileAsync(Request(WriteAudio())));
+
+        AssertNoSignedUrl(ex.Message);
+        Assert.Contains("***", ex.Message, StringComparison.Ordinal);
+        // The scrubbing must not cost the operator the diagnosis: the provider's own code and
+        // message survive, and the rejection is still clearly reported.
+        Assert.Contains("45000010", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("invalid audio url", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("asr.volcengine.api_key", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ProviderStatusFailuresThatEchoThePresignedUrl_AreScrubbedFromErrors()
+    {
+        // The other error path that carries the response body into a durable message: HTTP 200
+        // with a non-success X-Api-Status-Code, which is how the provider reports a rejected
+        // parameter after it accepted the request.
+        var handler = new StubHttpHandler().Enqueue(
+            HttpStatusCode.OK,
+            body: $$"""{"message":"audio.url unreachable: {{SignedUrl}}"}""",
+            apiStatus: "55000010",
+            apiMessage: "cannot retrieve audio");
+        using var provider = Create(handler, SignedUrl);
+
+        var ex = await Assert.ThrowsAsync<AsrTransientException>(
+            () => provider.SubmitFileAsync(Request(WriteAudio())));
+
+        AssertNoSignedUrl(ex.Message);
+        Assert.Contains("55000010", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("cannot retrieve audio", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    // The provider re-spells the URL it was handed: rewritten scheme, only the query quoted, or
+    // the query with its `&` separators JSON-escaped. Each of these still contains a live
+    // signature, so each has to be masked; a match against MeetCap's own single spelling of the
+    // URL would leave them intact. The replacement is asserted in full, which is what pins down
+    // both halves: the credential is gone and the diagnosis around it survives.
+    [InlineData("the URL as it was sent", "cannot fetch", SignedUrl, "cannot fetch ***")]
+    [InlineData("the same URL under http", "cannot fetch", SignedUrlUnderHttp, "cannot fetch ***")]
+    [InlineData("the query quoted on its own", "could not fetch signed url", SignedUrlQuery, "could not fetch signed url ***")]
+    [InlineData(
+        "the query with escaped separators",
+        "cannot fetch",
+        "X-Tos-Algorithm=TOS4-HMAC-SHA256\\u0026X-Tos-Date=20260919T101500Z\\u0026X-Tos-Expires=21600" +
+        "\\u0026X-Tos-Signature=deadbeefcafef00d\\u0026X-Tos-Credential=AKLT-SECRET%2F20260919%2Fcn-beijing%2Ftos%2Frequest",
+        "cannot fetch ***")]
+    public async Task PresignedUrlEchoedInAnySpelling_IsMaskedWithoutLosingTheDiagnosis(
+        string shape,
+        string lead,
+        string echoed,
+        string expected)
+    {
+        Assert.NotEmpty(shape);
+        var handler = new StubHttpHandler().Enqueue(
+            HttpStatusCode.BadRequest,
+            body: "{\"message\":\"" + lead + " " + echoed + "\"}",
+            apiStatus: "45000010");
+        using var provider = Create(handler, SignedUrl);
+
+        var ex = await Assert.ThrowsAsync<AsrPermanentException>(
+            () => provider.SubmitFileAsync(Request(WriteAudio())));
+
+        AssertNoSignedUrl(ex.Message);
+        Assert.Contains(expected, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AnInlineSubmissionCarriesNoUrlForAnErrorToLeak()
+    {
+        // The inline path never mints a credential, so the scrub set is the API key only and the
+        // adapter must not treat the (absent) URL as if it had one.
+        var handler = new StubHttpHandler().Enqueue(
+            HttpStatusCode.BadRequest,
+            body: "{\"message\":\"bad audio.data\"}",
+            apiStatus: "45000001");
+        using var provider = Create(handler);
+
+        var ex = await Assert.ThrowsAsync<AsrPermanentException>(
+            () => provider.SubmitFileAsync(Request(WriteAudio())));
+
+        Assert.Contains("bad audio.data", ex.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Fails when any part of the presigned credential survives into a durable message.
+    /// </summary>
+    /// <remarks>
+    /// The query is the credential, spread across its parameters, so this asserts on the
+    /// <em>values</em> rather than on parameter names: a parameter name is not a secret, and a
+    /// provider that escapes <c>&amp;</c> to <c>\u0026</c> in a JSON body leaves the name readable
+    /// around the mask. What may not survive is the credential material itself — the signature, the
+    /// signed key, or the query as one contiguous string — under any scheme or encoding.
+    /// </remarks>
+    private static void AssertNoSignedUrl(string message)
+    {
+        Assert.DoesNotContain(SignedUrlQuery, message, StringComparison.Ordinal);
+        Assert.DoesNotContain(SignedUrl, message, StringComparison.Ordinal);
+        Assert.DoesNotContain(SignedUrlUnderHttp, message, StringComparison.Ordinal);
+
+        foreach (var parameter in SignedUrlQuery.Split('&'))
+        {
+            // `name=value`; anything whose value is not one of the fixed non-secret protocol
+            // values is credential material and must have been replaced.
+            var value = parameter[(parameter.IndexOf('=', StringComparison.Ordinal) + 1)..];
+            if (NonSecretQueryValues.Contains(value))
+            {
+                continue;
+            }
+
+            Assert.DoesNotContain(value, message, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
     public async Task PermanentProviderStatusCodes_AreNotRetried()
     {
         var handler = new StubHttpHandler().Enqueue(
@@ -472,5 +832,146 @@ public class VolcengineAsrProviderTests : IDisposable
     {
         Assert.Throws<ArgumentException>(
             () => new VolcengineAsrProvider(new VolcengineAsrOptions { ApiKey = "   " }));
+    }
+
+    [Fact]
+    public void Factory_WithoutTosSection_BuildsAPublisherThatKeepsTheOversizedPathClosed()
+    {
+        // "TOS stays optional until the large-file path is needed": an absent [asr.tos] must not
+        // stop the provider from being constructed at all.
+        var config = ConfigurationDefaults.Default();
+        config.Asr.Volcengine.ApiKey = ApiKey;
+
+        using var provider = VolcengineAsrProviderFactory.Create(config);
+
+        Assert.NotNull(provider);
+        Assert.Equal(VolcengineAsrProviderFactory.ProviderName, provider.Name);
+    }
+
+    [Fact]
+    public void Factory_WithAFullyConfiguredTosSection_ResolvesBothCredentialReferences()
+    {
+        var config = ConfigurationDefaults.Default();
+        config.Asr.Volcengine.ApiKey = ApiKey;
+        config.Asr.Tos.Bucket = "meetcap-asr";
+        config.Asr.Tos.Region = "cn-beijing";
+        config.Asr.Tos.Endpoint = "https://tos-cn-beijing.volces.com";
+        config.Asr.Tos.AccessKey = "env:TOS_ACCESS_KEY";
+        config.Asr.Tos.SecretKey = "env:TOS_SECRET_KEY";
+
+        using var provider = VolcengineAsrProviderFactory.Create(
+            config,
+            handler: null,
+            environment: name => name switch
+            {
+                "TOS_ACCESS_KEY" => "AK-LITERAL",
+                "TOS_SECRET_KEY" => "SK-LITERAL",
+                _ => null,
+            });
+
+        Assert.NotNull(provider);
+    }
+
+    [Fact]
+    public void Factory_WithAPartiallyConfiguredTosSection_NamesTheMissingField()
+    {
+        // A half-filled section is a typo or an interrupted edit, not "TOS is not configured",
+        // and reporting it as absent would send the operator looking for a section they wrote.
+        var config = ConfigurationDefaults.Default();
+        config.Asr.Volcengine.ApiKey = ApiKey;
+        config.Asr.Tos.Bucket = "meetcap-asr";
+
+        var ex = Assert.Throws<AsrConfigurationException>(() => VolcengineAsrProviderFactory.Create(config));
+
+        // The first missing field is named, and the message explains why a half-filled section is
+        // an error rather than "TOS is not configured".
+        Assert.Contains("asr.tos.region", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("partly configured", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Factory_WithAnUnresolvableTosCredentialReference_NamesTheVariable()
+    {
+        var config = ConfigurationDefaults.Default();
+        config.Asr.Volcengine.ApiKey = ApiKey;
+        config.Asr.Tos.Bucket = "meetcap-asr";
+        config.Asr.Tos.Region = "cn-beijing";
+        config.Asr.Tos.Endpoint = "https://tos-cn-beijing.volces.com";
+        config.Asr.Tos.AccessKey = "env:TOS_ACCESS_KEY";
+        config.Asr.Tos.SecretKey = "env:TOS_SECRET_KEY";
+
+        var ex = Assert.Throws<AsrConfigurationException>(
+            () => VolcengineAsrProviderFactory.Create(config, handler: null, environment: _ => null));
+
+        Assert.Contains("TOS_ACCESS_KEY", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Factory_WithAnEmptyTosSecretKey_DoesNotSilentlySkipTheValidation()
+    {
+        var config = ConfigurationDefaults.Default();
+        config.Asr.Volcengine.ApiKey = ApiKey;
+        config.Asr.Tos.Bucket = "meetcap-asr";
+        config.Asr.Tos.Region = "cn-beijing";
+        config.Asr.Tos.Endpoint = "https://tos-cn-beijing.volces.com";
+        config.Asr.Tos.SecretKey = "env:TOS_SECRET_KEY";
+
+        var ex = Assert.Throws<AsrConfigurationException>(() => VolcengineAsrProviderFactory.Create(config));
+
+        Assert.Contains("asr.tos.access_key", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Factory_TosCredentialsNeverReachTheRedactedConfigurationOutput()
+    {
+        // config show and the log sinks both redact from the same secret set, so the set has to
+        // contain the TOS credential references as well as the Volcengine API key.
+        var config = ConfigurationDefaults.Default();
+        config.Asr.Volcengine.ApiKey = ApiKey;
+        config.Asr.Tos.AccessKey = "AK-LITERAL-SECRET";
+        config.Asr.Tos.SecretKey = "SK-LITERAL-SECRET";
+
+        var secrets = MeetCap.Core.Secrets.SecretRedactor.GetSecretValues(config);
+        var printed = MeetCap.Core.Secrets.SecretRedactor.Redact(
+            $"api_key={ApiKey} access_key=AK-LITERAL-SECRET secret_key=SK-LITERAL-SECRET",
+            secrets);
+
+        Assert.DoesNotContain(ApiKey, printed, StringComparison.Ordinal);
+        Assert.DoesNotContain("AK-LITERAL-SECRET", printed, StringComparison.Ordinal);
+        Assert.DoesNotContain("SK-LITERAL-SECRET", printed, StringComparison.Ordinal);
+        Assert.Equal("api_key=*** access_key=*** secret_key=***", printed);
+    }
+
+    [Fact]
+    public void TosPublisher_UsesTheOfficialSdkAndNeverHandRollsSigning()
+    {
+        // Issue #29 requires the official TOS .NET SDK and forbids hand-written request signing.
+        // The SDK is a real, separately-versioned dependency of this adapter rather than a shim,
+        // and the adapter declares no signing surface of its own: the only TOS machinery it can
+        // reach is the SDK's client, and neither of its two operations computes a signature.
+        var adapter = typeof(VolcengineTosAudioPublisher).Assembly;
+        var sdk = typeof(TOS.TosClientBuilder).Assembly;
+
+        Assert.Equal("Volcengine.TOS", sdk.GetName().Name);
+        Assert.NotEqual(adapter.GetName().Name, sdk.GetName().Name);
+
+        // The official client is what the adapter builds and calls, so upload, presigning and
+        // deletion all go through the SDK implementation.
+        var buildClient = typeof(VolcengineTosAudioPublisher).GetMethod(
+            "BuildClient",
+            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+        Assert.NotNull(buildClient);
+        Assert.Equal(typeof(TOS.ITosClient), buildClient!.ReturnType);
+
+        // No hand-rolled signing: the public surface is the transport contract only.
+        var adapterMethods = typeof(VolcengineTosAudioPublisher)
+            .GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance)
+            .Select(m => m.Name)
+            .ToHashSet(StringComparer.Ordinal);
+
+        Assert.Contains(nameof(VolcengineTosAudioPublisher.PublishAsync), adapterMethods);
+        Assert.Contains(nameof(VolcengineTosAudioPublisher.DeleteAsync), adapterMethods);
+        Assert.DoesNotContain(adapterMethods, name => name.Contains("Sign", StringComparison.Ordinal));
+        Assert.DoesNotContain(adapterMethods, name => name.Contains("Signature", StringComparison.Ordinal));
     }
 }

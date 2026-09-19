@@ -12,7 +12,8 @@
 -- process that read schema_migrations before this version was recorded will run the
 -- script too. A bare ALTER TABLE would therefore fail with "duplicate column name" and
 -- abort that process. The table is rebuilt instead: every statement is guarded, and a
--- second run copies the (now identical) rows across and swaps again.
+-- second run copies the rows across and swaps again, leaving the table the same shape
+-- and the same data the first run produced.
 --
 -- A re-run must also not *lose* anything. It is reached only because another process
 -- already committed this rebuild, and between that commit and this run's DROP TABLE the
@@ -30,6 +31,22 @@
 -- The rebuild is also what keeps the legacy `tier` column and every CHECK constraint
 -- byte-for-byte identical to migration 0003. `tier` is retained as a schema-compatibility
 -- field; it is no longer a routing input (docs/DATA_MODEL.md section 6).
+--
+-- This script declares the table's *later* columns (issue #29's transport identity) as
+-- well, for the same reason: a rebuild is only ever safe when the schema it creates is a
+-- superset of the schema it is replacing. The replay documented above can equally leave
+-- this script running long after a newer migration already added its own columns, and DROP
+-- TABLE does not care which migration added them -- it removes all of them. An earlier
+-- revision of this file reproduced 0003 plus provider_log_id only, so exactly that replay
+-- silently dropped audio_transport, tos_bucket, tos_object_key and tos_cleanup_pending and
+-- every later read of the table failed with "no such column: audio_transport". The columns
+-- are copied through the same schema-conditional placeholder, so a first run fills them
+-- with the defaults migration 0006 would have applied anyway and a re-run carries the
+-- stored values -- a cleanup still owed to TOS is not forgotten, and the stable bucket and
+-- key that identify the object survive.
+--
+-- Any future migration that adds a column to `asr_jobs` must therefore add it here too.
+-- docs/DATA_MODEL.md section 14 states the rule.
 
 CREATE TABLE IF NOT EXISTS asr_jobs_new (
     id                     TEXT    PRIMARY KEY,
@@ -59,7 +76,11 @@ CREATE TABLE IF NOT EXISTS asr_jobs_new (
     completed_at           TEXT,
     created_at             TEXT    NOT NULL,
     updated_at             TEXT    NOT NULL,
-    provider_log_id        TEXT
+    provider_log_id        TEXT,
+    audio_transport        TEXT    NOT NULL DEFAULT 'inline' CHECK (audio_transport IN ('inline', 'tos')),
+    tos_bucket             TEXT,
+    tos_object_key         TEXT,
+    tos_cleanup_pending    INTEGER NOT NULL DEFAULT 0 CHECK (tos_cleanup_pending IN (0, 1))
 );
 
 INSERT OR IGNORE INTO asr_jobs_new (
@@ -67,13 +88,17 @@ INSERT OR IGNORE INTO asr_jobs_new (
     provider_request_id, attempt_count, next_retry_at, request_metadata_path, raw_response_path,
     normalized_result_path, error_code, error_message, duration_ms, speaker_info_requested,
     speaker_info_returned, estimated_cost_cny, submitted_at, completed_at, created_at, updated_at,
-    provider_log_id)
+    provider_log_id, audio_transport, tos_bucket, tos_object_key, tos_cleanup_pending)
 SELECT
     id, session_id, source, tier, provider, start_ms, end_ms, input_artifact, status,
     provider_request_id, attempt_count, next_retry_at, request_metadata_path, raw_response_path,
     normalized_result_path, error_code, error_message, duration_ms, speaker_info_requested,
     speaker_info_returned, estimated_cost_cny, submitted_at, completed_at, created_at, updated_at,
-    {{asr_jobs.provider_log_id}}
+    {{asr_jobs.provider_log_id}},
+    COALESCE({{asr_jobs.audio_transport}}, 'inline'),
+    {{asr_jobs.tos_bucket}},
+    {{asr_jobs.tos_object_key}},
+    COALESCE({{asr_jobs.tos_cleanup_pending}}, 0)
 FROM asr_jobs;
 
 DROP TABLE IF EXISTS asr_jobs;

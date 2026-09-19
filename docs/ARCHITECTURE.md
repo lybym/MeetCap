@@ -82,7 +82,7 @@ Polly is not a replacement for the persistent ASR job queue.
 - Volcengine Seed-ASR 2.0 recording-file Standard HTTP ASR as the only default cloud ASR contract
 - request speaker information where supported
 - new-console `X-Api-Key` authentication only; streaming ASR remains separately deferred and disabled
-- issue #29 target: inline Base64 for <=20 MiB; private TOS + SDK-generated presigned `audio.url` for larger files
+- issue #29: inline Base64 for <=20 MiB; private TOS + SDK-generated presigned `audio.url` for larger files
 
 ### Speaker identity
 
@@ -870,7 +870,7 @@ query:       POST https://openspeech.bytedance.com/api/v3/auc/bigmodel/query
 auth:        X-Api-Key
 resource:    X-Api-Resource-Id: volc.seedasr.auc
 model:       Seed-ASR 2.0 / model_name=bigmodel
-audio:       <=20 MiB audio.data Base64; >20 MiB TOS presigned audio.url (target #29)
+audio:       <=20 MiB audio.data Base64; >20 MiB TOS presigned audio.url (issue #29)
 diagnostics: X-Api-Status-Code, X-Api-Message, X-Tt-Logid
 ```
 
@@ -887,6 +887,15 @@ Issue #29 adds a separate ASR-audio publishing boundary ahead of this provider. 
 not own TOS SDK concerns: small inputs arrive as inline data, while larger inputs arrive as an
 ephemeral URL produced by a TOS adapter. The stable TOS bucket/object key, not the signed URL, is
 persisted for crash recovery.
+
+The boundary is `IAsrAudioPublisher` (Core), with `VolcengineTosAudioPublisher` as the
+infrastructure implementation. It owns exactly three operations, all through the official TOS .NET
+SDK: a streamed `PutObject` from a `FileStream`, an `PreSignedURL` GET, and an idempotent
+`DeleteObject`. `VolcengineAsrProvider` chooses `audio.data` or `audio.url` from the returned
+transport, reports the stable identity back on `AsrSubmission.Audio`, and never touches TOS types
+itself. `AsrJobProcessor` commits that identity to the job row before the submission is treated as
+accepted and drives `IAsrProvider.ReleaseAudioAsync` once the job is terminal, so the temporary
+object is released from durable state rather than from process memory.
 
 Hotword identifiers and speaker-info flags remain inside `MeetCap.Asr.Volcengine`.
 
@@ -1366,11 +1375,16 @@ when a process dies between writing the transcript and persisting the terminal j
 
 Imported and recorded sessions therefore share the same transcript and speaker-identity pipeline.
 
-Imports continue to prefer one provider file request. Current `main` is inline-Base64-only;
-issue #29 adds a transport fallback where inputs above 20 MiB are streamed to a private TOS object
-with the official .NET SDK and submitted as a presigned `audio.url`. This does not bypass provider
+Imports continue to prefer one provider file request. `main` is inline-Base64-only; issue #29 (PR
+#31) adds a transport fallback where inputs above 20 MiB are streamed to a private TOS object with
+the official .NET SDK and submitted as a presigned `audio.url`. This does not bypass provider
 file/duration limits and does not introduce automatic splitting; split mapping with preserved
 timestamps remains a later concern (`ASR_STRATEGY.md` section 12).
+
+The transport is selected by artifact size alone and is not user-tunable: there is no setting that
+can push a small file through TOS or a large file through `audio.data`. When an oversized artifact
+needs TOS and `[asr.tos]` is absent the submission fails actionably; MeetCap never splits,
+downsamples, changes the ASR tier, or opens a streaming request as a substitute.
 
 ### 21.1 Live recording (M4)
 
@@ -1451,7 +1465,7 @@ Microsoft.Data.Sqlite
 FluentMigrator (or thin equivalent)
 FFMpegCore + FFmpeg/FFprobe
 Polly
-Volcengine TOS .NET SDK (optional large-file ASR transport; target #29)
+Volcengine TOS .NET SDK (optional large-file ASR transport; issue #29)
 sherpa-onnx
 3D-Speaker ERes2Net-base
 ```

@@ -12,9 +12,19 @@ public static class SecretRedactor
     private const string Redacted = "***";
 
     /// <summary>
-    /// The secret-bearing string values present in the configuration (the Volcengine
-    /// API key reference). Empty values are not treated as secrets.
+    /// The secret-bearing string values present in the configuration: the Volcengine API key
+    /// reference and the TOS credential references. Empty values are not treated as secrets.
     /// </summary>
+    /// <remarks>
+    /// Credential <em>references</em> are registered, not the resolved secret. Both an
+    /// <c>env:NAME</c> reference as written and the value it resolves to are the same string
+    /// whenever the configuration carries a literal credential, so a literal is redacted either
+    /// way; a reference is redacted because printing <c>env:TOS_SECRET_KEY</c> at least names
+    /// the variable, while printing the resolved value would leak it. The secret resolver hands
+    /// the same references to <c>config show</c>, the log formatter and
+    /// <c>session.import.json</c>, so one registration covers all three
+    /// (<c>docs/CONFIGURATION.md</c> rules 7 and 8).
+    /// </remarks>
     public static IReadOnlySet<string> GetSecretValues(MeetCapConfiguration config)
     {
         var secrets = new HashSet<string>(StringComparer.Ordinal);
@@ -24,6 +34,8 @@ public static class SecretRedactor
         }
 
         AddIfNonEmpty(secrets, config.Asr.Volcengine.ApiKey);
+        AddIfNonEmpty(secrets, config.Asr.Tos.AccessKey);
+        AddIfNonEmpty(secrets, config.Asr.Tos.SecretKey);
         return secrets;
     }
 

@@ -28,7 +28,7 @@ authentication: X-Api-Key only (new console)
 resource id:    volc.seedasr.auc
 submit:         POST https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit
 query:          POST https://openspeech.bytedance.com/api/v3/auc/bigmodel/query
-audio transport: <= 20 MiB audio.data (Base64); > 20 MiB TOS presigned audio.url (#29 target)
+audio transport: <= 20 MiB audio.data (Base64); > 20 MiB TOS presigned audio.url (issue #29)
 ```
 
 The resource ID and endpoint family are provider protocol constants, not user-tunable settings.
@@ -61,8 +61,9 @@ Related official references:
 Implementation alignment landed with issue #26: the adapter sends only `X-Api-Key`, fixes
 `X-Api-Resource-Id` to `volc.seedasr.auc`, speaks the submit/query endpoints above with no
 tier routing, and retains the provider's `X-Tt-Logid` on the job row.
-Large-file TOS transport remains tracked by issue #29; until it lands, the implementation on
-`main` remains inline-Base64-only for file transport.
+Large-file TOS transport is implemented by issue #29 (section 12.1) on
+`feat/29-tos-large-file-transport`; it is not yet on `main`, so `main` remains inline-Base64-only
+for file transport.
 
 ## 3. Default live-session algorithm
 
@@ -298,15 +299,15 @@ The source file is copied into `audio/import/` and never modified in place; the 
 normalized artifacts are both recorded in `session.json`. A source that is already in the
 target shape is submitted unchanged, so MeetCap never re-encodes audio it does not have to.
 
-The current implementation submits one provider file request per import and remains
-inline-Base64-only. Issue #29 changes the transport, not the one-request preference: inputs at or
+The implementation submits one provider file request per import, with the transport chosen by
+artifact size. Issue #29 changes the transport, not the one-request preference: inputs at or
 below 20 MiB use `audio.data`; larger inputs use a private TOS object and presigned `audio.url`.
 Automatic splitting remains a later concern, and provider duration/size limits still fail with an
 actionable message rather than being silently bypassed.
 
-### 12.1 Large-file transport target (issue #29)
+### 12.1 Large-file transport (issue #29)
 
-The target transport decision is deterministic and intentionally not user-tunable:
+The transport decision is deterministic and intentionally not user-tunable:
 
 ```text
 <= 20 MiB normalized WAV
@@ -315,14 +316,22 @@ The target transport decision is deterministic and intentionally not user-tunabl
 
 > 20 MiB normalized WAV
   -> official Volcengine TOS .NET SDK PutObject(FileStream)
-  -> private object under meetcap-asr/<random-shard>/...
-  -> SDK-generated presigned GET URL
+  -> private object under meetcap-asr/<shard>/<yyyy>/<MM>/<dd>/<job>.wav
+  -> SDK-generated presigned GET URL (6 hours)
   -> audio.url
 ```
 
-The TOS adapter lives outside `VolcengineAsrProvider`; the provider owns only the Seed-ASR
-wire contract. Presigned URLs are ephemeral and MUST NOT be durable job identity. Recovery
-persists stable bucket/object-key state and regenerates a URL when required.
+The TOS adapter lives outside `VolcengineAsrProvider` as the `IAsrAudioPublisher`
+implementation; the provider owns only the Seed-ASR wire contract and selects `audio.data` or
+`audio.url` from the transport it is handed. Presigned URLs are ephemeral and MUST NOT be durable
+job identity. Recovery persists stable bucket/object-key state and regenerates a URL when
+required.
+
+The provider reports the published identity back on `AsrSubmission.Audio`, and
+`AsrJobProcessor` persists it before the submission counts as accepted, so the durable row — not
+process memory — is what a restart recovers the object's identity from. Cleanup is driven from the
+same row: a terminal job attempts an idempotent `DeleteObject`, and a failed delete leaves
+`tos_cleanup_pending = 1` for a later `meetcap asr resume` to retry rather than failing the job.
 
 The first implementation uses ordinary SDK upload, not multipart upload: the TOS .NET SDK
 supports stream upload and its simple-upload ceiling is well above the Seed-ASR file range.
@@ -354,7 +363,8 @@ For every ASR job record:
 The M3 schema contains `provider`, the schema-compatibility `tier`, `source`, `duration_ms`,
 `submitted_at`, `completed_at`, `attempt_count`, `provider_request_id`, `error_code`,
 `error_message`, `speaker_info_requested`, `speaker_info_returned`, `estimated_cost_cny`,
-`provider_log_id`, `raw_response_path`, `normalized_result_path`, `request_metadata_path`. A
+`provider_log_id`, `raw_response_path`, `normalized_result_path`, `request_metadata_path`, and —
+since issue #29 — `audio_transport`, `tos_bucket`, `tos_object_key`, `tos_cleanup_pending`. A
 terminal job also emits an `asr.job.completed` or `asr.job.failed` record in `events.jsonl`, and
 `asr.job.submitted` / `asr.job.completed` carry the provider log id.
 

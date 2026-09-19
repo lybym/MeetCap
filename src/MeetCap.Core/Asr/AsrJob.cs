@@ -43,6 +43,12 @@ public sealed record AsrJob
     /// <summary>Session-relative path (or absolute path) of the audio submitted for this job.</summary>
     public required string InputArtifact { get; init; }
 
+    /// <summary>Stable ASR transport identity. Signed URLs are never durable state.</summary>
+    public string AudioTransport { get; init; } = "inline";
+    public string? TosBucket { get; init; }
+    public string? TosObjectKey { get; init; }
+    public bool TosCleanupPending { get; init; }
+
     public AsrJobStatus Status { get; init; } = AsrJobStatus.Pending;
 
     /// <summary>

@@ -543,10 +543,13 @@ Artifact contract
 - Failed jobs persist and retry after restart/network recovery.
 - Raw provider response is saved.
 - Provider calls use Seed-ASR 2.0 Standard HTTP, `X-Api-Key`, and fixed resource ID `volc.seedasr.auc`.
-- Target after issue #29: inputs <=20 MiB use inline `audio.data`; larger inputs use private TOS
+- Implemented by issue #29: inputs <=20 MiB use inline `audio.data`; larger inputs use private TOS
   staging via the official .NET SDK and a presigned `audio.url`, without persisting the signed URL.
+  The durable job row keeps the stable bucket and object key (never the signed URL) so a restart
+  can re-sign and can finish cleanup.
 - TOS upload/sign/delete failures never stop healthy recording and never replace the durable local
-  audio artifact; cleanup failure does not invalidate an otherwise successful transcript.
+  audio artifact; cleanup failure does not invalidate an otherwise successful transcript, it stays
+  recorded on the job as retryable cleanup debt.
 - Anonymous speaker labels/timestamps are preserved where available.
 
 ### Speaker

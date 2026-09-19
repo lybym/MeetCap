@@ -83,8 +83,9 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
     private readonly HttpClient _http;
     private readonly bool _ownsHttpClient;
     private readonly ResiliencePipeline<VolcengineResponse> _pipeline;
+    private readonly IAsrAudioPublisher _audioPublisher;
 
-    public VolcengineAsrProvider(VolcengineAsrOptions options, HttpMessageHandler? handler = null)
+    public VolcengineAsrProvider(VolcengineAsrOptions options, HttpMessageHandler? handler = null, IAsrAudioPublisher? audioPublisher = null)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
         ArgumentException.ThrowIfNullOrWhiteSpace(options.ApiKey);
@@ -95,6 +96,7 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
         // Polly owns the request deadline, so HttpClient's own timeout is disabled to
         // keep exactly one timeout semantic in play.
         _http.Timeout = Timeout.InfiniteTimeSpan;
+        _audioPublisher = audioPublisher ?? new VolcengineTosAudioPublisher(null);
 
         _pipeline = new ResiliencePipelineBuilder<VolcengineResponse>()
             .AddRetry(new RetryStrategyOptions<VolcengineResponse>
@@ -130,37 +132,21 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
                 "cannot be submitted. Re-import the recording.");
         }
 
-        if (audio.Length > _options.MaxInlineAudioBytes)
-        {
-            throw new AsrConfigurationException(
-                $"Audio artifact '{request.InputArtifactPath}' is {audio.Length} bytes, above the " +
-                $"{_options.MaxInlineAudioBytes}-byte inline upload limit. Import a shorter recording; " +
-                "splitting long imports is not implemented yet.");
-        }
+        var published = await _audioPublisher.PublishAsync(request, cancellationToken).ConfigureAwait(false);
+        var body = BuildRequestBody(request, published);
+        var sanitized = BuildSanitizedRequestJson(request, published);
 
-        byte[] audioBytes;
-        try
-        {
-            audioBytes = await File.ReadAllBytesAsync(request.InputArtifactPath, cancellationToken)
-                .ConfigureAwait(false);
-        }
-        catch (IOException ex)
-        {
-            throw new AsrTransientException(
-                "audio.unreadable",
-                $"Audio artifact '{request.InputArtifactPath}' could not be read: {ex.Message}",
-                ex);
-        }
-
-        var body = BuildRequestBody(request, Convert.ToBase64String(audioBytes));
-        var sanitized = BuildSanitizedRequestJson(request, audio.Length);
-
+        // The presigned URL just minted for this call is a credential: while it is alive it is the
+        // only thing that opens the private object. It has to join the scrub set on every path that
+        // can produce a message MeetCap persists, including one where the provider echoes the
+        // rejected `audio.url` parameter back (docs/DATA_MODEL.md section 6.2).
         var response = await SendAsync(
             submitPath,
             body,
             request.ProviderRequestId,
             // The official Standard HTTP contract identifies the submit as sequence -1.
             sequence: -1,
+            published,
             cancellationToken).ConfigureAwait(false);
 
         var status = response.ApiStatus;
@@ -171,10 +157,11 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
                 ProviderRequestId = request.ProviderRequestId,
                 SanitizedRequestJson = sanitized,
                 ProviderLogId = response.LogId,
+                Audio = published,
             };
         }
 
-        throw Failure(status, response);
+        throw Failure(status, response, published);
     }
 
     public async Task<AsrPollResult> GetResultAsync(
@@ -192,6 +179,9 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
             "{}",
             submission.ProviderRequestId,
             sequence: null,
+            // The query sends no audio and holds no presigned URL: the submission the caller
+            // rehydrated from SQLite carries the stable identity only.
+            published: null,
             cancellationToken).ConfigureAwait(false);
 
         var status = response.ApiStatus;
@@ -213,7 +203,7 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
             return AsrPollResult.Completed(new AsrCompletion(response.Body, status, response.LogId));
         }
 
-        var error = Failure(status, response);
+        var error = Failure(status, response, published: null);
         return error is AsrTransientException transient
             ? AsrPollResult.Failed(new AsrProviderError(transient.Code, transient.Message, IsTransient: true))
             : AsrPollResult.Failed(new AsrProviderError(
@@ -230,17 +220,68 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
         }
     }
 
+    /// <summary>
+    /// Releases the temporary audio copy this job staged for transport.
+    /// </summary>
+    /// <remarks>
+    /// The publisher owns the object-storage work — this method only decides whether there is
+    /// anything to release, and turns a publisher failure into a durable cleanup debt rather
+    /// than a job failure (<c>docs/DATA_MODEL.md</c> section 6.2). The translated message never
+    /// contains a credential or a signed URL.
+    /// </remarks>
+    public async Task<AsrAudioRelease> ReleaseAudioAsync(
+        AsrJob job,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(job);
+
+        // Both conditions are required. The transport says the job was submitted through a
+        // remote copy at all, and the pending flag is the durable statement that the copy has
+        // not been confirmed gone. Releasing an object a still-running job needs would break
+        // the request it was staged for, so a job with no debt is never touched.
+        if (!job.TosCleanupPending
+            || !string.Equals(job.AudioTransport, AsrTransports.Tos, StringComparison.Ordinal)
+            || string.IsNullOrWhiteSpace(job.TosBucket)
+            || string.IsNullOrWhiteSpace(job.TosObjectKey))
+        {
+            return AsrAudioRelease.NotNeeded;
+        }
+
+        try
+        {
+            await _audioPublisher.DeleteAsync(
+                new AsrPublishedAudio
+                {
+                    Transport = AsrTransports.Tos,
+                    Bucket = job.TosBucket,
+                    ObjectKey = job.TosObjectKey,
+                },
+                cancellationToken).ConfigureAwait(false);
+
+            return AsrAudioRelease.Succeeded;
+        }
+        catch (Exception ex) when (ex is AsrTransientException or AsrConfigurationException or IOException)
+        {
+            // Cleanup debt is never a transcription failure: the job keeps its terminal status
+            // and its transcript, and only the pending flag survives so a later resume retries.
+            // A publisher that threw anything else is caught by the caller, which treats it the
+            // same way, so no cleanup error can ever escape as a job failure.
+            return AsrAudioRelease.Failed(Scrub(ex.Message));
+        }
+    }
+
     private async Task<VolcengineResponse> SendAsync(
         string path,
         string body,
         string requestId,
         int? sequence,
+        AsrPublishedAudio? published,
         CancellationToken cancellationToken)
     {
         try
         {
             return await _pipeline.ExecuteAsync(
-                async token => await SendOnceAsync(path, body, requestId, sequence, token).ConfigureAwait(false),
+                async token => await SendOnceAsync(path, body, requestId, sequence, published, token).ConfigureAwait(false),
                 cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex) when (
@@ -257,7 +298,8 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
                 Scrub(
                     $"Provider '{Name}' could not be reached for {path} after " +
                     $"{_options.MaxTransientAttempts} attempt(s): {ex.Message} " +
-                    "The job keeps its durable state and is retried when the provider is reachable."),
+                    "The job keeps its durable state and is retried when the provider is reachable.",
+                    published),
                 ex);
         }
     }
@@ -267,6 +309,7 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
         string body,
         string requestId,
         int? sequence,
+        AsrPublishedAudio? published,
         CancellationToken cancellationToken)
     {
         using var httpRequest = new HttpRequestMessage(HttpMethod.Post, path)
@@ -312,7 +355,8 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
                     $"Volcengine rejected the request with HTTP {statusCode} for {path}" +
                     Describe(apiStatus, apiMessage, logId) +
                     $": {Snippet(responseBody)} Check asr.volcengine.api_key and the resolved " +
-                    "new-console API key."));
+                    "new-console API key.",
+                    published));
         }
 
         if (statusCode is >= 500 or 408 or 429)
@@ -323,7 +367,8 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
                 $"http.{statusCode}",
                 Scrub(
                     $"Volcengine returned HTTP {statusCode}{Describe(apiStatus, apiMessage, logId)}: " +
-                    Snippet(responseBody)));
+                    Snippet(responseBody),
+                    published));
         }
 
         if (!response.IsSuccessStatusCode && string.IsNullOrEmpty(apiStatus))
@@ -333,7 +378,8 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
                 Scrub(
                     $"Volcengine returned HTTP {statusCode} for {path}" +
                     Describe(apiStatus, apiMessage, logId) +
-                    $": {Snippet(responseBody)}"));
+                    $": {Snippet(responseBody)}",
+                    published));
         }
 
         return new VolcengineResponse(responseBody, apiStatus ?? string.Empty, apiMessage ?? string.Empty, logId);
@@ -342,19 +388,20 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
     private static string? ReadHeader(HttpResponseMessage response, string name) =>
         response.Headers.TryGetValues(name, out var values) ? values.FirstOrDefault() : null;
 
-    private Exception Failure(string status, VolcengineResponse response)
+    private Exception Failure(string status, VolcengineResponse response, AsrPublishedAudio? published)
     {
         var code = string.IsNullOrEmpty(status) ? "provider.unknown" : status;
         var message = Scrub(
             $"Volcengine reported status {code}" +
             Describe(null, response.ApiMessage, response.LogId) +
-            $". {Snippet(response.Body)}");
+            $". {Snippet(response.Body)}",
+            published);
         return s_permanentStatusCodes.Contains(code)
             ? new AsrPermanentException(code, message)
             : new AsrTransientException(code, message);
     }
 
-    private string BuildRequestBody(AsrFileRequest request, string audioBase64)
+    private string BuildRequestBody(AsrFileRequest request, AsrPublishedAudio audio)
     {
         var body = new JsonObject
         {
@@ -364,7 +411,8 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
             ["audio"] = new JsonObject
             {
                 ["format"] = request.AudioFormat,
-                ["data"] = audioBase64,
+                [audio.Transport == AsrTransports.Inline ? "data" : "url"] =
+                    audio.Transport == AsrTransports.Inline ? audio.InlineBase64 : audio.Url,
             },
             ["request"] = BuildProviderRequest(request.RequestSpeakerInfo),
         };
@@ -396,7 +444,7 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
     /// key -- are never included, and the endpoint/resource id are recorded so a later
     /// reader can tell which fixed contract produced the artifact.
     /// </remarks>
-    private string BuildSanitizedRequestJson(AsrFileRequest request, long audioBytes)
+    private string BuildSanitizedRequestJson(AsrFileRequest request, AsrPublishedAudio audio)
     {
         var body = new JsonObject
         {
@@ -413,7 +461,11 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
             ["audio"] = new JsonObject
             {
                 ["format"] = request.AudioFormat,
-                ["inline_bytes"] = audioBytes,
+                ["transport"] = audio.Transport,
+                ["bytes"] = audio.Bytes,
+                ["inline_bytes"] = audio.Transport == AsrTransports.Inline ? audio.Bytes : null,
+                ["tos_bucket"] = audio.Bucket,
+                ["tos_object_key"] = audio.ObjectKey,
             },
             ["request"] = BuildProviderRequest(request.RequestSpeakerInfo),
         };
@@ -422,15 +474,59 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
     }
 
     /// <summary>Removes any occurrence of the API key from text that will be stored or logged.</summary>
-    private string Scrub(string text)
+    private string Scrub(string text) => Scrub(text, published: null);
+
+    /// <summary>
+    /// Removes every credential this call knows about from text that will be stored or logged.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The API key is scrubbed on every path. A <em>presigned URL</em> is the other credential in
+    /// play, and it is scrubbed on the submit path, where the adapter has just put the live URL
+    /// into the request body and the provider can quote it back: a Seed-ASR rejection that could
+    /// not fetch <c>audio.url</c> names the parameter it rejected. That message becomes durable in
+    /// <c>asr_jobs.error_message</c>, in the append-only <c>events.jsonl</c>, and in the console
+    /// log, so a live 6-hour URL reaching it would be un-recallable
+    /// (<c>docs/DATA_MODEL.md</c> section 6.2).
+    /// </para>
+    /// <para>
+    /// The URL is only ever alive for the call that minted it — a query sends no audio and a
+    /// release holds the stable bucket/key identity only — so scrubbing it per call, against the
+    /// <see cref="AsrPublishedAudio"/> that call was handed, is sufficient. The adapter never
+    /// learns the TOS AK/SK: <see cref="VolcengineAsrOptions"/> carries the ASR API key only, and
+    /// those credentials are never sent to this provider, so no response body can echo them.
+    /// </para>
+    /// </remarks>
+    private string Scrub(string text, AsrPublishedAudio? published)
     {
-        if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(_options.ApiKey))
+        if (string.IsNullOrEmpty(text))
         {
             return text;
         }
 
-        return text.Replace(_options.ApiKey, "***", StringComparison.Ordinal);
+        var scrubbed = ScrubValue(text, _options.ApiKey);
+
+        // A non-TOS publication carries no URL, and a blank one is nothing to replace. Checking
+        // the secret rather than the transport is what keeps this correct for any future
+        // transport that produces a credentialed URL.
+        var url = published?.Url;
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return scrubbed;
+        }
+
+        foreach (var variant in SignedUrlRedaction.VariantsOf(url!))
+        {
+            scrubbed = ScrubValue(scrubbed, variant);
+        }
+
+        return scrubbed;
     }
+
+    private static string ScrubValue(string text, string? secret) =>
+        string.IsNullOrEmpty(secret)
+            ? text
+            : text.Replace(secret, "***", StringComparison.Ordinal);
 
     /// <summary>
     /// Formats the provider's status/message/log-id headers for an error message.

@@ -427,9 +427,13 @@ Point `[asr.volcengine] api_key` at a wrong key and run the 12.2 scenario.
       it never deletes the source audio.
 - [ ] The batch WAVs are real audio: open one in a player and confirm it plays at the session's
       format with no click or truncation at the chunk joins.
-- [ ] `meetcap.db` carries exactly one schema change over M3: migration
-      `0005_asr_job_provider_log_id` adds the nullable `provider_log_id` column to `asr_jobs`.
-      No other table or column is added, and every pre-existing `asr_jobs` row survives.
+- [ ] `meetcap.db` carries exactly the two expected schema changes over M3: migration
+      `0005_asr_job_provider_log_id` adds the nullable `provider_log_id` column to `asr_jobs`, and
+      migration `0006_tos_asr_transport` adds `audio_transport`, `tos_bucket`, `tos_object_key` and
+      `tos_cleanup_pending` (section 15). No other table or column is added, and every pre-existing
+      `asr_jobs` row survives both rebuilds with its values intact.
+- [ ] No `asr_jobs_new` table is left behind by either rebuild:
+      `select name from sqlite_master where name like 'asr_jobs%';` lists `asr_jobs` only.
 - [ ] `request.json` contains no `data` member (the inline audio is replaced by `inline_bytes`)
       and no API key.
 
@@ -598,6 +602,12 @@ on one job primary key.
 | 13.4 M5 headphones vs speakers | | |
 | 13.5 M5 process loopback | | |
 | 13.6 M5 two sessions, one data root | | |
+| 15.1 #29 config redaction | | |
+| 15.2 #29 oversized input over TOS | | |
+| 15.3 #29 restart re-signing | | |
+| 15.4 #29 cleanup failure semantics | | |
+| 15.5 #29 TOS outage isolation | | |
+| 15.6 #29 20 MiB boundary | | |
 
 M1, M2 and M4 may be described as verified on real hardware only when every row above is filled
 in and passing, or when the residual failure is written down here as a known limitation. The M4
@@ -609,3 +619,115 @@ scripted transport (endpoint, headers, body shape, status handling, secret redac
 retention), but no real Seed-ASR 2.0 Standard HTTP request has been made from this environment,
 so end-to-end provider verification is explicitly **not** claimed
 (`docs/DEVELOPMENT.md` section 7).
+
+---
+
+## 15. Issue #29 additions — TOS large-file transport
+
+Issue #29 adds a transport for normalized WAV inputs above 20 MiB. The automated suite covers the
+policy and the failure semantics with mocks and fakes: the 20 MiB decision, the actionable failure
+when TOS is required but absent, the object-key layout, `audio.url` request shape, secret and
+signed-URL redaction, persistence and recovery of the bucket/object key, idempotent cleanup,
+cleanup-failure semantics, and that cleanup debt never counts as outstanding work. See
+`tests/MeetCap.Asr.Volcengine.Tests/VolcengineTosAudioPublisherTests.cs`,
+`tests/MeetCap.Asr.Volcengine.Tests/VolcengineAsrProviderTests.cs`,
+`tests/MeetCap.Asr.Tests/AsrJobProcessorTests.cs` and
+`tests/MeetCap.Persistence.Tests/Storage/SqliteMigratorTests.cs`.
+
+Nothing below can be covered by CI: it needs a real private TOS bucket, a real AK/SK scoped to it,
+and a real Seed-ASR key. Do not record these as passed without running them.
+
+Prerequisites on top of section 2:
+
+- a private TOS bucket in the region under test;
+- an AK/SK pair allowed to `tos:PutObject`, `tos:GetObject` and `tos:DeleteObject` on that
+  bucket's `meetcap-asr/*` prefix, and nothing else;
+- a normalized WAV above 20 MiB (any 21 MiB mono 16-bit 48 kHz WAV will do);
+- the three-day lifecycle expiration rule recommended in `docs/CONFIGURATION.md` section 8.1
+  applied to `meetcap-asr/`.
+
+### 15.1 Configuration and redaction
+
+```powershell
+# [asr.tos] bucket/region/endpoint set; access_key/secret_key as env: references
+$env:TOS_ACCESS_KEY = "<AK>"
+$env:TOS_SECRET_KEY = "<SK>"
+$env:MEETCAP_VOLCENGINE_API_KEY = "<new-console API key>"
+meetcap config show
+```
+
+- [ ] `meetcap config show` prints the `[asr.tos]` section with `access_key` and `secret_key` shown
+      as `***`, and prints the Volcengine API key as `***`.
+- [ ] No AK or SK value appears anywhere in the output, and neither does the value behind the
+      `env:` reference if a literal credential is used.
+- [ ] `meetcap import` logs do not contain the AK/SK either.
+
+### 15.2 Oversized input over TOS
+
+```powershell
+# place an oversized normalized WAV under .\tests\audio\ or import the source and let it normalize
+meetcap import .\big-meeting.wav --title "TOS large-file smoke"
+```
+
+- [ ] The job row records the transport and the stable identity:
+      `select id, status, audio_transport, tos_bucket, tos_object_key, tos_cleanup_pending from asr_jobs;`
+      shows `audio_transport = tos` with a non-null `tos_bucket` and `tos_object_key`.
+- [ ] `tos_object_key` matches `meetcap-asr/<16 hex>/<yyyy>/<MM>/<dd>/<job>.wav` and contains no
+      meeting title, speaker name, or credential.
+- [ ] The object exists in the bucket **before** the provider submission is accepted (check the
+      bucket between the `submitting` and `submitted` states, or from the object's own
+      `LastModified`).
+- [ ] The object is **not** public-read: an unauthenticated GET against the object URL fails,
+      while the presigned URL succeeds until it expires.
+- [ ] `request.json` for the job has `"transport":"tos"` with `tos_bucket`/`tos_object_key`, and
+      contains no `X-Tos-Signature`, no signed query string, and no `data` member.
+- [ ] `transcript/raw.jsonl` holds the recognized segments and the local input WAV is untouched.
+- [ ] After the job reaches `succeeded`, `tos_cleanup_pending` is `0`, the object is gone from the
+      bucket, and `events.jsonl` contains `asr.audio.released`.
+- [ ] `select id, status from asr_jobs;` still shows `succeeded`: cleanup never changed the job's
+      outcome.
+
+### 15.3 Signed URL validity and restart re-signing
+
+- [ ] With a job left `submitted` (kill the process between submit and poll), a later
+      `meetcap asr resume` continues by polling and **does not** upload a second object; the
+      bucket holds one object for that job.
+- [ ] A restart never re-uses the old signed URL from durable state, because none is stored.
+
+### 15.4 Cleanup failure is not a transcription failure
+
+```powershell
+# revoke tos:DeleteObject (or point [asr.tos] at a bucket the AK cannot write to), then resume
+meetcap asr resume
+```
+
+- [ ] The job stays `succeeded`, the transcript stays complete and readable, and
+      `tos_cleanup_pending` stays `1`.
+- [ ] `events.jsonl` contains `asr.audio.release_failed`, and the error message contains no
+      credential and no signed URL.
+- [ ] Restoring `tos:DeleteObject` and running `meetcap asr resume` again releases the object and
+      clears `tos_cleanup_pending`.
+- [ ] Running `meetcap asr resume` when there is nothing left to do does not report the session as
+      unfinished because of cleanup.
+
+### 15.5 Offline / TOS outage isolation
+
+- [ ] With TOS unreachable (block the endpoint or unset the AK), an oversized import leaves the
+      recording and the local WAV durable and does not open a streaming request; the job is
+      retryable or fails actionably.
+- [ ] A live session keeps recording while such a job fails; capture is never blocked on TOS work.
+- [ ] A small (<=20 MiB) import with `[asr.tos]` absent or empty still succeeds on the inline path.
+
+### 15.6 20 MiB boundary
+
+- [ ] An artifact of exactly 20 MiB is submitted inline as `audio.data` and creates no object in
+      the bucket.
+- [ ] An artifact of 20 MiB + 1 byte is submitted as `audio.url` and does create one.
+
+Checklist line for the issue:
+
+```text
+Manual real-TOS + real-Seed-ASR >20 MiB smoke test: NOT RUN | PASSED (<tos_object_key>, <X-Tt-Logid>)
+```
+
+---

@@ -504,6 +504,10 @@ submitted_at
 completed_at
 created_at
 updated_at
+audio_transport
+tos_bucket
+tos_object_key
+tos_cleanup_pending
 ```
 
 Status values (section 12 of `ARCHITECTURE.md`): `pending`, `submitting`, `submitted`,
@@ -540,6 +544,15 @@ Notes:
   recorded value. It is a diagnostic id, not a credential: the API key is never persisted in
   this or any other column, and `X-Tt-Logid` is also carried in provider error messages so a
   failed exchange is traceable from `error_message` alone.
+- `error_message` is scrubbed, not raw. The adapter removes the ASR API key and, on the submit
+  path, the **currently live presigned URL** it just minted — as the full URL, under either
+  scheme, and as its query string with `&` spelled either way — before the message becomes
+  durable here, in the append-only `events.jsonl`, or in the console log. The provider can quote
+  the `audio.url` parameter back when it rejects a request it could not fetch, and a presigned URL
+  is the only credential that opens the private object, so the message is the one place it must
+  never survive: `events.jsonl` cannot be un-appended after the fact. A per-call scrub is
+  sufficient because a URL is only alive for the process that minted it, and the TOS AK/SK never
+  reach this adapter at all.
 - `raw_response_path` and `normalized_result_path` point at `response.json` and
   `normalized.jsonl`. The raw response is written before parsing so a parser fix never
   requires re-billing the same audio.
@@ -619,32 +632,48 @@ durable: that is a lost batch window, never lost audio.
 This adds no SQLite table and no migration: the batch's own mapping lives in the artifact beside
 it, and the job row already has the columns to point at it.
 
-### 6.2 TOS large-file transport state (target after issue #29)
+### 6.2 TOS large-file transport state
 
 Issue #29 requires a new numbered migration rather than rewriting the existing `0003_asr_jobs`
 migration. The durable job row must gain enough non-secret state to recover a TOS-backed
-submission across process restarts. Required semantics are:
+submission across process restarts. The implemented columns are:
 
 ```text
-audio_transport      inline | tos
+audio_transport      inline | tos, NOT NULL DEFAULT 'inline', CHECK constrained
 tos_bucket           nullable; set for tos
 tos_object_key       nullable; set for tos
-tos_cleanup_state    not_required | pending | deleted
+tos_cleanup_pending  0 | 1, NOT NULL DEFAULT 0; the durable cleanup debt
 ```
 
-Exact column names may differ, but these invariants do not:
+`tos_cleanup_pending` is the implemented form of the `not_required | pending | deleted` cleanup
+state sketched before the migration was written. It collapses `not_required` and `deleted` into
+"no debt outstanding", which is the only distinction the cleanup pass acts on: the stable bucket
+and object key are kept after a successful delete, so the "deleted" case is still auditable from
+the row and from the `asr.audio.released` event without a third stored value.
+
+The invariants this shape has to satisfy:
 
 - the presigned URL is never the durable identifier and is never stored in SQLite;
 - bucket + object key are persisted before provider submission so a restart can generate a new
   SDK presigned GET URL instead of uploading a duplicate object unnecessarily;
 - TOS credentials never enter the database;
-- cleanup is durable/idempotent: a successful transcript may coexist with `cleanup_state =
-  pending` until `DeleteObject` succeeds;
+- cleanup is durable/idempotent: a successful transcript may coexist with outstanding cleanup
+  debt until `DeleteObject` succeeds;
 - cleanup debt is not a transcription failure and must not erase provider results;
 - inline jobs do not manufacture fake TOS state.
 
 The local `input_artifact` remains authoritative for the recording/batch itself. The TOS object
 is only a temporary transport copy and can be deleted without changing transcript provenance.
+
+Who writes these columns: `VolcengineAsrProvider` publishes the audio, chooses `audio.data` or
+`audio.url` from the returned transport, and reports the stable identity on
+`AsrSubmission.Audio`. `AsrJobProcessor` records it with
+`AsrJobTransitions.RecordAudioTransport` before the job is marked `submitted`, so the identity is
+durable before the provider is treated as having accepted the task. On a terminal state it calls
+`IAsrProvider.ReleaseAudioAsync` and clears the debt with `AsrJobTransitions.MarkAudioReleased`
+only when the delete is confirmed. `IAsrJobStore.ListCleanupPending` is how a later process finds
+debt that is still outstanding; it is deliberately separate from `ListResumable`, so a succeeded
+job that still owes a delete is not reported as outstanding work.
 
 ## 7. Transcript segment
 
@@ -819,9 +848,32 @@ already-applied, and an unnumbered script is never considered at all.
   timeline manifest under `asr/batches/` (section 6.1), and the job that consumes it uses the M3
   `asr_jobs` columns unchanged: `input_artifact` names the batch and `start_ms` carries its
   position on the session timeline. No table, column or constraint changed.
-- Issue #29 adds TOS transport state to `asr_jobs` through a new numbered migration. Do not edit
+- Issue #29 adds TOS transport state to `asr_jobs` through **0006_tos_asr_transport**. Do not edit
   `0003_asr_jobs` in place: already-created data roots must migrate forward while preserving the
-  existing provider request ID, retry state, and local input artifact.
+  existing provider request ID, retry state, and local input artifact. Like 0005, 0006 rebuilds
+  `asr_jobs` (SQLite has no `ADD COLUMN IF NOT EXISTS`) with every statement guarded, so a replay
+  is a no-op for the schema and a value-preserving copy for the rows.
+- **A rebuild must declare every column the table can already have.** This is the rule the
+  original 0006 exposed and CI caught. `DROP TABLE` removes columns it has never heard of, and a
+  replay of 0005 — which the migrator's re-runnability contract allows at any later time — used to
+  recreate `asr_jobs` from the 0003-plus-`provider_log_id` shape alone. Every column a *later*
+  migration had added was therefore destroyed, and the next `SqliteAsrJobStore.Get` failed with
+  `no such column: audio_transport`. Both 0005 and 0006 now declare the full post-#26 schema and
+  copy the columns they do not own through the schema-conditional placeholder, so whichever one
+  replays, the result is the same table. Any future migration that adds a column to `asr_jobs`
+  must add it to both rebuilds as well. The regression tests are
+  `SqliteMigratorTests.Migrate_ReRunOfBothAsrJobMigrations_PreservesEveryColumnAndValue` and
+  `SqliteMigratorTests.Migrate_UpgradeFromAPreIssue29Database_AddsTheTransportColumnsWithInlineDefaults`,
+  and the rule itself is enforced — rather than merely documented — by
+  `SqliteMigratorTests.Migrate_EveryAsrJobsRebuild_ReproducesTheSameColumnSetInTheSameOrder`, which
+  records `asr_jobs`'s ordered column list from a fresh database and then replays 0005 and 0006 in
+  turn, asserting the same list in the same order each time. A column added to only one rebuild
+  makes that test red at the position where the lists diverge.
+- A migration may not simply skip itself when its column is already present either, and this is
+  why the rebuild is unconditional rather than guarded by "does `provider_log_id` exist yet". On a
+  fresh database 0006 commits first, so 0005's rebuild still has to run to add `provider_log_id`
+  in a schema where 0006's columns already exist; a presence guard would either skip the column
+  0005 exists to add or drop the ones 0006 added.
 - Later milestones add new schema only with their implemented features. No table or column is
   created ahead of its feature (section 11).
 

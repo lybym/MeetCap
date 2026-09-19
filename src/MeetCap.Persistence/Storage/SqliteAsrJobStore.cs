@@ -15,7 +15,7 @@ public sealed class SqliteAsrJobStore : IAsrJobStore, IAsrQueueInspector
         "provider_request_id, attempt_count, next_retry_at, request_metadata_path, raw_response_path, " +
         "normalized_result_path, error_code, error_message, duration_ms, speaker_info_requested, " +
         "speaker_info_returned, estimated_cost_cny, submitted_at, completed_at, created_at, updated_at, " +
-        "provider_log_id";
+        "provider_log_id, audio_transport, tos_bucket, tos_object_key, tos_cleanup_pending";
 
     private static readonly string[] s_resumableStatuses = new[]
     {
@@ -47,13 +47,13 @@ public sealed class SqliteAsrJobStore : IAsrJobStore, IAsrQueueInspector
                 provider_request_id, attempt_count, next_retry_at, request_metadata_path, raw_response_path,
                 normalized_result_path, error_code, error_message, duration_ms, speaker_info_requested,
                 speaker_info_returned, estimated_cost_cny, submitted_at, completed_at, created_at, updated_at,
-                provider_log_id)
+                provider_log_id, audio_transport, tos_bucket, tos_object_key, tos_cleanup_pending)
             VALUES (
                 @id, @sessionId, @source, @tier, @provider, @startMs, @endMs, @inputArtifact, @status,
                 @providerRequestId, @attemptCount, @nextRetryAt, @requestMetadataPath, @rawResponsePath,
                 @normalizedResultPath, @errorCode, @errorMessage, @durationMs, @speakerInfoRequested,
                 @speakerInfoReturned, @estimatedCostCny, @submittedAt, @completedAt, @createdAt, @updatedAt,
-                @providerLogId)
+                @providerLogId, @audioTransport, @tosBucket, @tosObjectKey, @tosCleanupPending)
             """,
             conn);
 
@@ -136,6 +136,47 @@ public sealed class SqliteAsrJobStore : IAsrJobStore, IAsrQueueInspector
         return ReadAll(cmd);
     }
 
+    public IReadOnlyList<AsrJob> ListCleanupPending(int limit, string? sessionId = null)
+    {
+        if (limit <= 0)
+        {
+            return Array.Empty<AsrJob>();
+        }
+
+        using var conn = SqliteConnectionFactory.Open(_dbPath);
+        if (!SqliteConnectionFactory.TableExists(conn, "asr_jobs"))
+        {
+            return Array.Empty<AsrJob>();
+        }
+
+        // Only terminal jobs hold cleanup debt: a job that is still running may still need its
+        // object for another poll, so releasing it early would break the very request it exists
+        // for. `tos_cleanup_pending` is what the job row carries until the delete is confirmed.
+        var sql =
+            $"SELECT {SelectColumns} FROM asr_jobs " +
+            "WHERE tos_cleanup_pending = 1 " +
+            "AND status IN (@succeeded, @failed, @cancelled) ";
+
+        if (sessionId is not null)
+        {
+            sql += "AND session_id = @sessionId ";
+        }
+
+        sql += "ORDER BY created_at, id LIMIT @limit";
+
+        using var cmd = new SqliteCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@succeeded", AsrJobStatuses.ToWire(AsrJobStatus.Succeeded));
+        cmd.Parameters.AddWithValue("@failed", AsrJobStatuses.ToWire(AsrJobStatus.Failed));
+        cmd.Parameters.AddWithValue("@cancelled", AsrJobStatuses.ToWire(AsrJobStatus.Cancelled));
+        cmd.Parameters.AddWithValue("@limit", limit);
+        if (sessionId is not null)
+        {
+            cmd.Parameters.AddWithValue("@sessionId", sessionId);
+        }
+
+        return ReadAll(cmd);
+    }
+
     public void Update(AsrJob job)
     {
         ArgumentNullException.ThrowIfNull(job);
@@ -167,6 +208,10 @@ public sealed class SqliteAsrJobStore : IAsrJobStore, IAsrQueueInspector
                 submitted_at = @submittedAt,
                 completed_at = @completedAt,
                 provider_log_id = @providerLogId,
+                audio_transport = @audioTransport,
+                tos_bucket = @tosBucket,
+                tos_object_key = @tosObjectKey,
+                tos_cleanup_pending = @tosCleanupPending,
                 updated_at = @updatedAt
             WHERE id = @id
             """,
@@ -298,6 +343,10 @@ public sealed class SqliteAsrJobStore : IAsrJobStore, IAsrQueueInspector
         cmd.Parameters.AddWithValue("@submittedAt", Timestamp(job.SubmittedAt));
         cmd.Parameters.AddWithValue("@completedAt", Timestamp(job.CompletedAt));
         cmd.Parameters.AddWithValue("@providerLogId", Text(job.ProviderLogId));
+        cmd.Parameters.AddWithValue("@audioTransport", job.AudioTransport);
+        cmd.Parameters.AddWithValue("@tosBucket", Text(job.TosBucket));
+        cmd.Parameters.AddWithValue("@tosObjectKey", Text(job.TosObjectKey));
+        cmd.Parameters.AddWithValue("@tosCleanupPending", job.TosCleanupPending ? 1 : 0);
         cmd.Parameters.AddWithValue("@createdAt", job.CreatedAt.UtcDateTime.ToString("o", CultureInfo.InvariantCulture));
         cmd.Parameters.AddWithValue("@updatedAt", job.UpdatedAt.UtcDateTime.ToString("o", CultureInfo.InvariantCulture));
     }
@@ -337,6 +386,10 @@ public sealed class SqliteAsrJobStore : IAsrJobStore, IAsrQueueInspector
             StartMs = reader.GetInt64(reader.GetOrdinal("start_ms")),
             EndMs = reader.GetInt64(reader.GetOrdinal("end_ms")),
             InputArtifact = reader.GetString(reader.GetOrdinal("input_artifact")),
+            AudioTransport = reader.GetString(reader.GetOrdinal("audio_transport")),
+            TosBucket = ReadText(reader, "tos_bucket"),
+            TosObjectKey = ReadText(reader, "tos_object_key"),
+            TosCleanupPending = reader.GetInt32(reader.GetOrdinal("tos_cleanup_pending")) != 0,
             Status = status,
             ProviderRequestId = requestId,
             AttemptCount = reader.GetInt32(reader.GetOrdinal("attempt_count")),

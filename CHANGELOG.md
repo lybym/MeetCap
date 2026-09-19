@@ -51,6 +51,27 @@ milestones are described as the former, never the latter
   The migration rebuilds `asr_jobs` and copies every existing row across unchanged — including
   on a re-run, where it now keeps any `provider_log_id` written since the first run instead of
   resetting it.
+- **TOS large-file ASR transport** ([#29](https://github.com/lybym/MeetCap/issues/29)).
+  Normalized WAV inputs above 20 MiB are streamed to a private Volcengine TOS object with the
+  official TOS .NET SDK and submitted to Seed-ASR as an SDK-generated six-hour presigned
+  `audio.url`; inputs at or below 20 MiB keep using inline `audio.data`. A new
+  `IAsrAudioPublisher` boundary keeps the storage transport out of `VolcengineAsrProvider`, and
+  `VolcengineTosAudioPublisher` owns the only three TOS operations — streamed `PutObject`,
+  `PreSignedURL`, idempotent `DeleteObject`. Object keys are
+  `meetcap-asr/<stable 16-hex shard>/<yyyy>/<MM>/<dd>/<job>.wav`, and no ACL is set, so the
+  object stays private. Optional `[asr.tos]` configuration (bucket, region, endpoint,
+  `env:`-resolvable access_key/secret_key) enables the path; an empty section is valid, and a
+  partly filled one is rejected before any session exists. Terminal jobs attempt an idempotent
+  delete, and a delete failure stays recorded retryable cleanup debt rather than failing the
+  transcript.
+- **`asr_jobs` transport identity** (migration `0006_tos_asr_transport`): `audio_transport`
+  (`inline`/`tos`), `tos_bucket`, `tos_object_key` and `tos_cleanup_pending`. The identity is
+  committed before the submission counts as accepted and the presigned URL is never stored, so
+  a restart can re-sign the URL from stable state and can finish the cleanup it still owes.
+- **`asr.audio.released` / `asr.audio.release_failed`** session events make remote-object cleanup
+  observable in `events.jsonl`, and a cleanup failure never changes a job's outcome.
+- **TOS credentials are registered with `SecretRedactor`** alongside the Volcengine API key, so
+  `meetcap config show`, the console log and `session.import.json` all redact them.
 
 ### Fixed
 
@@ -63,6 +84,17 @@ milestones are described as the former, never the latter
   so a re-run preserves the stored log ids. `SqliteMigrator` applies each migration in an
   immediate transaction so that placeholder is resolved against the schema the script actually
   sees.
+- **A replay of migration `0005` no longer destroys the columns migration `0006` added.**
+  `DROP TABLE` removes columns it has never heard of, and 0005's rebuild recreated `asr_jobs` from
+  the 0003-plus-`provider_log_id` shape only. Because the migrator's re-runnability contract
+  allows a migration to be replayed at any later time, that rebuild dropped `audio_transport`,
+  `tos_bucket`, `tos_object_key` and `tos_cleanup_pending`, and the next
+  `SqliteAsrJobStore.Get` failed with `no such column: audio_transport` — which is how CI caught
+  it. Both 0005 and 0006 now declare the full post-#26 schema and copy the columns they do not own
+  through the same schema-conditional placeholder, so whichever one replays the result is the same
+  table with the same values. Migration `0006` is also re-runnable now: it previously used bare
+  `ALTER TABLE ... ADD COLUMN`, which fails with `duplicate column name` on a replay and would
+  have aborted whichever process lost the race.
 - **The session configuration snapshot no longer stores the API key, in any serialized form.**
   `sessions.config_snapshot` is persisted, and it was serialized from the effective configuration
   verbatim, so a literal `asr.volcengine.api_key` was written to SQLite even though the API key is
@@ -77,9 +109,19 @@ milestones are described as the former, never the latter
   `standard`; it is no longer read as a routing input.
 - The batch manifest (`asr/batches/<source>/batch-NNNNNN.json`) no longer records `tier`. A
   manifest written before this change is still readable: the extra field is ignored.
+- Cleanup debt is deliberately not outstanding work: `CountOutstanding` and the resumable-job
+  query ignore `tos_cleanup_pending`, so a finished session whose temporary object still has to be
+  deleted is not reported as unfinished.
+- **Known residual risk:** an object staged by a process that dies between the upload and the job
+  row recording its identity is referenced by no job, so MeetCap cannot find it to delete it. The
+  three-day lifecycle expiration on the `meetcap-asr/` prefix is the documented mitigation and
+  remains a deployment requirement (`docs/CONFIGURATION.md` section 8.1,
+  `docs/RELIABILITY.md` section 9.1).
 - The manual real-credential smoke test against Seed-ASR 2.0 Standard HTTP is **not run** in this
   environment (`docs/M1_WINDOWS_VALIDATION.md` section 12.8), so end-to-end provider verification
   is still not claimed.
+- The manual real-TOS plus real-Seed-ASR smoke test for the >20 MiB path is likewise **not run**
+  (`docs/M1_WINDOWS_VALIDATION.md` section 15); CI covers that path with mocks and fakes only.
 
 ## [0.1.0] - 2026-09-18
 
