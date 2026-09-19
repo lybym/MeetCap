@@ -121,11 +121,44 @@ public sealed class CaptureService
     /// deadline read from a frozen clock would never expire and the recovery loop could not
     /// terminate. A count is bounded whatever the clock does.
     /// </para>
+    /// <para>
+    /// The multiplication is done in <see cref="long"/> and only then narrowed. Seconds times
+    /// milliseconds overflows <see cref="int"/> above 2,147,483 seconds, and the wrapped value
+    /// is negative — which both downstream consumers clamp to zero, turning an operator's very
+    /// long window into <em>no</em> recovery at all. That is the exact silent inversion of the
+    /// configured policy this derivation exists to remove, so the arithmetic cannot be done in
+    /// <see cref="int"/> (docs/CONFIGURATION.md section 6). Every window validation accepts as a
+    /// non-negative value is therefore honoured: the result is never negative and never
+    /// decreases as the window grows.
+    /// </para>
+    /// <para>
+    /// A window so long that the attempt count exceeds <see cref="int.MaxValue"/> is saturated
+    /// there rather than wrapped or thrown. The count is a loop bound, not an operator-visible
+    /// number, and saturating keeps the promise the window makes — more window never buys fewer
+    /// retries — while the count stays the finite bound the loop needs.
+    /// </para>
     /// </remarks>
     internal static int RecoveryAttemptsFor(int deviceRecoverySeconds)
-        => Math.Max(0, deviceRecoverySeconds) * 1000 / CaptureTrack.DeviceRecoveryBackoffMs;
+        => RecoveryAttemptsFor((long)deviceRecoverySeconds);
+
+    /// <inheritdoc cref="RecoveryAttemptsFor(int)"/>
+    internal static int RecoveryAttemptsFor(long deviceRecoverySeconds)
+    {
+        var attempts = Math.Max(0L, deviceRecoverySeconds) * 1_000L / CaptureTrack.DeviceRecoveryBackoffMs;
+        return (int)Math.Min(int.MaxValue, attempts);
+    }
 
     public CaptureSettings Settings => _settings;
+
+    /// <summary>
+    /// The device-recovery attempt budget this service actually hands to its tracks.
+    /// </summary>
+    /// <remarks>
+    /// Exposed for tests so the derivation can be checked through the production constructor
+    /// rather than only as a standalone calculation
+    /// (<see cref="RecoveryAttemptsFor(int)"/>, docs/CONFIGURATION.md section 6).
+    /// </remarks>
+    internal int MaxDeviceRecoveryAttempts => _maxDeviceRecoveryAttempts;
 
     /// <summary>Active capture endpoints, default first.</summary>
     public IReadOnlyList<CaptureDeviceInfo> ListDevices() => OrderDevices(_platform.Devices.EnumerateCaptureDevices());

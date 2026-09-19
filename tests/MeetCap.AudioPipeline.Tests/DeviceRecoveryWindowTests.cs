@@ -1,4 +1,3 @@
-using System.Runtime.CompilerServices;
 using System.Text.Json;
 using MeetCap.AudioPipeline.Tests.TestSupport;
 using MeetCap.Core.Capture;
@@ -113,15 +112,16 @@ public class DeviceRecoveryWindowTests
         // The window is the policy an operator configures; the attempt count is only how it is
         // spent. They are derived from one value so they cannot drift apart, and a longer
         // window must buy proportionally more attempts (docs/CONFIGURATION.md section 6).
-        var backoffSeconds = CaptureTrack.DeviceRecoveryBackoffMs / 1000;
+        AssertAttempts(0, 0);
+        AssertAttempts(3, 3);
+        AssertAttempts(20, 20);
+        AssertAttempts(60, 60);
 
-        Assert.Equal(0, CaptureService.RecoveryAttemptsFor(0));
-        Assert.Equal(3, CaptureService.RecoveryAttemptsFor(3));
-        Assert.Equal(20, CaptureService.RecoveryAttemptsFor(20));
-        Assert.Equal(60, CaptureService.RecoveryAttemptsFor(60));
+        // Doubling the window doubles the budget, which is the "spends the window" property
+        // stated as arithmetic rather than as a restatement of the derivation.
         Assert.Equal(
-            CaptureService.RecoveryAttemptsFor(10) * backoffSeconds,
-            CaptureService.RecoveryAttemptsFor(10 * backoffSeconds));
+            2 * CaptureService.RecoveryAttemptsFor(10),
+            CaptureService.RecoveryAttemptsFor(20));
     }
 
     [Fact]
@@ -131,8 +131,80 @@ public class DeviceRecoveryWindowTests
         // derivation with one means a caller bypassed configuration. Failing closed (no
         // retries) is the only safe reading: a negative window must never buy more attempts
         // than a zero window.
-        Assert.Equal(0, CaptureService.RecoveryAttemptsFor(-1));
-        Assert.Equal(0, CaptureService.RecoveryAttemptsFor(int.MinValue));
+        AssertAttempts(-1, 0);
+        AssertAttempts(int.MinValue, 0);
+    }
+
+    [Fact]
+    public void RecoveryAttemptsFor_AWindowPastTheIntMillisecondBoundaryBuysMoreAttemptsNotFewer()
+    {
+        // Seconds times milliseconds overflows int above 2,147,483 seconds. The wrapped value is
+        // negative, and both consumers clamp a negative budget to zero, so an operator who
+        // configured a very long window silently got no recovery at all — the opposite of the
+        // policy they configured, and the exact class of silent inversion issue #34 is about.
+        // Every value here is one ConfigurationValidator accepts, so every one must buy at least
+        // as many attempts as the window below it (docs/CONFIGURATION.md section 6).
+        var boundary = int.MaxValue / 1000;          // 2,147,483 s — the last second that fits
+        var justPastBoundary = boundary + 1;         // 2,147,484 s — overflows an int multiply
+        var days = 365 * 24 * 60 * 60;               // 31,536,000 s — one year, still an int
+        var beforeOverflow = CaptureService.RecoveryAttemptsFor(boundary);
+        var pastOverflow = CaptureService.RecoveryAttemptsFor(justPastBoundary);
+
+        Assert.True(
+            pastOverflow > beforeOverflow,
+            $"a window of {justPastBoundary} s bought {pastOverflow} attempts, no more than the {beforeOverflow} " +
+            $"that {boundary} s bought");
+        Assert.True(pastOverflow > 0, "a window past the int/millisecond boundary must still buy recovery attempts");
+
+        // One year of window is one million one-second attempts, which is nowhere near the
+        // saturation point, so the derivation is exact well past the overflow boundary.
+        AssertAttempts(days, days);
+        AssertAttempts(boundary, boundary);
+        AssertAttempts(justPastBoundary, justPastBoundary);
+
+        // The very longest window an int can express overflows int.MaxValue attempts and
+        // saturates rather than wrapping negative or throwing. Saturation still honours the
+        // window: the budget is as large as the loop bound can be, never smaller than a shorter
+        // window's (docs/CONFIGURATION.md section 6).
+        var longestWindow = CaptureService.RecoveryAttemptsFor(int.MaxValue);
+        Assert.Equal(int.MaxValue, longestWindow);
+        Assert.True(
+            longestWindow >= CaptureService.RecoveryAttemptsFor(boundary),
+            "a longer window must never buy fewer attempts than a shorter one");
+    }
+
+    [Fact]
+    public void CaptureService_AVeryLongConfiguredWindowStillGetsARecoveryBudget()
+    {
+        // Pins the whole path the finding described: validation accepts the window, the settings
+        // carry it, and the production constructor derives a budget that is handed to the tracks.
+        // A negative or zero budget here is the silent policy inversion, so this must be derived
+        // and positive (docs/CONFIGURATION.md section 6, docs/RELIABILITY.md section 8.1).
+        var veryLongWindow = int.MaxValue / 1000 + 1;
+        using var harness = new SessionHarness(chunkSeconds: 60, deviceRecoverySeconds: veryLongWindow);
+
+        var settings = new CaptureSettings(
+            harness.DataRoot,
+            chunkSeconds: 60,
+            bufferSeconds: 60,
+            flushIntervalMs: 1_000,
+            minimumFreeSpaceGb: 5,
+            microphoneDeviceId: "mic-default",
+            configVersion: 1,
+            deviceRecoverySeconds: veryLongWindow);
+
+        var service = new CaptureService(
+            harness.Platform,
+            harness.Database,
+            settings,
+            maxDeviceRecoveryAttempts: null);
+
+        Assert.Equal(
+            CaptureService.RecoveryAttemptsFor(veryLongWindow),
+            service.MaxDeviceRecoveryAttempts);
+        Assert.True(
+            service.MaxDeviceRecoveryAttempts > 0,
+            $"a configured window of {veryLongWindow} s must still buy recovery attempts");
     }
 
     [Fact]
@@ -372,33 +444,275 @@ public class DeviceRecoveryWindowTests
         Assert.Equal(2, WavNames(paths, AudioSource.Loopback).Length);
     }
 
-    /// <summary>
-    /// Dates the outage and releases the gated recovery attempt(s). Runs as a separate task
-    /// because <see cref="FakeCaptureSource.Fail"/> does not return until the capture loop
-    /// parks on the gate.
-    /// </summary>
-    /// <remarks>
-    /// The release happens only after a track has actually entered the gate
-    /// (<paramref name="gateEntries"/>), so the clock is always advanced inside the window
-    /// between the outage being stamped and being measured. Sleeping instead would be a race.
-    /// </remarks>
-    private static async Task AdvanceClockAndRelease(
-        SessionHarness harness,
-        StrongBox<int> gateEntries,
-        SemaphoreSlim gate,
-        int outageSeconds)
+    [Fact]
+    public async Task RunAsync_OneTrackRecoversWhileTheOtherDoesNot_EachReportsItsOwnOutcome()
     {
-        Assert.True(
-            await Wait.UntilAsync(() => Volatile.Read(ref gateEntries.Value) > 0, timeoutMs: 15_000),
-            "no recovery attempt reached the gate");
+        // The one-sided case a real headset produces when only one of its two endpoints finishes
+        // re-enumerating: the microphone comes back inside the window while the render endpoint
+        // stays gone. The recovered track must resume and quantify its outage, the stranded track
+        // must end fatally and quantify its own — and neither outcome may be folded into the
+        // other (issue #34 Acceptance Criteria 3 and 4, docs/RELIABILITY.md section 8).
+        var gate = new Gate();
+        using var harness = new SessionHarness(
+            chunkSeconds: 60,
+            deviceRecoverySeconds: 3,
+            mode: SessionModes.Online,
+            beforeReopenAttempt: gate.WaitAsync);
 
-        // The gates are opened after the clock is advanced, so a track that took the gate after
-        // the read still blocks: it cannot measure the outage before the clock moved.
-        var waiters = Volatile.Read(ref gateEntries.Value);
-        harness.Clock.Advance(TimeSpan.FromSeconds(outageSeconds));
-        gate.Release(waiters);
-        await Task.CompletedTask.ConfigureAwait(false);
+        // Both tracks lose their endpoint at the same instant and both measure this much downtime:
+        // the clock is advanced under the gate, and the loopback's whole attempt budget is spent
+        // before it advances again.
+        const int MeasuredOutageSeconds = 2;
+
+        var micFirst = new FakeCaptureSource(Format, harness.Device, AudioSource.Mic);
+        var micSecond = new FakeCaptureSource(Format, harness.Device, AudioSource.Mic);
+        var loopbackFirst = new FakeCaptureSource(Format, harness.RenderDevice, AudioSource.Loopback);
+        harness.Sources.Enqueue(micFirst);
+        harness.Sources.Enqueue(micSecond);
+        harness.Sources.EnqueueLoopback(loopbackFirst);
+
+        var session = harness.PrepareSessionDirect("One-Sided Bluetooth Loss", online: true);
+        var paths = pathsFor(harness, session);
+
+        using var cancellation = new CancellationTokenSource();
+        var run = session.RunAsync(cancellation.Token);
+        Assert.True(
+            await Wait.UntilAsync(() => micFirst.StartCount == 1 && loopbackFirst.StartCount == 1),
+            "both tracks did not start");
+
+        const int RecordedMs = 5_000;
+        TestAudio.EmitSeconds(micFirst, Format, 0, milliseconds: RecordedMs, AudioSource.Mic);
+        TestAudio.EmitSeconds(loopbackFirst, Format, 0, milliseconds: RecordedMs, AudioSource.Loopback);
+
+        micFirst.Fail(new DeviceUnavailableException("bluetooth endpoint disconnected"));
+        loopbackFirst.Fail(new DeviceUnavailableException("bluetooth endpoint disconnected"));
+
+        // The microphone endpoint is still being enumerated, so its track reopens it; the render
+        // endpoint is not, so the loopback track spends its whole window and gives up.
+        harness.Devices.SetRenderDevices();
+
+        await Wait.ForAsync(
+            AdvanceClockAndRelease(harness, gate, MeasuredOutageSeconds, expectedEntries: 2),
+            timeoutMs: 15_000,
+            "both tracks to enter the recovery gate and the outage to be dated");
+
+        // The loopback track runs out its window (three one-second backoffs against the fake
+        // clock's fixed instant plus the real backoffs), so its fatal end is awaited, not assumed.
+        Assert.True(
+            await Wait.UntilAsync(
+                () => HasEvent(paths, SessionEventNames.CaptureDeviceLostFatal),
+                timeoutMs: 15_000),
+            "the loopback track did not report a fatal device loss");
+
+        Assert.True(
+            await Wait.UntilAsync(() => micSecond.StartCount == 1, timeoutMs: 15_000),
+            "the microphone track did not reopen its endpoint");
+
+        // Nothing more is emitted from the reopened microphone, so the loopback's terminal gap is
+        // never placed by a buffer and the microphone's measured outage stays pending until the
+        // session stops — both of which exercise the accounting paths being asserted below.
+        cancellation.Cancel();
+        var outcome = await Finish(run);
+
+        var events = ReadEvents(paths);
+
+        // Exactly one track recovered and exactly one was declared fatally lost.
+        Assert.Equal(1, CountEvents(events, SessionEventNames.CaptureDeviceRestored));
+        Assert.Equal(1, CountEvents(events, SessionEventNames.CaptureDeviceLostFatal));
+        Assert.Equal(
+            "mic",
+            Assert.Single(events, e => Name(e) == SessionEventNames.CaptureDeviceRestored)
+                .GetProperty("source").GetString());
+
+        var fatal = Assert.Single(events, e => Name(e) == SessionEventNames.CaptureDeviceLostFatal);
+        Assert.Equal("loopback", fatal.GetProperty("source").GetString());
+
+        // Each track reports its own outage, and neither is attributed to the other.
+        var gaps = events
+            .Where(e => Name(e) == SessionEventNames.CaptureGap)
+            .Select(e => (Source: e.GetProperty("source").GetString(), Ms: e.GetProperty("gap_ms").GetInt64()))
+            .ToArray();
+        Assert.Equal(2, gaps.Length);
+        Assert.Contains(gaps, g => g.Source == "mic" && g.Ms == MeasuredOutageSeconds * 1000L);
+        Assert.Contains(gaps, g => g.Source == "loopback" && g.Ms == MeasuredOutageSeconds * 1000L);
+
+        // The manifest agrees per track: the microphone resumed and ended for no fault of its own;
+        // the loopback is degraded with a named end reason and one durable chunk from before the loss.
+        var manifest = ReadManifest(paths);
+        var micHealth = manifest.TrackHealth.Single(h => h.Source == AudioSources.Mic);
+        var loopbackHealth = manifest.TrackHealth.Single(h => h.Source == AudioSources.Loopback);
+        Assert.Null(micHealth.EndReason);
+        Assert.Equal("device_lost", loopbackHealth.EndReason);
+        Assert.True(loopbackHealth.Degraded);
+        Assert.Equal(1, loopbackHealth.ChunksClosed);
+
+        // The audio each track captured before the loss is durable, and the loopback (which never
+        // resumed) did not invent a chunk from a device it refused.
+        Assert.Single(WavNames(paths, AudioSource.Mic));
+        Assert.Single(WavNames(paths, AudioSource.Loopback));
+        Assert.Equal(2, harness.Database.Chunks.ListForSession(session.SessionId).Count);
+
+        // The session as a whole is degraded, because one of its tracks really is missing audio.
+        Assert.True(outcome.Degraded);
     }
+
+    [Fact]
+    public async Task RunAsync_SessionStopsAfterARecoveryButBeforeItsFirstBuffer_StillCountsTheOutage()
+    {
+        // The endpoint comes back, the track reopens it, and the operator stops the session before
+        // the reopened endpoint delivers a single buffer. The deferral that normally places the
+        // measured outage — the next buffer does it — then never happens, so the outage used to be
+        // dropped and the session reported a hole it had measured as no gap at all. The measured
+        // outage is real missing audio on a span this track did capture, so it must still be
+        // counted (issue #34 Acceptance Criterion 4, docs/RELIABILITY.md section 8.2).
+        var gate = new Gate();
+        using var harness = new SessionHarness(
+            chunkSeconds: 60,
+            deviceRecoverySeconds: BluetoothOutageSeconds + 1,
+            beforeReopenAttempt: gate.WaitAsync);
+
+        var first = new FakeCaptureSource(Format, harness.Device);
+        var second = new FakeCaptureSource(Format, harness.Device);
+        harness.Sources.Enqueue(first);
+        harness.Sources.Enqueue(second);
+
+        var session = harness.PrepareSessionDirect("Bluetooth Reconnect Then Stop");
+        var paths = pathsFor(harness, session);
+
+        using var cancellation = new CancellationTokenSource();
+        var run = session.RunAsync(cancellation.Token);
+        Assert.True(await Wait.UntilAsync(() => first.StartCount == 1), "capture did not start");
+
+        const int RecordedMs = 5_000;
+        TestAudio.EmitSeconds(first, Format, 0, milliseconds: RecordedMs);
+        first.Fail(new DeviceUnavailableException("bluetooth endpoint disconnected"));
+
+        // The outage is dated and the attempt released only once the track is inside the gate, so
+        // the clock advance always lands between the outage being stamped and being measured.
+        await Wait.ForAsync(
+            AdvanceClockAndRelease(harness, gate, BluetoothOutageSeconds, expectedEntries: 1),
+            timeoutMs: 15_000,
+            "the outage to be dated and the recovery gate released");
+
+        Assert.True(
+            await Wait.UntilAsync(() => second.StartCount == 1, timeoutMs: 15_000),
+            "capture was not reopened after the endpoint returned");
+
+        // Stop immediately: the reopened endpoint never delivers a buffer, so the outage has no
+        // next buffer to place it.
+        cancellation.Cancel();
+        var outcome = await Finish(run);
+
+        var events = ReadEvents(paths);
+
+        // The recovery really happened, and the track did not end fatally.
+        Assert.Equal(1, CountEvents(events, SessionEventNames.CaptureDeviceRestored));
+        Assert.Equal(0, CountEvents(events, SessionEventNames.CaptureDeviceLostFatal));
+        Assert.NotEqual("device_lost", outcome.EndReason);
+
+        // The measured outage is still reported as a named gap on the session's own record, with
+        // the same interval and reason the unrecoverable case uses.
+        var gap = Assert.Single(events, e => Name(e) == SessionEventNames.CaptureGap);
+        Assert.Equal("mic", gap.GetProperty("source").GetString());
+        Assert.Equal(RecordedMs, gap.GetProperty("gap_start_ms").GetInt64());
+        Assert.Equal(RecordedMs + (BluetoothOutageSeconds * 1000L), gap.GetProperty("gap_end_ms").GetInt64());
+        Assert.Equal(BluetoothOutageSeconds * 1000L, gap.GetProperty("gap_ms").GetInt64());
+        Assert.Equal(AudioGapReasons.NotCaptured, gap.GetProperty("reason").GetString());
+
+        var manifest = ReadManifest(paths);
+        Assert.Equal(1, manifest.GapCount);
+        Assert.Equal(BluetoothOutageSeconds * 1000L, manifest.GapTotalMs);
+
+        // The outage extends the recorded timeline, so the session lasts the audio time it really
+        // accounts for rather than stopping at the last captured buffer.
+        Assert.Equal(RecordedMs + (BluetoothOutageSeconds * 1000L), outcome.DurationMs);
+
+        // The track is degraded, because audio is missing from a span it did capture.
+        Assert.True(outcome.Degraded);
+        Assert.True(manifest.TrackHealth.Single(h => h.Source == AudioSources.Mic).Degraded);
+
+        // Exactly one gap was counted: the outage is not also reported as a turn-of-stream gap when
+        // the track finalizes.
+        Assert.Equal(1, outcome.GapCount);
+    }
+
+    [Fact]
+    public async Task RunAsync_EndpointReturnsWithADifferentFormat_EndsTheTrackAndKeepsTheOutageHonest()
+    {
+        // A headset can come back on a different profile — hands-free instead of stereo — so the
+        // endpoint resolves to the same configured id with a format the session cannot splice into
+        // the audio it already captured. The track must refuse the fabrication and end, and the
+        // outage it measured while waiting is still real missing audio that must be quantified
+        // (issue #34 Acceptance Criterion 4, docs/RELIABILITY.md section 8).
+        var gate = new Gate();
+        using var harness = new SessionHarness(
+            chunkSeconds: 60,
+            deviceRecoverySeconds: BluetoothOutageSeconds + 1,
+            beforeReopenAttempt: gate.WaitAsync);
+
+        var first = new FakeCaptureSource(Format, harness.Device);
+        var reopened = new FakeCaptureSource(
+            new AudioFormat(44_100, 2, 32, AudioSampleFormat.IeeeFloat),
+            harness.Device);
+        harness.Sources.Enqueue(first);
+        harness.Sources.Enqueue(reopened);
+
+        var session = harness.PrepareSessionDirect("Bluetooth Format Change");
+        var paths = pathsFor(harness, session);
+
+        using var cancellation = new CancellationTokenSource();
+        var run = session.RunAsync(cancellation.Token);
+        Assert.True(await Wait.UntilAsync(() => first.StartCount == 1), "capture did not start");
+
+        const int RecordedMs = 10_000;
+        TestAudio.EmitSeconds(first, Format, 0, milliseconds: RecordedMs);
+        first.Fail(new DeviceUnavailableException("bluetooth endpoint disconnected"));
+
+        await Wait.ForAsync(
+            AdvanceClockAndRelease(harness, gate, BluetoothOutageSeconds, expectedEntries: 1),
+            timeoutMs: 15_000,
+            "the outage to be dated and the recovery gate released");
+
+        // The endpoint reopened with a format the session cannot use, so the track ends by itself
+        // and the session ends with it.
+        var outcome = await Finish(run);
+
+        var events = ReadEvents(paths);
+
+        Assert.Equal(1, CountEvents(events, SessionEventNames.CaptureFormatChanged));
+        Assert.Equal(1, CountEvents(events, SessionEventNames.CaptureDeviceLostFatal));
+        Assert.Equal("device_format_changed", outcome.EndReason);
+
+        // The reopened device was refused rather than spliced in, so nothing was captured from it.
+        Assert.Empty(WavNames(paths, AudioSource.Mic).Except(new[] { "000001.wav" }));
+
+        // The outage measured while the endpoint was gone is still reported, exactly as it is when
+        // the endpoint never returns at all.
+        var gap = Assert.Single(events, e => Name(e) == SessionEventNames.CaptureGap);
+        Assert.Equal(RecordedMs, gap.GetProperty("gap_start_ms").GetInt64());
+        Assert.Equal(RecordedMs + (BluetoothOutageSeconds * 1000L), gap.GetProperty("gap_end_ms").GetInt64());
+        Assert.Equal(BluetoothOutageSeconds * 1000L, gap.GetProperty("gap_ms").GetInt64());
+        Assert.Equal(AudioGapReasons.NotCaptured, gap.GetProperty("reason").GetString());
+
+        var manifest = ReadManifest(paths);
+        Assert.Equal(1, manifest.GapCount);
+        Assert.Equal(BluetoothOutageSeconds * 1000L, manifest.GapTotalMs);
+        Assert.True(outcome.Degraded);
+    }
+
+    /// <summary>
+    /// Asserts the derivation's contract for one window: the count is the window spent at one
+    /// attempt per backoff, and it is never negative.
+    /// </summary>
+    private static void AssertAttempts(int deviceRecoverySeconds, int expected)
+    {
+        var attempts = CaptureService.RecoveryAttemptsFor(deviceRecoverySeconds);
+        Assert.Equal(expected, attempts);
+        Assert.True(attempts >= 0, $"a window of {deviceRecoverySeconds} s bought {attempts} attempts");
+    }
+
+    private static bool HasEvent(SessionPaths paths, string name)
+        => ReadEvents(paths).Any(e => Name(e) == name);
 
     private static TaskCompletionSource<ClosedAudioChunk> ClosedChunkSignal(
         RecordingSession session,

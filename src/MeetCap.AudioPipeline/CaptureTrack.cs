@@ -107,6 +107,7 @@ internal sealed class CaptureTrack : IDisposable
     private Exception? _segmentFault;
 
     private int _deviceRestarted;
+    private int _deviceRecovered;
     private int _terminalDeviceLoss;
     private int _flushRequested;
     private int _overflowSignalled;
@@ -301,8 +302,18 @@ internal sealed class CaptureTrack : IDisposable
 
             if (cancellationToken.IsCancellationRequested)
             {
-                // A stop request or a storage failure ended the session. This track is
-                // not degraded by a clean stop.
+                // A stop request or a storage failure ended the session, so this track is not
+                // degraded by the clean stop itself. An outage measured before the stop is still
+                // missing audio, though, so it is handed to the consumer — the timeline's only
+                // writer — to be recorded rather than dropped with the track. Nothing is handed
+                // over when there is no pending measurement, and a track that never placed a
+                // buffer has no span for audio to be missing from, so the consumer records no gap
+                // for that case either (docs/RELIABILITY.md section 8.2).
+                if (Volatile.Read(ref _pendingGapMs) > 0)
+                {
+                    Interlocked.Exchange(ref _terminalDeviceLoss, 1);
+                }
+
                 return;
             }
 
@@ -570,6 +581,10 @@ internal sealed class CaptureTrack : IDisposable
             // it must close the audio captured before the outage.
             Interlocked.Exchange(ref _deviceRestarted, 1);
 
+            // The endpoint did come back, which decides how a pending outage is worded if the
+            // session instead ends before the reopened endpoint delivers a buffer.
+            Interlocked.Exchange(ref _deviceRecovered, 1);
+
             _events.Write(new SessionEvent(SessionEventNames.CaptureDeviceRestored, CurrentTimelineMs())
             {
                 Source = _source.ToWireName(),
@@ -583,7 +598,8 @@ internal sealed class CaptureTrack : IDisposable
         // The recovery window closed with the endpoint still gone. The outage measured while
         // retrying is real missing audio even though no buffer will ever place it, so it is
         // carried to the consumer — which owns the timeline — instead of vanishing with the
-        // track (docs/RELIABILITY.md section 7).
+        // track (docs/RELIABILITY.md section 8.2).
+        Interlocked.Exchange(ref _deviceRecovered, 0);
         Interlocked.Add(ref _pendingGapMs, MeasuredDowntime(downtimeStart));
         return (null, attempts, true);
     }
@@ -694,8 +710,8 @@ internal sealed class CaptureTrack : IDisposable
     }
 
     /// <summary>
-    /// Accounts for the outage that was still unplaced when this track ended, and names it in
-    /// the event log.
+    /// Accounts for the outage that was still unplaced when this track stopped receiving buffers,
+    /// and names it in the event log.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -704,6 +720,14 @@ internal sealed class CaptureTrack : IDisposable
     /// returned and the writer is complete, so the timeline has no writer left but this one
     /// (docs/ARCHITECTURE.md section 7.2). Recording the outage anywhere else would race the
     /// consumer's own <c>Observe</c> calls.
+    /// </para>
+    /// <para>
+    /// Two situations reach here with an outage that was measured but never placed: the recovery
+    /// window closed with the endpoint still gone and the track ended fatally, or the track
+    /// successfully reopened the endpoint and the session then stopped before that endpoint
+    /// delivered a single buffer. Both are real missing audio on a span this track did capture, so
+    /// both are reported; they differ only in the wording of the reason (docs/RELIABILITY.md
+    /// section 8.2).
     /// </para>
     /// <para>
     /// A track that placed no buffer reports no gap: there is no span of captured audio for
@@ -718,6 +742,7 @@ internal sealed class CaptureTrack : IDisposable
             return;
         }
 
+        var recovered = Interlocked.Exchange(ref _deviceRecovered, 0) == 1;
         var pending = Interlocked.Exchange(ref _pendingGapMs, 0);
         var gap = _timeline?.RecordTerminalDeviceLoss(pending);
         if (gap is not { } terminal)
@@ -732,11 +757,15 @@ internal sealed class CaptureTrack : IDisposable
             GapEndMs = terminal.GapEndMs,
             GapMs = terminal.GapMs,
             Reason = AudioGapReasons.NotCaptured,
-            Detail =
-                "the configured capture device did not return within the recovery window, so this " +
-                "stretch of the track's timeline has no captured audio. The track ends here; the " +
-                "outage is what was measured while retrying, not an estimate of what a successful " +
-                "recovery would have captured.",
+            Detail = recovered
+                ? "the configured capture device returned and the track reopened it, but the session " +
+                  "stopped before the reopened endpoint delivered a buffer, so this stretch of the " +
+                  "track's timeline has no captured audio. The outage is what was measured while " +
+                  "retrying, not an estimate of what the rest of the session would have captured."
+                : "the configured capture device did not return within the recovery window, so this " +
+                  "stretch of the track's timeline has no captured audio. The track ends here; the " +
+                  "outage is what was measured while retrying, not an estimate of what a successful " +
+                  "recovery would have captured.",
         });
     }
 
@@ -879,6 +908,9 @@ internal sealed class CaptureTrack : IDisposable
 
         if (restarted)
         {
+            // The outage this track measured has now been placed by the first buffer of the
+            // restarted stream, so a later stop must not report it again as a terminal gap.
+            Interlocked.Exchange(ref _deviceRecovered, 0);
             _timeline!.RecordDeviceLoss(pendingGap);
         }
 

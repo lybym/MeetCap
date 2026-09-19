@@ -93,7 +93,10 @@ ends the whole session.
 
 The window is the policy and the attempt count is derived from it
 (`CaptureService.RecoveryAttemptsFor`), so a window and the number of retries that spend it
-cannot disagree.
+cannot disagree. The budget is never negative and never shrinks as the window grows: the
+derivation multiplies in `long` and saturates at `int.MaxValue` attempts, so even a window long
+enough to overflow an `int` millisecond count still buys recovery rather than silently buying
+none (`docs/CONFIGURATION.md` section 6).
 
 The window exists because the timescales differ by transport. A wired endpoint that is
 unplugged and a Bluetooth endpoint that Windows is re-enumerating are indistinguishable to
@@ -124,6 +127,15 @@ captured: it is a floor on the missing audio, and it is stated as such.
 A track that never placed a buffer reports no terminal gap. There is no span of captured audio
 for anything to be missing from, and inventing one would overstate the loss in exactly the
 direction a reader cannot check.
+
+The same accounting covers the case where the endpoint *did* come back: if the session is stopped
+after the track reopened its endpoint but before that endpoint delivered a single buffer, there is
+still no next buffer to place the measured outage, so it is recorded the same way and with the
+same `reason = "not_captured"`. The reported interval and reason are identical to the unrecoverable
+case; only the event's `detail` distinguishes "the device never came back" from "the recording
+stopped first". The track is degraded either way — a device loss degrades it, whether or not it
+recovers — and the reported gap accounts for the audio that is missing from the span it did
+capture.
 
 ## 9. Network loss
 

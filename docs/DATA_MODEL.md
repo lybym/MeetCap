@@ -367,22 +367,25 @@ events whose name alone is not specific enough. `capture.gap` uses it for the ga
 (`not_captured`, `chunk_unreadable` or `chunk_missing`, section 5.1) and `session.recovered`
 sets `reason=incomplete` when the session still has a known gap.
 
-### 4.1 `capture.gap` has two producers, and they must name the same hole
+### 4.1 `capture.gap` has three producers, and they must name the same hole
 
 A gap is observed twice: the live recording measures it while it is running, and recovery
-re-derives it from the chunk index afterwards (section 5.1). The event therefore carries the
-gap's own interval in `gap_start_ms` / `gap_end_ms` — where audio stopped and where it resumed
-— and `at_ms` remains the position on the timeline the event is placed at, which for the live
-writer is the resume position.
+re-derives it from the chunk index afterwards (section 5.1). The live writer produces two of the
+three cases — a device-position skip between buffers, and a measured outage with no resume
+position — while recovery produces the third. The event therefore carries the gap's own interval
+in `gap_start_ms` / `gap_end_ms` — where audio stopped and where it resumed — and `at_ms` remains
+the position on the timeline the event is placed at, which for the live writer is the resume
+position. When there is no resume position the outage's end is used instead.
 
-The live writer has one more case beyond "the device skipped audio between buffers": a
-configured endpoint that disappeared and never came back within its recovery window
-(`docs/RELIABILITY.md` section 8.2, issue #34). There is no resume position there, so the
-outage measured while retrying is applied when the track ends and written as a `capture.gap`
-with `reason = "not_captured"` whose `gap_start_ms` is where the last captured buffer ended and
-whose `gap_end_ms` is that position plus the measured outage. It exists because the alternative
-— an outage the track measured but never placed, because placing it is the next buffer's job —
-left `gap_count: 0` on a session whose own log described a multi-second hole.
+The live writer's second case is a configured endpoint that disappeared and never came back
+within its recovery window (`docs/RELIABILITY.md` section 8.2, issue #34) — or that did come back
+after a session had already been asked to stop, so the reopened endpoint never delivered a buffer.
+Either way there is no resume position, so the outage measured while retrying is applied when the
+track stops receiving buffers and written as a `capture.gap` with `reason = "not_captured"` whose
+`gap_start_ms` is where the last captured buffer ended and whose `gap_end_ms` is that position
+plus the measured outage. It exists because the alternative — an outage the track measured but
+never placed, because placing it is the next buffer's job — left `gap_count: 0` on a session whose
+own log described a multi-second hole.
 
 Those are deliberately not the same coordinate. The live writer's `start_ms`, when it sets it
 at all, is the position of the *buffer* it is writing (where audio resumes), while the audit's
