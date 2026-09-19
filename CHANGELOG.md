@@ -12,7 +12,14 @@ manual checklist in `docs/M1_WINDOWS_VALIDATION.md` has been run on real hardwar
 milestones are described as the former, never the latter
 (`docs/DEVELOPMENT.md` section 7).
 
-## [Unreleased]
+## [0.2.0] - 2026-09-19
+
+The second MVP-track release. It adds one post-MVP transport feature and one
+provider-contract realignment on top of 0.1.0. No milestone becomes newly
+complete in this release: M0 through M6 remain *implemented and automatically
+covered*, not *verified end to end*, and the MVP umbrella issue
+([#1](https://github.com/lybym/MeetCap/issues/1)) and the architecture-baseline
+issue ([#9](https://github.com/lybym/MeetCap/issues/9)) remain OPEN by design.
 
 ### Changed
 
@@ -122,6 +129,25 @@ milestones are described as the former, never the latter
   is still not claimed.
 - The manual real-TOS plus real-Seed-ASR smoke test for the >20 MiB path is likewise **not run**
   (`docs/M1_WINDOWS_VALIDATION.md` section 15); CI covers that path with mocks and fakes only.
+
+### Database migrations
+
+Two forward migrations are added since 0.1.0. Both are applied automatically on first run; there is
+no manual migration step.
+
+- `0005_asr_job_provider_log_id.sql` — adds `asr_jobs.provider_log_id`. It rebuilds `asr_jobs` and
+  copies every existing row unchanged, and it is re-runnable: a replay now preserves any
+  `provider_log_id` written since the first run instead of resetting it to `NULL`.
+- `0006_tos_asr_transport.sql` — adds `asr_jobs.audio_transport`, `tos_bucket`, `tos_object_key` and
+  `tos_cleanup_pending`. It is also re-runnable (`ADD COLUMN` guarded by a schema check), because a
+  second process can read `schema_migrations` before the version row is committed and run the script
+  too.
+
+Upgrading from 0.1.0 therefore needs no manual SQL, but it **does** need a configuration edit: see
+*Breaking changes* above. A 0005 replay previously dropped the 0006 columns and broke
+`meetcap asr resume` with `no such column: audio_transport`; both rebuilds now declare the full
+post-#26 column set, and regression tests replay each migration, both in sequence, and the upgrade
+path from a pre-#29 data root.
 
 ## [0.1.0] - 2026-09-18
 

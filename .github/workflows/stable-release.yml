@@ -7,10 +7,10 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Stable version to publish (for example, 0.1.0)
+        description: Stable version to publish (for example, 0.2.0)
         required: true
         type: string
-        default: 0.1.0
+        default: 0.2.0
 
 permissions:
   contents: write

@@ -61,9 +61,10 @@ Related official references:
 Implementation alignment landed with issue #26: the adapter sends only `X-Api-Key`, fixes
 `X-Api-Resource-Id` to `volc.seedasr.auc`, speaks the submit/query endpoints above with no
 tier routing, and retains the provider's `X-Tt-Logid` on the job row.
-Large-file TOS transport is implemented by issue #29 (section 12.1) on
-`feat/29-tos-large-file-transport`; it is not yet on `main`, so `main` remains inline-Base64-only
-for file transport.
+Large-file TOS transport is implemented by issue #29 (section 12.1) and was merged to `main` by
+PR #31 for release 0.2.0, so `main` no longer stays inline-Base64-only for file transport. The
+real-TOS plus real-Seed-ASR smoke test for that path is still **not run**
+(`docs/M1_WINDOWS_VALIDATION.md` section 15).
 
 ## 3. Default live-session algorithm
 

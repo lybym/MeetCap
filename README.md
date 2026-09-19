@@ -1,13 +1,5 @@
 # MeetCap
 
-## Optional large-file ASR transport
-
-For normalized WAV inputs larger than 20 MiB, configure `[asr.tos]` with a dedicated private
-bucket/prefix. MeetCap uses the official Volcengine TOS .NET SDK to stream the file, submits a
-six-hour presigned GET URL to Seed-ASR, and never stores the signed URL or credentials. Grant only
-`tos:PutObject`, `tos:GetObject`, and `tos:DeleteObject` on `meetcap-asr/*`; configure a three-day
-lifecycle expiration safety net for that prefix. MeetCap never changes bucket policy, IAM, or lifecycle rules.
-
 MeetCap is a Windows-resident CLI for **durable meeting audio capture, file-first ASR, speaker attribution, and continuously persisted transcripts**.
 
 The design deliberately prioritizes:
@@ -99,16 +91,23 @@ contract is implemented by the provider adapter: the only user-supplied provider
 and the service-tier selector are rejected with a migration message rather than reinterpreted.
 The provider's `X-Tt-Logid` is retained per job for support tracing.
 
-Large-file transport is specified and implemented by issue #29 (branch
-`feat/29-tos-large-file-transport`, PR #31; not yet on `main`). Files at or below 20 MiB stay on
-inline `audio.data`; larger files are temporarily staged in a private Volcengine TOS object using
+Large-file transport is specified and implemented by issue #29 (PR #31, merged to `main` in
+0.2.0). Files at or below 20 MiB stay on inline `audio.data`; larger files are temporarily staged
+in a private Volcengine TOS object using
 the official TOS .NET SDK and submitted through an SDK-generated presigned `audio.url`. TOS is
 optional for ordinary 300-second live batches and never replaces local durable audio. The job row
 keeps the stable bucket and object key — never the signed URL — so a restart can re-sign and can
 finish the idempotent `DeleteObject` cleanup; a cleanup failure is recorded retryable debt and does
 not invalidate a successful transcript.
 
-Until that branch merges, `main` remains inline-Base64-only for file transport.
+To enable it, configure `[asr.tos]` with a dedicated private bucket/prefix. Grant only
+`tos:PutObject`, `tos:GetObject`, and `tos:DeleteObject` on `meetcap-asr/*`, and configure a
+three-day lifecycle expiration safety net for that prefix. MeetCap never changes bucket policy, IAM,
+or lifecycle rules, and never stores the signed URL or credentials.
+
+The transport is covered by the automated suite against mocked TOS and provider boundaries; the
+real-TOS plus real-Seed-ASR smoke test for the >20 MiB path is **not run**
+(`docs/M1_WINDOWS_VALIDATION.md` section 15), so this path is not claimed as verified end to end.
 
 The hardware-dependent acceptance tests are tracked as a
 manual checklist in `docs/M1_WINDOWS_VALIDATION.md`; nothing here claims any milestone is
@@ -182,7 +181,9 @@ M0 through M6 are implemented and automatically covered. Code is added milestone
 milestone according to `docs/ROADMAP.md`; agents should not implement later milestones
 opportunistically.
 
-This is release **0.1.0**. The hardware-dependent acceptance tests are still open and are
-tracked as a manual checklist in `docs/M1_WINDOWS_VALIDATION.md`; nothing here claims any
-milestone is verified end to end on real audio hardware yet. See `CHANGELOG.md` for the
-release notes and `docs/ROADMAP.md` for milestone status.
+This is release **0.2.0**, which adds the optional large-file TOS ASR transport and realigns the
+Volcengine provider contract on top of 0.1.0; no milestone becomes newly complete. The
+hardware-dependent acceptance tests are still open and are tracked as a manual checklist in
+`docs/M1_WINDOWS_VALIDATION.md`; nothing here claims any milestone is verified end to end on real
+audio hardware yet. See `CHANGELOG.md` for the release notes and `docs/ROADMAP.md` for milestone
+status.
