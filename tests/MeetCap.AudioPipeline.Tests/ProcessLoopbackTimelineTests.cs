@@ -71,6 +71,15 @@ public class ProcessLoopbackTimelineTests
         Assert.Empty(EventsNamed(paths, SessionEventNames.CaptureDiscontinuity, AudioSources.Loopback));
         Assert.Empty(EventsNamed(paths, SessionEventNames.CaptureGap, AudioSources.Loopback));
 
+        // The session's opening record says which device timing each track is placed by, so
+        // "the loopback track was placed by QPC because its stream has no position of its
+        // own" is something a reader is told rather than something they infer
+        // (docs/ARCHITECTURE.md section 8.1).
+        var started = Assert.Single(EventsNamed(paths, SessionEventNames.SessionStarted));
+        Assert.Contains("source='loopback'", started.Detail, StringComparison.Ordinal);
+        Assert.Contains("clock='qpc'", started.Detail, StringComparison.Ordinal);
+        Assert.Contains("clock='device_position'", started.Detail, StringComparison.Ordinal);
+
         // The track's timeline is monotonic and complete: three chunks covering 0..130000,
         // the same span the device-position microphone track records.
         var loopbackChunks = harness.Database.Chunks.ListForSession(session.SessionId)
