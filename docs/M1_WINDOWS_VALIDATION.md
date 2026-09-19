@@ -11,6 +11,11 @@ scripted capture source, but it runs without a microphone. Until the scenarios b
 have been executed on real hardware, M1 must be described as *implemented and
 automatically covered*, not as *verified*.
 
+One exception is recorded, and it is not a completed checklist: two of the section 13.5
+process-loopback timeline rows were run on real hardware on 2026-09-19 against the
+Issue #33 fixed build and passed (section 14.1). Everything else in this document,
+including the other section 13.5 rows, remains unrun.
+
 Section 10 holds the same kind of checklist for the M2 additions from Issue #4 (bounded
 buffer accounting, explicit gap reporting, `meetcap session repair`).
 
@@ -538,6 +543,13 @@ meetcap start "M5 online check" --mode online
 meetcap start "M5 process loopback" --mode online
 ```
 
+> **Partial run recorded (2026-09-19, Issue #33).** The two timeline rows below — stable process
+> audio is not marked degraded, and the QPC-placed chunks cover the whole session span — were run
+> on real hardware against a fixed build with an actively playing target process, and **passed**.
+> Every other row here, and every row in the rest of section 13, is still unrun: those need a real
+> meeting application and endpoint changes this run did not perform. The full record, including what
+> was and was not covered, is in section 14.1.
+
 - [ ] On a supported Windows/NAudio environment, only the named meeting application's audio
       appears on the loopback track; other system audio does not.
 - [ ] Process loopback does not create a new meeting mode — it is the same `online` session,
@@ -551,6 +563,25 @@ meetcap start "M5 process loopback" --mode online
       `end_reason: capture_start_failed` and an empty `audio/loopback/`.
 - [ ] If the running Windows/NAudio combination does not support process loopback, the failure
       is actionable, not a silent fallback to system loopback.
+- [ ] Stable process audio does **not** mark the loopback track degraded. `session.json` reports
+      the loopback entry with `degraded: false`, `gap_count: 0` and no `end_reason`, and
+      `events.jsonl` carries no repeated `capture.discontinuity` for the loopback source.
+      Process loopback reports no device position of its own, so this track is placed by its QPC
+      timestamp (docs/ARCHITECTURE.md section 8.1); one "device position moved backwards" event
+      per buffer is the defect this row checks for, not an acceptable warning.
+      ```powershell
+      Select-String -Path <data-root>\sessions\<id>\events.jsonl -Pattern 'capture.discontinuity'
+      # expect at most the one stream-start flags event per track, never one per buffer
+      ```
+- [ ] The loopback track's chunks cover the same session span as the microphone track's, so the
+      QPC-placed timeline is complete rather than merely free of events. Compare the chunk index:
+      ```powershell
+      meetcap status --session <id>
+      ```
+- [ ] A real drop stays observable: stop the target process's audio for a second while capture
+      runs, and the loopback track reports one `capture.gap` with the missing milliseconds and is
+      marked degraded. Missing audio is reported, never absorbed by shifting later timestamps
+      (docs/RELIABILITY.md section 7).
 
 ### 13.6 Two sessions into one data root both get their transcript
 
@@ -600,7 +631,7 @@ on one job primary key.
 | 13.2 M5 overlapping speech | | |
 | 13.3 M5 one track degrades | | |
 | 13.4 M5 headphones vs speakers | | |
-| 13.5 M5 process loopback | | |
+| 13.5 M5 process loopback | **partial** (2 of 7 rows; section 14.1) | timeline rows passed 2026-09-19; rest unrun |
 | 13.6 M5 two sessions, one data root | | |
 | 15.1 #29 config redaction | | |
 | 15.2 #29 oversized input over TOS | | |
@@ -619,6 +650,70 @@ scripted transport (endpoint, headers, body shape, status handling, secret redac
 retention), but no real Seed-ASR 2.0 Standard HTTP request has been made from this environment,
 so end-to-end provider verification is explicitly **not** claimed
 (`docs/DEVELOPMENT.md` section 7).
+
+### 14.1 Issue #33 process-loopback timeline rows — partial run, 2026-09-19
+
+Issue #33's acceptance criterion *"reproduce and verify process loopback with an actively playing
+target process"* needs the process-loopback path to be exercised on real hardware against a real
+render endpoint and a real playing process, which is what section 13.5's timeline rows check. That
+run was performed on the machine below, against the fixed build, and is recorded here in full.
+
+Environment (section 1 fields):
+
+| Field | Value |
+| --- | --- |
+| Date | 2026-09-19 |
+| Tester | coding agent, unattended session (`ISSUE_AGENT-33-S05`) |
+| Windows version / build | Windows 11 Home, build 26200 (10.0.26200), AMD64 |
+| MeetCap commit | `7709b118ed4a14a7a93d98bb9eace7f1309df9f5` (`fix/33-process-loopback-timeline`) |
+| Machine | DESKTOP-2H6MG5P |
+| Microphone (from `meetcap devices`) | `麦克风阵列 (Realtek(R) Audio)`, id `{0.0.1.00000000}.{c3842cfa-9574-418e-8c47-18da833f7eab}` |
+| Render endpoint (loopback source) | `扬声器 (Realtek(R) Audio)`, id `{0.0.0.00000000}.{97aa8bbe-5462-4856-916e-4ee6569b8d1e}` |
+| `capture.chunk_seconds` | 60 |
+| Target process | `ffplay.exe` (`C:\Program Files\ffmpeg\bin\ffplay.exe`) looping a tone WAV from `.manual-validation/process-audio-data/tone.wav` |
+| Build run | `dotnet build src/MeetCap.Cli/MeetCap.Cli.csproj -c Release -o <temp>`, so the live soak's locked `bin/Release` was not touched |
+
+Method: `capture.online.loopback_mode = "process"`, `capture.online.process_name = "ffplay"`,
+ASR and speakers disabled, `meetcap start … --mode online` for 58.2 s with the target actively
+playing, then `meetcap stop`. Session `ses_20260919T092817Z_3910e1e6`; artifacts under an
+out-of-tree data root (temp), not the repository's `.manual-validation` tree.
+
+Result rows:
+
+| Row | Result |
+| --- | --- |
+| Stable process audio does not mark the loopback track degraded: `degraded: false`, `gap_count: 0`, no `end_reason`, and no repeated `capture.discontinuity` for the loopback source | **PASSED.** `session.json`: session `degraded: false`, `end_reason: stop_requested`, `gap_count: 0`, `gap_total_ms: 0`; `loopback` track health `degraded: false`, `gap_count: 0`, `gap_total_ms: 0`, `end_reason` absent, `chunks_closed: 1`, 20,543,544 bytes. `events.jsonl` holds exactly one `capture.discontinuity` in the whole session and it is the microphone's first-buffer `DataDiscontinuity` stream flag; the loopback source produced none. `session.started` records the declaration this fix added: `source='loopback' … clock='qpc'` alongside `source='mic' … clock='device_position'`. |
+| The loopback track's chunks cover the same session span as the microphone track's | **PASSED.** `session.stopped` reports `end_ms: 58230`, and the loopback chunk index row is `start_ms: 0, end_ms: 58230`, identical to the microphone's. Both WAVs decode to exactly 58.23 s of audio at their own native formats (loopback 44,100 Hz stereo float, mic 48,000 Hz stereo float). The loopback track therefore spans the session rather than stopping at the first buffer. |
+
+Additional facts recorded, because they are what the fix's residual risk was about:
+
+- The loopback chunk index row carries `device_position_frames = 0` with a real
+  `qpc_position_ticks = 880015035985`. That is the shape the fix is built on: this capture path
+  reports no device position of its own, and on this run the fixed build placed the track by QPC
+  for the whole session.
+- Both tracks closed cleanly on one chunk, no `.part` was left behind, `dropped_packets: 0`,
+  `stall_events: 0`, and `meetcap start` exited `0` printing a per-track line. This is the online
+  happy path, not the `system` baseline: the baseline is not claimed here.
+
+**Explicitly not covered by this run** — these are still unrun and must not be read as passed:
+
+- **The other five rows of section 13.5.** Rows 1-5 (only the named application's audio appears;
+  process loopback is still the same `online` session; an invalid `loopback_mode` fails before any
+  session is written; a missing target process exits `1` with the actionable reason and leaves the
+  session `INTERRUPTED`; an unsupported Windows/NAudio combination fails actionably) were not
+  attempted.
+- **A real drop while the target plays.** The remaining section 13.5 row — stopping the target
+  process's audio for a second and confirming one `capture.gap` carrying the missing milliseconds
+  — was not attempted. The gap path is covered by the automated suite
+  (`ProcessLoopbackTrack_MissingAudioInItsOwnClock_IsStillReportedAsAGap`) and is **not** claimed
+  as hardware-verified.
+- **Sections 13.1-13.4 and 13.6**, and every earlier scenario in this document.
+- **A real meeting application.** The target was `ffplay`, the reproduction's own stand-in, not a
+  meeting client whose process tree has to be resolved.
+
+No section 13.5 checkbox was ticked by this run: the rows are still `- [ ]` above, because the run
+covered some of what they ask and not the rest, and a ticked box would claim the whole row. The
+per-row result is pinned here instead.
 
 ---
 

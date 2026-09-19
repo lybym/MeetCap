@@ -90,6 +90,14 @@ internal sealed class FakeCaptureSource : IAudioCaptureSource
 
     public AudioFormat Format { get; }
 
+    /// <summary>
+    /// Which device timing this fake's packets are placed by. Defaults to
+    /// <see cref="CaptureClock.DevicePosition"/>; a test that reproduces a stream with no
+    /// position of its own sets <see cref="CaptureClock.Qpc"/>
+    /// (docs/ARCHITECTURE.md section 8.1).
+    /// </summary>
+    public CaptureClock Clock { get; set; } = CaptureClock.DevicePosition;
+
     public CaptureDeviceInfo Device { get; set; }
 
     public event Action<AudioPacket>? PacketAvailable;
@@ -197,6 +205,15 @@ internal sealed class FakeCaptureSourceFactory : IAudioCaptureSourceFactory
 
     public Func<LoopbackCaptureRequest, IAudioCaptureSource>? LoopbackFallback { get; set; }
 
+    /// <summary>
+    /// Runs inside <see cref="CreateLoopback"/> before the replacement source is returned, which is
+    /// how a test dates a device outage deterministically. The track stamps the outage's start when
+    /// it notices the fault and measures it when the endpoint comes back, so a clock advanced from
+    /// outside that window is a race with the capture loop; a clock advanced here lands between the
+    /// two and is always observed (docs/RELIABILITY.md section 7).
+    /// </summary>
+    public Action? OnCreateLoopback { get; set; }
+
     public void EnqueueLoopback(FakeCaptureSource source)
         => _scriptedLoopback.Enqueue(_ => source);
 
@@ -206,6 +223,8 @@ internal sealed class FakeCaptureSourceFactory : IAudioCaptureSourceFactory
     public IAudioCaptureSource CreateLoopback(LoopbackCaptureRequest request)
     {
         ArgumentNullException.ThrowIfNull(request);
+
+        OnCreateLoopback?.Invoke();
 
         var factory = _scriptedLoopback.Count > 0 ? _scriptedLoopback.Dequeue() : LoopbackFallback;
         if (factory is null)
@@ -304,6 +323,78 @@ internal static class TestAudio
 
         return frame;
     }
+
+    /// <summary>
+    /// A packet from a capture source that reports no device position of its own: the
+    /// Windows process-loopback shape, where every buffer carries device position 0 and
+    /// only the QPC timestamp advances (issue #33, docs/ARCHITECTURE.md section 8.1).
+    /// </summary>
+    /// <param name="qpcDeltaTicks">
+    /// Shifts the stream's whole QPC origin. A reopened stream reports a position from its own
+    /// new origin, which is how a test makes the restarted stream's own clock say something
+    /// unrelated to session time (docs/ARCHITECTURE.md section 8.1).
+    /// </param>
+    public static AudioPacket PacketWithoutDevicePosition(
+        AudioFormat format,
+        long startFrame,
+        int frames,
+        AudioSource source = AudioSource.Loopback,
+        AudioBufferFlags flags = AudioBufferFlags.None,
+        long qpcDeltaTicks = 0)
+        => new(
+            source,
+            format,
+            new byte[frames * format.BlockAlign],
+            0,
+            (startFrame * 10_000_000L / format.SampleRate) + qpcDeltaTicks,
+            DateTimeOffset.UnixEpoch,
+            flags);
+
+    /// <summary>
+    /// Emits <paramref name="milliseconds"/> of contiguous audio whose only timing is the
+    /// QPC timestamp, returning the next free position in frames. The counterpart of
+    /// <see cref="EmitSeconds"/> for a stream with no device position of its own
+    /// (docs/ARCHITECTURE.md section 8.1).
+    /// </summary>
+    public static long EmitSecondsWithoutDevicePosition(
+        FakeCaptureSource source,
+        AudioFormat format,
+        long startFrame,
+        int milliseconds,
+        int bufferMs = 100,
+        long qpcDeltaTicks = 0)
+    {
+        var remaining = milliseconds;
+        var frame = startFrame;
+
+        while (remaining > 0)
+        {
+            var chunkMs = Math.Min(bufferMs, remaining);
+            var frames = Frames(format, chunkMs);
+            source.Emit(PacketWithoutDevicePosition(
+                format, frame, frames, source.Source, AudioBufferFlags.None, qpcDeltaTicks));
+            frame += frames;
+            remaining -= chunkMs;
+        }
+
+        return frame;
+    }
+
+    /// <summary>
+    /// A packet that carries neither a device position nor a QPC timestamp, so no clock can
+    /// place it (docs/ARCHITECTURE.md section 8.1).
+    /// </summary>
+    public static AudioPacket PacketWithoutAnyTiming(
+        AudioFormat format,
+        int frames,
+        AudioSource source)
+        => new(
+            source,
+            format,
+            new byte[frames * format.BlockAlign],
+            0,
+            null,
+            DateTimeOffset.UnixEpoch);
 }
 
 /// <summary>Temp data root plus a migrated database with one session row.</summary>

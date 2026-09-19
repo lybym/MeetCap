@@ -535,6 +535,13 @@ Artifact contract
 - 2-hour online recording test captures microphone and loopback independently.
 - Closing the network connection for 30 minutes does not interrupt local recording.
 - Previously closed chunks remain valid after forced process termination.
+- A track whose audio was captured correctly is not reported degraded. In particular, the
+  process-loopback track is healthy when its audio is continuous, even though Windows process
+  loopback reports no device position of its own and the track is placed by its QPC timestamp
+  (docs/ARCHITECTURE.md section 8.1); only genuinely missing audio, dropped buffers, stalls or a
+  device transition make it degraded. An environment that cannot supply usable device timing for
+  the track fails explicitly rather than being reported as degraded audio
+  (docs/RELIABILITY.md section 7).
 
 ### ASR
 

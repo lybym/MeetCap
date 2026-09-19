@@ -358,7 +358,7 @@ Where NAudio/Windows support process loopback, MeetCap should use that implement
 ```text
 IAudioDeviceEnumerator      active capture endpoints and the system default
 IAudioCaptureSourceFactory  creates a capture source for a resolved endpoint
-IAudioCaptureSource         Format, Device, PacketAvailable, Stopped, Start, Stop
+IAudioCaptureSource         Format, Clock, Device, PacketAvailable, Stopped, Start, Stop
 ```
 
 `AudioPacket` is the MeetCap-owned packet that crosses that boundary. It carries the
@@ -366,6 +366,8 @@ source, the native `AudioFormat`, a private copy of the bytes, the device positi
 frames, the device QPC timestamp when one was supplied, the observation time, and
 MeetCap-owned buffer flags. No NAudio type escapes the assembly, and no conversion or
 resampling happens on the capture thread: the device's own mix format is recorded.
+`Clock` declares which of those timing fields this stream can actually be placed by, so a
+stream that reports no device position is never judged by one (section 8.1).
 
 The recording pipeline owns the bounded queue:
 
@@ -401,7 +403,9 @@ for the loopback track — through `IAudioDeviceEnumerator.EnumerateRenderDevice
 `.WithProcessLoopback` (process, the additive option), which produces the same
 span-based `WasapiRecorder` the microphone uses, so the loopback track reuses the
 `NAudioCaptureSource` adapter and no raw `ActivateAudioInterfaceAsync` / COM plumbing is
-recreated (section 2).
+recreated (section 2). The two paths differ in the timing they can report, so each one tells
+the track which clock it is placed by: system loopback reports the render endpoint's device
+position, process loopback reports none and is placed by QPC (section 8.1).
 
 `RecordingSession` owns one `CaptureTrack` per source. Each `CaptureTrack` is a
 self-contained copy of the M1/M2 capture-consumer-recovery runtime: its own capture
@@ -438,6 +442,13 @@ NAudio-provided timing metadata should be carried through the MeetCap abstractio
 
 Do not build the unified timeline only from wall-clock timestamps.
 
+A captured stream does not always provide every field above. When it does not, the
+timeline is placed by a field the stream *does* provide, and which field that is is
+declared by the capture source (`IAudioCaptureSource.Clock`) instead of being inferred
+from the buffer values. A field the stream does not report is still carried, as the zero
+its own API returns for it, rather than discarded — the point is only that the timeline
+never guesses its clock from those values. See section 8.1.
+
 ### 8.1 Session timeline
 
 The first observed packet defines the session origin. Every later packet is placed by
@@ -445,15 +456,70 @@ device position, so session-relative milliseconds come from the device rather th
 a wall-clock read. QPC is preserved on the packet and as a per-chunk start anchor, so a
 recorded timeline can be cross-checked afterwards.
 
+The capture clock a track is placed by is one of:
+
+```text
+device_position  the device's own stream position, in frames (the default)
+qpc              the device's QPC timestamp in 100-ns units, when the stream has no
+                 position of its own
+```
+
+On the verified Windows/NAudio environment (Windows 11 build 26200, Realtek render
+endpoint, NAudio 3.1), a source that reports no position of its own reports **zero** for
+every buffer, not a missing value, and Windows process loopback is such a source. Placing
+such a track by device position therefore reads as a backwards jump on every buffer after
+the first — one false `capture.discontinuity` per buffer, and a track wrongly reported
+degraded. That is why the clock is declared by the capture source and carried with the
+source's format into `CaptureTimeline`, and why nothing is inferred from the packet values
+at run time.
+
+That declaration is bound to the capture *mode*: a `process` loopback request is placed by
+QPC, and every other request by device position
+(`MeetCap.WindowsAudio.NAudioCaptureSourceFactory.LoopbackClock`). Two consequences are
+deliberate and worth stating rather than leaving to be rediscovered:
+
+- if a system-loopback or microphone endpoint ever reports a constant device position, that
+  track still gets one false discontinuity per buffer and reads as degraded, because no
+  device-position track is checked for a position that never advances. The mode-bound
+  declaration closes the process-loopback case, which is the one that was observed, not the
+  whole class;
+- if a future Windows/NAudio combination makes process loopback report a real advancing
+  device position, the track is still placed by QPC and its frame-exact placement is lost.
+  The declaration is version-independent by design, so this costs resolution, not
+  correctness — the two clocks are equivalent observers of the same device time.
+
+The wording above is scoped to the environment it was observed on
+(`docs/M1_WINDOWS_VALIDATION.md` section 13.5): "process loopback reports no device
+position" is a property of that capture path as verified here, not a documented guarantee
+of the platform.
+
+The two clocks are equivalent observers of the same device time. Both produce
+session-relative positions from device timing, both count a skipped stretch exactly once as
+a gap, and both clamp a backwards step so the session timeline stays monotonic. The
+difference is resolution only: a device position is an exact sample count, while a QPC
+reading is a time that is expressed in whole milliseconds, so a QPC-placed buffer that
+lands within a millisecond of the expected continuation is treated as the same stream
+continuing rather than as a restarted one.
+
 Discontinuities are never smoothed over:
 
 - a device position that jumps forward produces a `capture.gap` event carrying the
   missing duration, and later audio stays where the device says it belongs;
 - a device position that moves backwards (a restarted stream) is clamped so the session
   timeline stays monotonic, and is reported as a `capture.discontinuity`;
+- a QPC-placed stream that produces no audio for a stretch of its own clock time produces
+  the same explicit `capture.gap`, so a drop of one buffer is one buffer of reported
+  missing audio rather than something the timeline absorbs;
 - the device's own buffer flags are surfaced as `capture.discontinuity`;
 - after a device loss and recovery, the measured outage is inserted as an explicit gap,
-  and the first buffer of the new stream starts a new chunk;
+  and the first buffer of the new stream starts a new chunk. On a QPC-placed track the
+  restarted stream is re-anchored to its new origin, so the new stream's own clock reading
+  cannot displace the measured outage;
+- a track whose stream provides **neither** a device position nor a QPC timestamp has no
+  device timing to be placed by at all. MeetCap does not substitute a wall-clock read: the
+  track ends with one explicit `capture.timeline_unusable` event naming the reason and the
+  baseline alternative, and the other track keeps recording. Silently degrading is
+  explicitly not the outcome here (docs/RELIABILITY.md sections 7 and 8);
 - a reopened endpoint that reports a **different mix format** cannot be folded into the
   running session, because the chunk headers, the chunk index and the timeline are
   already written against the session's format. The session ends as degraded with an
@@ -464,6 +530,26 @@ M2 makes the missing time explicit on both sides of a crash: the live timeline c
 discontinuity once as `CaptureTimeline.GapTotalMs` / `GapCount` and persists it in
 `session.json`, and startup recovery re-derives the same question from the chunk index with the
 gap audit. See section 9.2 and `docs/DATA_MODEL.md` section 5.1.
+
+#### Windows/NAudio capability limitation (process loopback)
+
+On the Windows/NAudio combination issue #33 reproduced on (Windows 10/11, Realtek render
+endpoint, NAudio 3.1, `capture.online.loopback_mode = "process"` with a playing target
+process), Windows process loopback reports **no device position**: `GetBuffer` returned
+`device_position_frames = 0` for every one of 1797 captured buffers, while the QPC
+timestamp advanced by exactly 100,000 ticks (10 ms) for every consecutive buffer. This is
+a capability of the activation path, not a defect in MeetCap or in NAudio that can be
+fixed in code: process loopback captures a process tree through
+`ActivateAudioInterfaceAsync` rather than owning an endpoint's stream, so there is no
+stream position to report.
+
+MeetCap therefore places the process-loopback track by QPC
+(`NAudioCaptureSourceFactory.CreateLoopback` declares `CaptureClock.Qpc` for a process
+request and `CaptureClock.DevicePosition` otherwise), which reproduces the system-loopback
+baseline's timeline for the same audio. What cannot be fixed in code is the resolution: QPC
+is a time, so the process-loopback timeline is resolved to the millisecond rather than to
+the exact frame, and a Windows/NAudio combination whose process loopback supplies no QPC
+timestamp at all remains unsupported by design (it ends the track loudly, as above).
 
 ---
 

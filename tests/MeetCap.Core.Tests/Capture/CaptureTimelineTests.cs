@@ -1,4 +1,5 @@
 using MeetCap.Core.Capture;
+using MeetCap.Core.Diagnostics;
 using Xunit;
 
 namespace MeetCap.Core.Tests.Capture;
@@ -269,15 +270,310 @@ public class CaptureTimelineTests
         Assert.Null(anomaly.GapEndMs);
     }
 
+    // ------------------------------------------------------------------- capture clock
+    //
+    // Issue #33: on a real Windows machine the baseline sources report a device position
+    // and the process-loopback source reports none — every one of its buffers carries
+    // device_position_frames = 0 while only the QPC timestamp advances. The clock a track
+    // is placed by is therefore declared by the capture source rather than inferred from
+    // the buffer values (docs/ARCHITECTURE.md section 8.1). These tests are the regression
+    // test for that handling: they place the same packet stream twice, once by device
+    // position (which is what produced one false discontinuity per buffer) and once by QPC.
+
+    [Fact]
+    public void DevicePositionClock_AllZeroPositions_FlagsEveryBufferAfterTheFirst()
+    {
+        // The defect's mechanism, kept explicit: a stream with no position of its own must
+        // never be placed by device position, because its zeros read as a backwards jump on
+        // every buffer (issue #33, docs/ARCHITECTURE.md section 8.1).
+        var timeline = new CaptureTimeline(Mono48k);
+
+        var first = timeline.Observe(ProcessLoopbackPacket(0));
+        Assert.False(first.DevicePositionAnomaly);
+
+        for (var i = 1; i < 20; i++)
+        {
+            Assert.True(timeline.Observe(ProcessLoopbackPacket(i * TenMs)).DevicePositionAnomaly);
+        }
+
+        // A backwards position is a restarted stream, not lost audio, so the false
+        // anomalies never inflated the gap accounting either.
+        Assert.Equal(0, timeline.GapTotalMs);
+        Assert.Equal(0, timeline.GapCount);
+    }
+
+    [Fact]
+    public void QpcClock_ProcessLoopbackBuffers_ProduceAContinuousTimeline()
+    {
+        var timeline = new CaptureTimeline(Mono48k, CaptureClock.Qpc);
+
+        for (var i = 0; i < 20; i++)
+        {
+            var timing = timeline.Observe(ProcessLoopbackPacket(i * TenMs));
+
+            Assert.False(timing.DevicePositionAnomaly);
+            Assert.False(timing.Discontinuity);
+            Assert.False(timing.IsIrregular);
+            Assert.Equal(0, timing.GapMs);
+            Assert.Equal(i * 10, timing.StartMs);
+            Assert.Equal((i + 1) * 10, timing.EndMs);
+        }
+
+        Assert.Equal(CaptureClock.Qpc, timeline.Clock);
+        Assert.Equal(200, timeline.LastEndMs);
+        Assert.Equal(0, timeline.GapTotalMs);
+        Assert.Equal(0, timeline.GapCount);
+    }
+
+    [Fact]
+    public void QpcClock_SkipsAStretchOfItsOwnClock_ReportsTheGapInsteadOfAnAnomaly()
+    {
+        var timeline = new CaptureTimeline(Mono48k, CaptureClock.Qpc);
+
+        timeline.Observe(ProcessLoopbackPacket(0)); // placed at 0..10 ms
+
+        // The stream produced nothing for a second: its QPC time resumes at 1010 ms.
+        var timing = timeline.Observe(ProcessLoopbackPacket(101 * TenMs));
+
+        Assert.Equal(1_010, timing.StartMs);
+        Assert.Equal(1_020, timing.EndMs);
+        Assert.Equal(1_000, timing.GapMs);
+        Assert.Equal(10, timing.GapStartMs);
+        Assert.Equal(1_010, timing.GapEndMs);
+        Assert.False(timing.DevicePositionAnomaly);
+        Assert.Equal(1_000, timeline.GapTotalMs);
+        Assert.Equal(1, timeline.GapCount);
+    }
+
+    [Fact]
+    public void QpcClock_OneMissingBuffer_IsStillReportedAsAGap()
+    {
+        // "Actual drops, stalls, and gaps should remain observable and should not be
+        // hidden" (issue #33). One buffer of missing audio is one buffer of missing time.
+        var timeline = new CaptureTimeline(Mono48k, CaptureClock.Qpc);
+
+        timeline.Observe(ProcessLoopbackPacket(0));
+        var timing = timeline.Observe(ProcessLoopbackPacket(2 * TenMs));
+
+        Assert.Equal(10, timing.GapMs);
+        Assert.Equal(10, timing.GapStartMs);
+        Assert.Equal(20, timing.GapEndMs);
+        Assert.Equal(20, timing.StartMs);
+        Assert.Equal(1, timeline.GapCount);
+    }
+
+    [Fact]
+    public void QpcClock_SubMillisecondEarlyArrival_IsNotARestartedStream()
+    {
+        // A QPC reading is a time, so a buffer that lands within a millisecond of the
+        // expected continuation is the same stream read at millisecond resolution — not
+        // the restarted stream a negative device position would mean.
+        var timeline = new CaptureTimeline(Mono48k, CaptureClock.Qpc);
+
+        timeline.Observe(ProcessLoopbackPacket(0));
+        var timing = timeline.Observe(ProcessLoopbackPacket(Mono48k.MillisecondsToFrames(9)));
+
+        Assert.False(timing.DevicePositionAnomaly);
+        Assert.Equal(0, timing.GapMs);
+        Assert.Equal(10, timing.StartMs);
+        Assert.Equal(20, timing.EndMs);
+        Assert.Equal(0, timeline.GapCount);
+    }
+
+    [Fact]
+    public void QpcClock_AQpcThatMovesBackwards_IsFlaggedOnceAndKeepsTheTimelineMonotonic()
+    {
+        var timeline = new CaptureTimeline(Mono48k, CaptureClock.Qpc);
+
+        // A restarted stream reports a position from its own new origin.
+        timeline.Observe(ProcessLoopbackPacket(10 * TenMs));
+
+        var timing = timeline.Observe(ProcessLoopbackPacket(0));
+
+        Assert.True(timing.DevicePositionAnomaly);
+        Assert.Equal(10, timing.StartMs);
+        Assert.Equal(20, timing.EndMs);
+        Assert.Equal(0, timing.GapMs);
+        Assert.Equal(0, timeline.GapTotalMs);
+        Assert.Equal(20, timeline.LastEndMs);
+    }
+
+    [Fact]
+    public void QpcClock_RecordDeviceLoss_PlacesTheRestartedStreamAfterTheOutage()
+    {
+        var timeline = new CaptureTimeline(Mono48k, CaptureClock.Qpc);
+
+        // The stream's own QPC starts far away from the session origin, so the restart can
+        // only be placed by the measured outage, never by the new stream's position.
+        timeline.Observe(ProcessLoopbackPacket(1_000, qpcDeltaTicks: 50_000_000));
+        timeline.RecordDeviceLoss(5_000);
+
+        var restarted = timeline.Observe(ProcessLoopbackPacket(0, qpcDeltaTicks: 900_000_000));
+
+        Assert.True(restarted.IsNewSegment);
+        Assert.Equal(5_000, restarted.GapMs);
+        Assert.Equal(5_010, restarted.StartMs);
+        Assert.Equal(5_020, restarted.EndMs);
+        Assert.Equal(10, restarted.GapStartMs);
+        Assert.Equal(5_010, restarted.GapEndMs);
+        Assert.False(restarted.DevicePositionAnomaly);
+        Assert.Equal(5_000, timeline.GapTotalMs);
+        Assert.Equal(1, timeline.GapCount);
+
+        // The new stream is re-anchored: the buffer after it continues contiguously, and the
+        // rewritten origin is what puts the next buffer one buffer past the restart.
+        var after = timeline.Observe(
+            ProcessLoopbackPacket(TenMs, qpcDeltaTicks: 900_000_000));
+
+        Assert.Equal(5_020, after.StartMs);
+        Assert.Equal(5_030, after.EndMs);
+        Assert.Equal(0, after.GapMs);
+        Assert.False(after.DevicePositionAnomaly);
+
+        // Audio stopped at 10 ms and resumes at 5010 ms even though the new stream's own
+        // clock says something else entirely (docs/RELIABILITY.md section 7): the restart
+        // buffer's own QPC reading now maps to where the outage put it.
+        Assert.Equal(5_010, timeline.QpcToSessionMs(900_000_000));
+        Assert.Equal(5_020, timeline.QpcToSessionMs(900_100_000));
+    }
+
+    [Fact]
+    public void QpcClock_SubMillisecondForwardDrift_IsNotReportedAsAGap()
+    {
+        // A buffer length that is not a whole number of QPC ticks drifts by a sub-millisecond
+        // amount on every buffer: 1000 frames at 3000 Hz is 333,333.33 ticks, which rounds to
+        // 333,333. The stream's own reading then sits one tick — a ten-thousandth of a
+        // millisecond — ahead of the continuation the timeline expected. That is a real forward
+        // step, but it is far below the millisecond the timeline measures holes in, so it must
+        // not be dressed up as a gap: the interval would otherwise name an empty hole
+        // (docs/DATA_MODEL.md section 4.1).
+        var format = new AudioFormat(3_000, 1, 16, AudioSampleFormat.Pcm);
+        var timeline = new CaptureTimeline(format, CaptureClock.Qpc);
+
+        const int BufferFrames = 1_000; // 333,333.33 ticks => 333,333 rounded
+
+        timeline.Observe(Packet(format, devicePosition: 0, frames: BufferFrames, qpc: 0));
+
+        for (var buffer = 1; buffer <= 20; buffer++)
+        {
+            var timing = timeline.Observe(
+                Packet(format, devicePosition: 0, frames: BufferFrames, qpc: buffer * BufferFrames * 10_000_000L / format.SampleRate));
+
+            Assert.Equal(0, timing.GapMs);
+            Assert.False(timing.HasGap);
+            Assert.False(timing.IsIrregular);
+            Assert.Null(timing.GapStartMs);
+            Assert.Null(timing.GapEndMs);
+        }
+
+        // Twenty buffers of sub-millisecond rounding never turned into a claimed loss.
+        Assert.Equal(0, timeline.GapTotalMs);
+        Assert.Equal(0, timeline.GapCount);
+    }
+
+    [Fact]
+    public void GapInterval_IsPresentExactlyWhenTheGapIsReportable()
+    {
+        // The invariant behind the fix: GapStartMs/GapEndMs name a hole only when GapMs
+        // measures one. A zero-millisecond gap is not a hole any gap surface can express, so
+        // the interval is null there — a consumer keying off GapStartMs never sees a
+        // zero-length gap.
+        var timeline = new CaptureTimeline(Mono48k, CaptureClock.Qpc);
+
+        for (var i = 0; i < 5; i++)
+        {
+            var contiguous = timeline.Observe(ProcessLoopbackPacket(i * TenMs));
+            Assert.Equal(0, contiguous.GapMs);
+            Assert.Null(contiguous.GapStartMs);
+            Assert.Null(contiguous.GapEndMs);
+        }
+
+        // One full buffer of its own clock time missing: reportable, and named.
+        var reported = timeline.Observe(ProcessLoopbackPacket(6 * TenMs));
+
+        Assert.Equal(10, reported.GapMs);
+        Assert.True(reported.HasGap);
+        Assert.Equal(50, reported.GapStartMs);
+        Assert.Equal(60, reported.GapEndMs);
+    }
+
+    [Fact]
+    public void QpcClock_WithoutAQpcTimestamp_FailsWithAnActionableDiagnostic()
+    {
+        // Issue #33's fourth expectation: an unsupported process-loopback environment must
+        // fail with an actionable diagnostic rather than silently producing degraded audio.
+        // A track whose stream supplies no QPC cannot be placed by device timing at all, and
+        // MeetCap refuses to invent one from a wall-clock read
+        // (docs/ARCHITECTURE.md sections 8 and 8.1).
+        var timeline = new CaptureTimeline(Mono48k, CaptureClock.Qpc);
+
+        var exception = Assert.Throws<CaptureFailedException>(
+            () => timeline.Observe(PacketWithoutAnyTiming()));
+
+        Assert.Contains("QPC", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("loopback_mode = \"system\"", exception.Message, StringComparison.Ordinal);
+        Assert.False(timeline.HasOrigin);
+
+        // The same guard holds after the track has been placed for a while, so a stream
+        // that stops supplying timing mid-session cannot slip through.
+        var placed = new CaptureTimeline(Mono48k, CaptureClock.Qpc);
+        placed.Observe(ProcessLoopbackPacket(0));
+
+        Assert.Throws<CaptureFailedException>(
+            () => placed.Observe(PacketWithoutAnyTiming()));
+    }
+
+    [Fact]
+    public void QpcClock_DeviceFlags_AreStillSurfaced()
+    {
+        var timeline = new CaptureTimeline(Mono48k, CaptureClock.Qpc);
+
+        var timing = timeline.Observe(
+            ProcessLoopbackPacket(0, flags: AudioBufferFlags.DataDiscontinuity));
+
+        Assert.True(timing.Discontinuity);
+        Assert.True(timing.IsIrregular);
+    }
+
+    /// <summary>
+    /// A process-loopback-shaped packet: the stream reports no device position of its own,
+    /// so the device position is 0 on every buffer and only the QPC timestamp advances
+    /// (issue #33, docs/ARCHITECTURE.md section 8.1).
+    /// </summary>
+    private static AudioPacket ProcessLoopbackPacket(
+        long startFrame,
+        int frames = TenMs,
+        long qpcDeltaTicks = 0,
+        AudioBufferFlags flags = AudioBufferFlags.None)
+        => Packet(
+            devicePosition: 0,
+            frames: frames,
+            // The QPC of the frame the stream starts at, shifted by an explicit delta when a
+            // test needs the stream's own clock to sit somewhere else entirely.
+            qpc: (startFrame * 10_000_000L / Mono48k.SampleRate) + qpcDeltaTicks,
+            flags: flags);
+
+    /// <summary>A packet that carries neither a device position nor a QPC timestamp.</summary>
+    private static AudioPacket PacketWithoutAnyTiming(int frames = TenMs)
+        => Packet(devicePosition: 0, frames: frames, qpc: null);
+
     private static AudioPacket Packet(
         long devicePosition,
         int frames,
         long? qpc = null,
         AudioBufferFlags flags = AudioBufferFlags.None)
+        => Packet(Mono48k, devicePosition, frames, qpc, flags);
+
+    private static AudioPacket Packet(
+        AudioFormat format,
+        long devicePosition,
+        int frames,
+        long? qpc,
+        AudioBufferFlags flags = AudioBufferFlags.None)
         => new(
             AudioSource.Mic,
-            Mono48k,
-            new byte[frames * Mono48k.BlockAlign],
+            format,
+            new byte[frames * format.BlockAlign],
             devicePosition,
             qpc,
             DateTimeOffset.UnixEpoch,

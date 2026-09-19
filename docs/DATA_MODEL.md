@@ -275,6 +275,13 @@ Append-only operational events, one JSON object per line.
 `at_ms` is the session-relative position on the capture timeline, never a wall-clock
 reading. Fields an event does not define are omitted rather than written as `null`.
 
+`capture.gap` is written only for a gap the timeline measures as at least one whole
+millisecond, and it then carries all three of `gap_ms`, `gap_start_ms` and `gap_end_ms`.
+A forward step in the stream's own clock that rounds to zero milliseconds — a sub-millisecond
+QPC rounding remainder, reachable on ordinary hardware — is not a hole any gap surface in
+this document can express, so it produces no event and no interval, rather than a
+`capture.gap` naming an empty hole.
+
 The capture vocabulary written by M1 is:
 
 ```text
@@ -328,6 +335,21 @@ silence in the transcript that nothing explains. For `batch_write_failed`, the b
 removed along with the manifest it cannot be paired with, because a WAV with no manifest states no
 timeline and `RecoverFinalizedBatches` refuses it; if even that removal fails, the same event names
 the leftover artifact so it is not left silently on disk.
+
+M5 adds one event to the capture vocabulary:
+
+```text
+capture.timeline_unusable  the track's buffers cannot be placed on the session timeline by
+                           the device timing its stream reports, so the track ends instead
+                           of writing audio at an invented position. This is the
+                           unsupported-process-loopback case: a capture stream that
+                           supplies neither a usable device position nor a QPC timestamp
+                           (docs/ARCHITECTURE.md section 8.1). `detail` carries the reason
+                           and the baseline alternative. It is written once per track, and
+                           it is deliberately not a degradation of otherwise healthy
+                           audio: without it the unsupported environment would be
+                           indistinguishable from a track that recorded normally.
+```
 
 `session.repair.incomplete` is written by startup recovery and by `meetcap session repair`
 when the session's timeline still holds a provable gap after every repair that could be
@@ -412,6 +434,15 @@ root does not invalidate the index.
 `device_position_frames` and `qpc_position_ticks` are the device-timing anchors for the
 chunk's first frame. They are stored so a recorded timeline can be audited against what
 the device actually reported (`docs/ARCHITECTURE.md` section 8).
+
+A `device_position_frames` of `0` is not by itself a corrupt index row. A track placed by
+its declared QPC clock — Windows process loopback, which reports no device position of its
+own (`docs/ARCHITECTURE.md` section 8.1) — legitimately records `0` for every chunk while
+`qpc_position_ticks` carries the real anchor, so a reader must consult the chunk's
+`qpc_position_ticks` before treating a zero device position as missing provenance. The
+recovery gap audit and the recovery scanner derive their spans from the chunk's
+`start_ms` / `end_ms`, not from this column, so a QPC track's zeros do not affect gap
+detection or crash recovery (section 5.1).
 
 `sha256` stays `NULL` in M1: a chunk is validated by checking its header against its
 actual length, and content hashing is deferred until a milestone needs end-to-end
