@@ -31,6 +31,26 @@ public interface IAudioCaptureSource : IDisposable
     /// <summary>The device's native format for this session.</summary>
     AudioFormat Format { get; }
 
+    /// <summary>
+    /// Which device timing this source's packets can be placed by
+    /// (docs/ARCHITECTURE.md section 8.1).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The default is <see cref="CaptureClock.DevicePosition"/>, which is what WASAPI
+    /// microphone capture and system loopback report. A source declares
+    /// <see cref="CaptureClock.Qpc"/> only when the captured stream has no position of its
+    /// own, which is how Windows process loopback behaves: every buffer carries
+    /// <c>device_position_frames = 0</c> while the QPC timestamp advances.
+    /// </para>
+    /// <para>
+    /// The recording pipeline reads this from the same source that supplied
+    /// <see cref="Format"/>, so the timeline is placed by a clock the stream actually
+    /// provides. Nothing is inferred from the packet values afterwards.
+    /// </para>
+    /// </remarks>
+    CaptureClock Clock { get; }
+
     CaptureDeviceInfo Device { get; }
 
     /// <summary>

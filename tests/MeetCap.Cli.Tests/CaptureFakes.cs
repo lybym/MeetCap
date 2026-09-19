@@ -87,6 +87,12 @@ internal sealed class FakeCaptureSource : IAudioCaptureSource
 
     public AudioFormat Format { get; }
 
+    /// <summary>
+    /// This fake produces advancing device positions, so it declares the default clock
+    /// (docs/ARCHITECTURE.md section 8.1).
+    /// </summary>
+    public CaptureClock Clock => CaptureClock.DevicePosition;
+
     public CaptureDeviceInfo Device { get; }
 
     public event Action<AudioPacket>? PacketAvailable;

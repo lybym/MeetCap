@@ -26,6 +26,19 @@ public static class SessionEventNames
     public const string CaptureBufferOverflow = "capture.buffer_overflow";
     public const string CaptureConsumerStalled = "capture.consumer_stalled";
 
+    /// <summary>
+    /// The track's buffers cannot be placed on the session timeline by the device timing
+    /// its stream reports, so the track ends instead of writing audio at an invented
+    /// position (docs/ARCHITECTURE.md section 8.1, docs/RELIABILITY.md section 7).
+    /// </summary>
+    /// <remarks>
+    /// Written once per track, and only for the case no clock can serve: a capture stream
+    /// that reports neither a usable device position nor a QPC timestamp. Without it the
+    /// unsupported environment would degrade silently, which is the failure mode this
+    /// event exists to replace.
+    /// </remarks>
+    public const string CaptureTimelineUnusable = "capture.timeline_unusable";
+
     public const string StorageLowDiskSpace = "storage.low_disk_space";
     public const string StorageDiskExhausted = "storage.disk_exhausted";
     public const string StorageProbeFailed = "storage.probe_failed";

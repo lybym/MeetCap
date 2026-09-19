@@ -33,7 +33,8 @@ internal sealed class NAudioCaptureSource : IAudioCaptureSource
         AudioSource source,
         MMDevice device,
         CaptureDeviceInfo deviceInfo,
-        WasapiRecorder recorder)
+        WasapiRecorder recorder,
+        CaptureClock clock)
     {
         _device = device;
         _recorder = recorder;
@@ -44,6 +45,7 @@ internal sealed class NAudioCaptureSource : IAudioCaptureSource
 
         Source = source;
         Format = NAudioWaveFormatAdapter.ToAudioFormat(waveFormat, deviceInfo);
+        Clock = clock;
         Device = deviceInfo with
         {
             Id = string.IsNullOrWhiteSpace(recorder.DeviceId) ? deviceInfo.Id : recorder.DeviceId,
@@ -56,6 +58,8 @@ internal sealed class NAudioCaptureSource : IAudioCaptureSource
     public AudioSource Source { get; }
 
     public AudioFormat Format { get; }
+
+    public CaptureClock Clock { get; }
 
     public CaptureDeviceInfo Device { get; }
 
@@ -217,7 +221,7 @@ public sealed class NAudioCaptureSourceFactory : IAudioCaptureSourceFactory
                 .WithEventSync()
                 .Build();
 
-            return Wrap(AudioSource.Mic, mmDevice, device, recorder);
+            return Wrap(AudioSource.Mic, mmDevice, device, recorder, CaptureClock.DevicePosition);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -250,6 +254,14 @@ public sealed class NAudioCaptureSourceFactory : IAudioCaptureSourceFactory
     /// <c>DataAvailable</c> callback the microphone path already uses, so the loopback
     /// track reuses the same adapter and the same MeetCap-owned packet type. No NAudio
     /// type crosses the assembly boundary (docs/DEVELOPMENT.md section 4).
+    /// </para>
+    /// <para>
+    /// The two paths do <em>not</em> produce the same timing. System loopback reports the
+    /// render endpoint's stream position, so the track is placed by
+    /// <see cref="CaptureClock.DevicePosition"/>; process loopback reports no position of
+    /// its own and is placed by <see cref="CaptureClock.Qpc"/> instead
+    /// (docs/ARCHITECTURE.md section 8.1). The clock travels with the source so the
+    /// recording pipeline never has to infer it from the buffer values.
     /// </para>
     /// </remarks>
     public IAudioCaptureSource CreateLoopback(LoopbackCaptureRequest request)
@@ -295,7 +307,12 @@ public sealed class NAudioCaptureSourceFactory : IAudioCaptureSourceFactory
                 recorder = builder.WithLoopbackCapture().Build();
             }
 
-            return Wrap(AudioSource.Loopback, mmDevice, request.RenderDevice, recorder);
+            return Wrap(
+                AudioSource.Loopback,
+                mmDevice,
+                request.RenderDevice,
+                recorder,
+                LoopbackClock(request));
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -303,9 +320,36 @@ public sealed class NAudioCaptureSourceFactory : IAudioCaptureSourceFactory
             throw new DeviceUnavailableException(
                 $"Loopback capture could not be initialized for '{request.RenderDevice.DisplayName}'" +
                 (request.IsProcessLoopback ? $" (process='{request.ProcessName}')" : string.Empty) +
-                $": {ex.Message}",
+                $": {ex.Message}" +
+                (request.IsProcessLoopback
+                    ? " Process loopback needs a Windows/NAudio combination that supports it plus a" +
+                      " running target process; when this machine cannot provide it, the baseline" +
+                      " capture.online.loopback_mode = \"system\" still records the render endpoint's mix."
+                    : string.Empty),
                 ex);
         }
+    }
+
+    /// <summary>
+    /// Which capture clock a loopback request's stream can be placed by.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Process loopback captures a process tree rather than an endpoint's own stream, and the
+    /// audio engine reports a device position of 0 for every buffer in that case. The QPC
+    /// timestamp it does report is what places the track, so the session timeline stays
+    /// monotonic instead of flagging one backwards device position per buffer
+    /// (docs/ARCHITECTURE.md section 8.1).
+    /// </para>
+    /// <para>
+    /// The decision is a pure function of the request so it is covered by a test without
+    /// audio hardware; the COM-bound activation around it is not.
+    /// </para>
+    /// </remarks>
+    internal static CaptureClock LoopbackClock(LoopbackCaptureRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        return request.IsProcessLoopback ? CaptureClock.Qpc : CaptureClock.DevicePosition;
     }
 
     /// <summary>
@@ -348,9 +392,10 @@ public sealed class NAudioCaptureSourceFactory : IAudioCaptureSourceFactory
         AudioSource source,
         MMDevice mmDevice,
         CaptureDeviceInfo deviceInfo,
-        WasapiRecorder recorder)
+        WasapiRecorder recorder,
+        CaptureClock clock)
     {
-        var capture = new NAudioCaptureSource(source, mmDevice, deviceInfo, recorder);
+        var capture = new NAudioCaptureSource(source, mmDevice, deviceInfo, recorder, clock);
         capture.Attach();
         return capture;
     }

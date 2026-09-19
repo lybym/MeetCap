@@ -354,7 +354,7 @@ public sealed class RecordingSession : IDisposable
                 // format before capture starts. A source that cannot be created aborts the
                 // session before capture starts (online mode requires every track).
                 var source = track.CreateInitialSource();
-                track.Initialize(source.Format);
+                track.Initialize(source);
                 tracks.Add(track);
                 sources.Add(source);
             }
@@ -424,9 +424,14 @@ public sealed class RecordingSession : IDisposable
         var parts = tracks.Select(t =>
         {
             var format = t.Format;
+            // The clock is part of the session's opening record: it says which device
+            // timing each track's timeline is placed by, so a track placed by QPC because
+            // its stream has no position of its own is visible in the log rather than
+            // something a reader has to infer (docs/ARCHITECTURE.md section 8.1).
+            var clock = $" clock='{t.Clock.ToWireName()}'";
             return format is null
-                ? $"source='{t.Source.ToWireName()}' device='{t.Device.DisplayName}'"
-                : $"source='{t.Source.ToWireName()}' device='{t.Device.DisplayName}' format='{format}'";
+                ? $"source='{t.Source.ToWireName()}' device='{t.Device.DisplayName}'{clock}"
+                : $"source='{t.Source.ToWireName()}' device='{t.Device.DisplayName}'{clock} format='{format}'";
         });
         return "tracks: " + string.Join("; ", parts);
     }

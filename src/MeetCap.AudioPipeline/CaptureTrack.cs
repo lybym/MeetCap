@@ -83,6 +83,7 @@ internal sealed class CaptureTrack : IDisposable
     private EventHandler<CaptureStoppedEventArgs>? _stoppedHandler;
 
     private AudioFormat? _format;
+    private CaptureClock _captureClock = CaptureClock.DevicePosition;
     private CaptureTimeline? _timeline;
     private ChunkSpool? _spool;
     private Channel<AudioPacket>? _channel;
@@ -94,6 +95,7 @@ internal sealed class CaptureTrack : IDisposable
     private int _deviceRestarted;
     private int _flushRequested;
     private int _overflowSignalled;
+    private int _timelineUnusable;
     private int _announcedChunkSequence;
     private long _pendingGapMs;
     private long _stallObservedMs;
@@ -143,6 +145,12 @@ internal sealed class CaptureTrack : IDisposable
 
     public AudioFormat? Format => _format;
 
+    /// <summary>
+    /// Which device timing this track's timeline is placed by — the clock the capture
+    /// source declared (docs/ARCHITECTURE.md section 8.1).
+    /// </summary>
+    public CaptureClock Clock => _captureClock;
+
     public bool CaptureStarted => _captureStarted;
 
     public bool Degraded => _degraded || _storageFailure is not null;
@@ -188,14 +196,21 @@ internal sealed class CaptureTrack : IDisposable
 
     /// <summary>
     /// Initializes the per-track runtime — timeline, spool, bounded queue and backlog —
-    /// from the capture source's native format. Called once the source exists, before
-    /// capture starts.
+    /// from the capture source's native format and declared capture clock. Called once the
+    /// source exists, before capture starts.
     /// </summary>
-    public void Initialize(AudioFormat format)
+    public void Initialize(IAudioCaptureSource source)
     {
-        ArgumentNullException.ThrowIfNull(format);
+        ArgumentNullException.ThrowIfNull(source);
+
+        var format = source.Format;
         _format = format;
-        _timeline = new CaptureTimeline(format);
+
+        // The clock comes from the source that produced the format, so the timeline is
+        // placed by timing this stream actually reports rather than by a value inferred
+        // from the buffers (docs/ARCHITECTURE.md section 8.1).
+        _captureClock = source.Clock;
+        _timeline = new CaptureTimeline(format, _captureClock);
         _spool = new ChunkSpool(
             _paths,
             _source,
@@ -271,6 +286,15 @@ internal sealed class CaptureTrack : IDisposable
             {
                 // A stop request or a storage failure ended the session. This track is
                 // not degraded by a clean stop.
+                return;
+            }
+
+            if (_endReason is not null)
+            {
+                // The track ended for its own reason while its segment was being stopped
+                // (an unusable timeline), so this is not a device loss and there is nothing
+                // to recover. Returning without reporting one keeps the record honest.
+                CompleteWriter();
                 return;
             }
 
@@ -618,6 +642,43 @@ internal sealed class CaptureTrack : IDisposable
         Interlocked.CompareExchange(ref _endReason, reason, null);
     }
 
+    /// <summary>
+    /// Ends this track because its buffers cannot be placed on the session timeline by the
+    /// timing its stream reports.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is the unsupported-process-loopback outcome docs/ARCHITECTURE.md section 8.1
+    /// requires: one explicit, actionable statement and a track that ends, instead of a
+    /// track that keeps running while every buffer is quietly reported as a backwards
+    /// device position and the whole recording is written off as degraded
+    /// (docs/RELIABILITY.md section 7).
+    /// </para>
+    /// <para>
+    /// Only this track ends. The other track may still be recording, and the audio already
+    /// captured on this one stays durable because completing the writer lets the consumer
+    /// drain and close the open chunk exactly as a fatal device loss does.
+    /// </para>
+    /// </remarks>
+    private void EndUnusableTimeline(Exception error)
+    {
+        Interlocked.Exchange(ref _timelineUnusable, 1);
+        EndTrack("timeline_unusable");
+
+        _events.Write(new SessionEvent(SessionEventNames.CaptureTimelineUnusable, CurrentTimelineMs())
+        {
+            Source = _source.ToWireName(),
+            Detail = error.Message,
+        });
+
+        // Ends this capture segment deliberately: no further buffer from it can be placed,
+        // and the capture loop must not mistake this for a device loss and try to recover.
+        _segmentEnded?.TrySetResult();
+
+        // No more packets can be placed, so the consumer may finalize what it already has.
+        CompleteWriter();
+    }
+
     private async Task WaitForSegmentEndAsync(CancellationToken cancellationToken)
     {
         var ended = _segmentEnded!;
@@ -627,6 +688,14 @@ internal sealed class CaptureTrack : IDisposable
 
     private void OnPacketAvailable(AudioPacket packet)
     {
+        if (Volatile.Read(ref _timelineUnusable) == 1)
+        {
+            // The track has already ended because its buffers cannot be placed on the
+            // session timeline at all. Refusing the audio is stated once, by
+            // EndUnusableTimeline, rather than restated as one overflow per packet.
+            return;
+        }
+
         if (_channel!.Writer.TryWrite(packet))
         {
             _backlog!.RecordProduced();
@@ -699,6 +768,14 @@ internal sealed class CaptureTrack : IDisposable
 
     private void ProcessPacket(AudioPacket packet)
     {
+        if (Volatile.Read(ref _timelineUnusable) == 1)
+        {
+            // The track already ended on its first unplaceable buffer; the remaining
+            // buffered packets cannot be placed either and must not restate the same
+            // diagnostic once per packet.
+            return;
+        }
+
         var restarted = Interlocked.Exchange(ref _deviceRestarted, 0) == 1;
         var pendingGap = Interlocked.Exchange(ref _pendingGapMs, 0);
 
@@ -708,7 +785,21 @@ internal sealed class CaptureTrack : IDisposable
         }
 
         var wasFirstPacketOfSession = !_timeline!.HasOrigin;
-        var timing = _timeline.Observe(packet);
+
+        PacketTiming timing;
+        try
+        {
+            timing = _timeline.Observe(packet);
+        }
+        catch (CaptureFailedException ex)
+        {
+            // The track's declared clock cannot place this buffer at all, so there is no
+            // honest position to write it at (docs/RELIABILITY.md section 7). The track
+            // ends itself with one explicit diagnostic instead of degrading silently, and
+            // the other track keeps recording (docs/RELIABILITY.md section 8).
+            EndUnusableTimeline(ex);
+            return;
+        }
 
         if (timing.IsNewSegment)
         {
