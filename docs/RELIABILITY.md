@@ -97,7 +97,7 @@ network down
 
 This is normal operation, not a fatal session error.
 
-### 9.1 TOS transport failure semantics (target after issue #29)
+### 9.1 TOS transport failure semantics
 
 Large-file TOS staging belongs to the ASR/storage-transport failure domain. It never runs on the
 capture callback/thread and never weakens the local-audio invariant.

@@ -1,5 +1,13 @@
 # MeetCap
 
+## Optional large-file ASR transport
+
+For normalized WAV inputs larger than 20 MiB, configure `[asr.tos]` with a dedicated private
+bucket/prefix. MeetCap uses the official Volcengine TOS .NET SDK to stream the file, submits a
+six-hour presigned GET URL to Seed-ASR, and never stores the signed URL or credentials. Grant only
+`tos:PutObject`, `tos:GetObject`, and `tos:DeleteObject` on `meetcap-asr/*`; configure a three-day
+lifecycle expiration safety net for that prefix. MeetCap never changes bucket policy, IAM, or lifecycle rules.
+
 MeetCap is a Windows-resident CLI for **durable meeting audio capture, file-first ASR, speaker attribution, and continuously persisted transcripts**.
 
 The design deliberately prioritizes:

@@ -278,7 +278,7 @@ Because these labels are the default MVP diarization source, `speakers.enabled =
 anonymous speaker clusters exist for the identity pipeline to match unless a local diarization
 fallback is configured.
 
-## 8.1 TOS large-file ASR transport (target after issue #29)
+## 8.1 TOS large-file ASR transport
 
 TOS is optional infrastructure for oversized file-ASR inputs. It is not required for normal
 300-second live batches and does not replace the local session/audio artifact tree.

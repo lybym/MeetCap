@@ -61,7 +61,7 @@ Related official references:
 Implementation alignment landed with issue #26: the adapter sends only `X-Api-Key`, fixes
 `X-Api-Resource-Id` to `volc.seedasr.auc`, speaks the submit/query endpoints above with no
 tier routing, and retains the provider's `X-Tt-Logid` on the job row.
-Large-file TOS transport remains tracked by issue #29; until it lands, the implementation on
+Large-file TOS transport is implemented by issue #29; the implementation on
 `main` remains inline-Base64-only for file transport.
 
 ## 3. Default live-session algorithm

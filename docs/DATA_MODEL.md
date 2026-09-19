@@ -619,7 +619,7 @@ durable: that is a lost batch window, never lost audio.
 This adds no SQLite table and no migration: the batch's own mapping lives in the artifact beside
 it, and the job row already has the columns to point at it.
 
-### 6.2 TOS large-file transport state (target after issue #29)
+### 6.2 TOS large-file transport state
 
 Issue #29 requires a new numbered migration rather than rewriting the existing `0003_asr_jobs`
 migration. The durable job row must gain enough non-secret state to recover a TOS-backed
