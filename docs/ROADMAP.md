@@ -697,11 +697,11 @@ Do not introduce Python/PyTorch into the default Windows runtime merely to dupli
 
 The first MVP release requires M0 through M6.
 
-As of release 0.2.0, M0 through M6 are implemented and automatically covered. The
+As of release 0.3.0, M0 through M6 are implemented and automatically covered. The
 real-hardware validation checklist in `docs/M1_WINDOWS_VALIDATION.md` (status: not yet run)
 gates end-to-end verification, not implementation; milestones are therefore described as
 *implemented and automatically covered*, not *verified end to end*
-(`docs/DEVELOPMENT.md` section 7). Release 0.2.0 adds no milestone completion.
+(`docs/DEVELOPMENT.md` section 7). Release 0.3.0 adds no milestone completion.
 
 P0 issue #26 (Seed-ASR 2.0 + `X-Api-Key`-only provider contract) has landed, so the Volcengine
 provider is production-aligned with the current official interface at the implementation level.
@@ -711,6 +711,12 @@ P1 issue #29 is a post-MVP large-file transport enhancement. It MUST NOT become 
 for ordinary 300-second live batches or block the M0-M6 release gate. It merged to `main` by
 PR #31 and ships in release 0.2.0 without changing the M0-M6 gate: the required manual real-TOS
 plus real-Seed-ASR smoke test is still **not run** (`docs/M1_WINDOWS_VALIDATION.md` section 15).
+
+Issues #33 (process-loopback timeline placed by the capture clock its source declares) and #34
+(capture recovery window and terminal-outage accounting) are the two bugfixes release 0.3.0 ships.
+Both sit inside M5's already-declared scope and complete no milestone: issue #34's real-Bluetooth
+criterion is **not run**, and only two of section 13.5's process-loopback rows were run on real
+hardware (`docs/M1_WINDOWS_VALIDATION.md` sections 14.1 and 16).
 
 M7 may partially land before the release but MUST NOT delay core reliability unless it fixes real transcription quality.
 

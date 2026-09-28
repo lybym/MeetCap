@@ -531,10 +531,11 @@ target may legally be silent for seconds or minutes in the middle of a meeting, 
 whole-span rule is free of that false positive.
 
 Evidence for the shape this detects, and for what it does not fix, is kept in
-`docs/M1_WINDOWS_VALIDATION.md` section 14.2 (the rc.1 run that recorded digital silence; on this
-branch that record lives in the release branch's copy of the document, PR #37) and section 14.3
-(the re-validation of the same target class outside the confined acceptance session, where the
-same reproducer binary recorded non-zero content). Automated coverage:
+`docs/M1_WINDOWS_VALIDATION.md` section 14.2 (the rc.1 run that recorded digital silence; that
+record belongs to the `0.3.0-rc.1` provenance and is present in the release branch's copy of the
+document, PR #37, not on `main`) and section 14.3 (the re-validation of the same target class
+outside the confined acceptance session, where the same reproducer binary recorded non-zero
+content). Automated coverage:
 `tests/MeetCap.Core.Tests/AudioContentStatsTests.cs` for the counters (including the non-finite
 samples), `tests/MeetCap.AudioPipeline.Tests/ProcessLoopbackSilenceTests.cs` for the verdicts,
 their scope and the content path into the recorded WAV, and

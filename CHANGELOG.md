@@ -12,7 +12,22 @@ manual checklist in `docs/M1_WINDOWS_VALIDATION.md` has been run on real hardwar
 milestones are described as the former, never the latter
 (`docs/DEVELOPMENT.md` section 7).
 
-## [Unreleased]
+## [0.3.0] - 2026-09-27
+
+The third MVP-track release. It fixes three capture defects on top of 0.2.0: Windows process
+loopback was placed by a device position its stream never reports, capture recovery after an
+endpoint disappeared and returned was a hard-coded three one-second budget that also discarded the
+outage it had measured, and a process-loopback track that captured no audio at all was reported as
+a healthy, completed session — so the release now records what each track's samples contained and
+states that failure instead of hiding it. No milestone becomes newly complete in this release: M0
+through M6 remain *implemented and automatically covered*, not *verified end to end*, and the MVP
+umbrella issue ([#1](https://github.com/lybym/MeetCap/issues/1)) and the architecture-baseline
+issue ([#9](https://github.com/lybym/MeetCap/issues/9)) remain OPEN by design.
+
+There is no database migration in this release. Migrations `0001` through `0006` are unchanged,
+`track_health` in `session.json` and the `events.jsonl` vocabulary are extended by values rather
+than columns, and `capture.device_recovery_seconds` is an additive configuration key, so an
+existing `config.toml` and an existing data root are upgraded with no manual step.
 
 ### Fixed
 

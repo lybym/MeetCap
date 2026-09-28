@@ -612,10 +612,9 @@ changed the outcome:
 
 The conclusion recorded for the release is therefore about *visibility*, not about a wrapper
 swap: process-loopback content is the only honest health signal for this path, so the counters
-and the verdict above are the product's answer, and
-`docs/M1_WINDOWS_VALIDATION.md` section 14.3 keeps both runs as provenance — the rc.1 acceptance
-record it re-validates is that document's section 14.2 on `release/v0.3.0` (PR #37), which main
-does not yet carry.
+and the verdict above are the product's answer, and `docs/M1_WINDOWS_VALIDATION.md` keeps both runs
+as provenance: section 14.2 is the rc.1 acceptance record on `release/v0.3.0` (PR #37, which `main`
+does not yet carry) and section 14.3 re-validates it there and on `main`.
 
 ---
 
