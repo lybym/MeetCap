@@ -13,8 +13,12 @@ automatically covered*, not as *verified*.
 
 One exception is recorded, and it is not a completed checklist: two of the section 13.5
 process-loopback timeline rows were run on real hardware on 2026-09-19 against the
-Issue #33 fixed build and passed (section 14.1). Everything else in this document,
-including the other section 13.5 rows, remains unrun.
+Issue #33 fixed build and passed (section 14.1). A second real-hardware acceptance pass,
+against the published `v0.3.0-rc.1` release artifact on 2026-09-28, is recorded in
+sections 14.2 and 16.3: it verifies the section 16.2 Bluetooth recovery and fatal-side rows
+and the section 13.5 negative rows, and it **fails** the section 13.5 content row — the
+process-loopback track records digital silence while the target plays (issue #38).
+Everything else in this document remains unrun.
 
 Section 10 holds the same kind of checklist for the M2 additions from Issue #4 (bounded
 buffer accounting, explicit gap reporting, `meetcap session repair`).
@@ -549,6 +553,12 @@ meetcap start "M5 process loopback" --mode online
 > Every other row here, and every row in the rest of section 13, is still unrun: those need a real
 > meeting application and endpoint changes this run did not perform. The full record, including what
 > was and was not covered, is in section 14.1.
+>
+> **Acceptance run against `v0.3.0-rc.1` (2026-09-28, section 14.2).** The negative rows and both
+> timeline rows were re-run against the published RC artifact; the content row **failed**: the
+> process-loopback track records digital silence on the acceptance machine while the target plays
+> (issue #38), so the real-drop row could not be exercised either. No checkbox below is ticked; the
+> per-row result is pinned in section 14.2.
 
 - [ ] On a supported Windows/NAudio environment, only the named meeting application's audio
       appears on the loopback track; other system audio does not.
@@ -610,10 +620,10 @@ on one job primary key.
 
 | Scenario | Result | Notes |
 | --- | --- | --- |
-| 1. 2-hour soak | | |
+| 1. 2-hour soak | **partial** (4.7 min healthy; section 14.2) | full 2 h not run; 2026-09-28, rc.1 artifact |
 | 2. Default-device change | | |
 | 3. Unplug / replug | | |
-| 4. Forced kill | | |
+| 4. Forced kill | **PASS** (section 14.2) | hashes identical, `.part` repaired readable, idempotent, live-status safe; 2026-09-28 |
 | 5. Low disk space | | |
 | 6. Timing metadata | | |
 | 10.1 M2 buffer accounting | | |
@@ -627,11 +637,11 @@ on one job primary key.
 | 12.6 M4 provider rejection | | |
 | 12.7 M4 artifact footprint | | |
 | 12.8 Seed-ASR 2.0 real smoke test | | |
-| 13.1 M5 system loopback | | |
+| 13.1 M5 system loopback | **PASS** (synthetic tone source, not a meeting app; section 14.2) | rc.1 artifact, 2026-09-28 |
 | 13.2 M5 overlapping speech | | |
 | 13.3 M5 one track degrades | | |
 | 13.4 M5 headphones vs speakers | | |
-| 13.5 M5 process loopback | **partial** (2 of 7 rows; section 14.1) | timeline rows passed 2026-09-19; rest unrun |
+| 13.5 M5 process loopback | **FAIL** (content row; sections 14.1–14.2, issue #38) | timeline/negative rows pass 2026-09-19 + 2026-09-28; loopback track delivers digital silence |
 | 13.6 M5 two sessions, one data root | | |
 | 15.1 #29 config redaction | | |
 | 15.2 #29 oversized input over TOS | | |
@@ -639,8 +649,8 @@ on one job primary key.
 | 15.4 #29 cleanup failure semantics | | |
 | 15.5 #29 TOS outage isolation | | |
 | 15.6 #29 20 MiB boundary | | |
-| 16.2 #34 Bluetooth reconnect recovers | **NOT RUN** (no Bluetooth audio endpoint; section 16.1) | automated coverage only |
-| 16.2 #34 unrecovered outage is a gap | **NOT RUN** (no Bluetooth audio endpoint; section 16.1) | automated coverage only |
+| 16.2 #34 Bluetooth reconnect recovers | **partial** (section 16.3) | recovery + gap accounting verified on real headset 2026-09-28; loopback track recorded no audio after its restore |
+| 16.2 #34 unrecovered outage is a gap | **PASS** (section 16.3) | `device_lost_fatal` + `capture.gap not_captured` + non-zero `gap_count` verified 2026-09-28 |
 
 M1, M2 and M4 may be described as verified on real hardware only when every row above is filled
 in and passing, or when the residual failure is written down here as a known limitation. The M4
@@ -716,6 +726,78 @@ Additional facts recorded, because they are what the fix's residual risk was abo
 No section 13.5 checkbox was ticked by this run: the rows are still `- [ ]` above, because the run
 covered some of what they ask and not the rest, and a ticked box would claim the whole row. The
 per-row result is pinned here instead.
+
+### 14.2 v0.3.0-rc.1 process-loopback and system-loopback rows — acceptance run, 2026-09-28
+
+Run against the **published RC artifact** (not a source build), as part of the v0.3.0-rc.1 stable
+release acceptance. All sessions used an out-of-tree data root, retained with the rest of the
+acceptance evidence.
+
+Environment (section 1 fields):
+
+| Field | Value |
+| --- | --- |
+| Date | 2026-09-28 |
+| Tester | coding agent, unattended session (DSH `session-7eeb9e88`) |
+| Windows version / build | Windows 11 Home, build 26200 (10.0.26200), AMD64 |
+| MeetCap artifact | GitHub Release `v0.3.0-rc.1` zip, SHA256 `522fa569cc946a9bcd69af842e8f39817ea6a69816bcf20bff550e6e8681b858`; `meetcap --version` = `0.3.0+677ae2cde62fd07fb3b5f77e702e64ab36d84a63` |
+| Machine | DESKTOP-2H6MG5P |
+| Microphone | `麦克风阵列 (Realtek(R) Audio)`, `{0.0.1.00000000}.{c3842cfa-9574-418e-8c47-18da833f7eab}` |
+| Render endpoint | `扬声器 (Realtek(R) Audio)`, `{0.0.0.00000000}.{97aa8bbe-5462-4856-916e-4ee6569b8d1e}` |
+| `capture.chunk_seconds` | 30 |
+| Target process | Microsoft Edge (temp profile) looping a generated 440 Hz 48 kHz stereo sine WAV; the tone's presence on the endpoint was verified by a system-loopback control in the same minutes (RMS −7.13 dB) at locked master volume |
+
+Method note: `capture.online.process_name = "msedge"`. The 2026-09-19 run used `ffplay`; on this
+date a machine-local security policy hides non-store-signed executables (`ffplay`, `python`) from
+the process enumeration performed by unsigned applications, so the doc's own
+meeting-application-shaped target (`msedge`) was substituted. That constraint is machine-local and
+is not claimed as product behavior.
+
+Per-row results (the section 13.5 rows):
+
+| Row | Result |
+| --- | --- |
+| Stable process audio does not mark the loopback track degraded (`degraded: false`, `gap_count: 0`, no `end_reason`, no per-buffer `capture.discontinuity`) | **PASS on timing, vacuous on content.** Every process-loopback session completes cleanly: `degraded: false`, `gap_count: 0`, `gap_total_ms: 0`, no `end_reason`, `session.started` declares `clock='qpc'` for the loopback track, and the only `capture.discontinuity` in each session is the microphone's first-buffer stream flag. The QPC timeline is exact: consecutive chunk anchors differ by exactly 3,000,000 ticks per 30 s chunk. But the track's audio is **digital silence** (issue #38), so the row's intent — "its audio is fine" — is not met. |
+| The loopback track's chunks cover the same session span as the microphone track's | **PASS on timing, vacuous on content.** Chunk index `0→30000→48000` identical to the microphone's; WAVs decode to 30.000 s + 18.000 s = 48.000 s = `session.stopped` `end_ms`. Content is silence (issue #38). |
+| Only the named meeting application's audio appears on the loopback track | **FAIL.** The track carries no audio at all — the named application's audio is absent (issue #38). For the record, no out-of-tree audio leaked either: an 880 Hz control tone from a separate process, verified present on the endpoint, was never captured by any process-loopback run. |
+| Process loopback does not create a new meeting mode | **PASS.** Same `--mode online` session; `config_snapshot.online.loopback_mode = "process"`. |
+| An invalid `capture.online.loopback_mode` value fails before any session is created | **PASS.** `loopback_mode = "bogus"` → exit 1, actionable message naming the allowed values, and no new session directory. |
+| Target process not running → exit 1 with the actionable reason, session left `INTERRUPTED` | **PASS.** With no `msedge` running: exit 1, actionable stderr naming the target and the `system` fallback, session `INTERRUPTED` with `end_reason: capture_start_failed` and an empty `audio/loopback/`. |
+| Unsupported Windows/NAudio combination fails actionably, not silently | **NOT EXERCISABLE on this machine — and that is the defect.** The activation succeeds here, so the actionable path never fires; instead the track silently records zeros (issue #38). |
+| A real drop stays observable: one `capture.gap` with the missing milliseconds, track degraded | **BLOCKED by issue #38.** The silent stream keeps delivering packets even when the target process tree is killed, so no packet-level gap can arise; content-level drops cannot be detected on a track that never had content. |
+
+**Finding recorded as [issue #38](https://github.com/lybym/MeetCap/issues/38):** the
+process-loopback track records digital silence while the target plays. The issue contains a
+minimal NAudio 3.1.0 reproducer (no MeetCap code): the `WasapiRecorderBuilder.WithProcessLoopback`
+stream delivers packets at the normal 10 ms cadence with an advancing QPC and `peakAbsSample = 0`
+across every candidate process root, while a system-loopback control over the same endpoint
+captures the same playback at −3.1 dB to −7.1 dB at locked master volume. MeetCap's call shape
+matches the documented builder API; the defect sits in the NAudio wrapper or the Windows 26200
+audio engine, and the failure is fully silent at the product level.
+
+Section 13.1 (system-loopback baseline) was exercised in the same pass and **passed**:
+`PLS_system_loopback_baseline` and two further control sessions record `mode: online`, both
+tracks, independent `audio/mic/` and `audio/loopback/` chunk trees, per-source chunk events, both
+`track_health` entries non-degraded on a clean stop, start exit 0 with per-track lines, and the
+loopback track carries the played tone (RMS −11.18 dB). The source was a synthetic tone, not a
+real meeting application; sections 13.2, 13.4 and 13.6 remain unrun.
+
+Two M1/M2 mechanical rows were exercised in the same pass against the same artifact:
+
+- **Scenario 1, offline soak — partial (4.7 min of the required 2 h).**
+  `ses_20260928T072149Z_4abf724b`, offline on the Realtek mic array, 48 kHz float:
+  `COMPLETED`, `degraded: false`, `gap_count: 0`, 19 contiguous chunks `0→281720 ms` with no
+  `capture.gap` / `capture.buffer_overflow` / `capture.device_lost` events and no `.part` left
+  behind; only the microphone's first-buffer stream-flag discontinuity appears. The 2-hour
+  duration was not run, so the row stays partial.
+- **Scenario 4, forced kill — PASS.** `ses_20260928T072751Z_5c853b64`: three chunks closed and
+  hashed, the process was killed (its own PID, `Stop-Process -Force`), a `000004.wav.part` was
+  left; `meetcap status` reported the incomplete session and repaired the chunk; the three
+  closed chunks hash **identically** before and after; the repaired `000004.wav` decodes
+  (ffprobe, 4.762 s); `session.json` is `INTERRUPTED` with `recovered_at` set; a second `status`
+  reports nothing further (idempotent). The live-recording half also passed: `meetcap status`
+  during a running session reports the active session, finds nothing to recover, writes no
+  `session.recovered`/`audio.chunk.corrupt` events, and the session stops cleanly afterwards.
 
 ---
 
@@ -900,5 +982,48 @@ A second run with the headset left switched off until the window expires checks 
 - [ ] `session.json` reports that outage in `gap_count` / `gap_total_ms` rather than `0`
       (this is the reporting the issue observed as broken).
 - [ ] The track's already-captured audio is durable as a closed `.wav` with no `.part` left.
+
+### 16.3 v0.3.0-rc.1 Bluetooth reconnect rows — acceptance run, 2026-09-28
+
+Run against the **published RC artifact** on the section 14.2 machine, with a real Bluetooth
+endpoint this time: a Sony **WF-1000XM5** whose endpoint ids are exactly the ones section 16.2's
+example config names (`{0.0.1.00000000}.{e285b8cf-...}` capture, `{0.0.0.00000000}.{97644e66-...}`
+render). Both tracks were pinned to the headset per section 16.2, `chunk_seconds = 15`, ASR and
+speakers disabled, a tone playing through the headset to keep the A2DP stream alive. All sessions
+used the out-of-tree data root, retained.
+
+Disconnect/reconnect mechanism: PnP-disable of the `BTHENUM\DEV_88C9E8FD1ECC` device node **plus**
+its A2DP MEDIA devnode and the `BTHHFENUM` Hands-Free audio devnode, then PnP-enable. Verified
+first: disabling only the `BTHENUM` device node does **not** remove the audio endpoints (the first
+attempted run, `BT1_recover_default20`, saw no device loss at all and is discarded as a method
+failure, not a product result). The Windows-side times of each disable/enable are retained in the
+acceptance log.
+
+Runs:
+
+| Run | `device_recovery_seconds` | Outage | Result |
+| --- | --- | --- | --- |
+| BT-2 recovery | default (config snapshot records `20`) | ~10 s disabled + ~7 s re-enumeration | `capture.device_lost` and `capture.device_restored` on **both** tracks; loopback `gap_ms = 17111` (matches the real outage), mic `gap_ms = 1008`; a `capture.gap` was placed for each (mic placed by the next buffer, `reason = "the device skipped audio between buffers"`; loopback terminal, `reason = "not_captured"`); `meetcap start` summary reports `audio gaps: 2 (18119 ms missing)`; session `COMPLETED` with `end_reason: stop_requested` — **no** `device_lost_fatal`. The mic resumed with new chunks after its restore (28.5 s–46.6 s). Observation recorded honestly: the loopback track captured no audio after its `device_restored` — its only chunk ends exactly at the loss moment. |
+| BT-3 unrecovered | default (20) | disabled, never reconnected; stop issued after the window expired | `capture.device_lost_fatal` written once for the loopback track ("could not be recovered; the track is ending and its final chunk is closed and durable"); `capture.gap` with `reason = "not_captured"`, `gap_ms = 20124`, "the capture device did not return within the recovery window"; summary reports `audio gaps: 1 (20124 ms missing)` — **`gap_count` is not 0**, which is exactly the reporting the issue observed as broken. The mic track (whose HFP endpoint survived this disable) kept recording the whole session, demonstrating that one track's unrecoverable loss ends only that track; the session itself stays alive until stopped and completes `COMPLETED`. |
+| BT-4 explicit non-default window | `10` (config snapshot records `10`) | ~16 s (disable latency exceeded the plan) | outage longer than the window → `device_lost_fatal` at window expiry + `capture.gap not_captured gap_ms = 10071`. Together with BT-2 (a ~17 s outage recovered under the 20 s default) this shows the non-default value is honored in both directions. |
+| BT-5 stop inside the window | attempted with 60 | — | dedicated run not achieved: endpoint re-registration latency repeatedly pushed the stop past the window. The shape-(b) terminal event ("the recording was stopped while this track was still recovering its capture device, with recovery time left in its window") was however produced, with the exact documented language, by BT-2's loopback track. |
+
+Reopened-endpoint format change: **NOT RUN.** No `capture.format_changed` event occurred in any
+run, and no stable way to manufacture the A2DP/HFP format switch was found; per the rules above
+this is recorded as not run, not as passed.
+
+Honest caveats. (1) The disconnect is a software PnP disable, not a physical headset power-off; it
+removes the same endpoints Windows removes on hardware disconnect, but it is not literally the
+manual gesture. (2) The HFP (capture) endpoint survived some disable windows — Windows kept the
+active session alive — so the "the other track kept recording" evidence in BT-3 comes from that
+survival rather than from a second, separate healthy device. (3) The automated
+`DeviceRecoveryWindowTests` suite remains the only coverage for the attempt-budget derivation and
+window edge cases these runs cannot reach.
+
+Checklist status: no §16.2 checkbox is ticked. Block 1's row "each track resumed with a new WAV
+chunk after the restore, so both tracks wrote audio on both sides" did not fully pass (the
+loopback track wrote nothing after its restore), so the block is left unticked with the per-row
+evidence pinned here; block 2's three rows are fully evidenced by BT-3 and are marked **PASS** in
+the section 14 table.
 
 ---
