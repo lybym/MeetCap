@@ -474,3 +474,69 @@ Known limits of this milestone, stated rather than implied:
   picked up by the microphone and again by the loopback); the merger preserves both rather than
   deleting either, and marking probable echo duplicates is left to a later milestone
   (docs/ARCHITECTURE.md section 16 step 6).
+
+## 17. Silent capture detection
+
+Section 7 makes missing *time* explicit. Issue #38 exposed the other half of the same invariant:
+missing *content*. A process-loopback stream activated, delivered packets at the normal cadence,
+advanced a QPC timestamp, reported no discontinuity and no gap — and every sample in it was
+digital zero. Every check the session had passed; the recording was empty; the stop summary said
+`healthy` and `COMPLETED` (docs/M1_WINDOWS_VALIDATION.md section 14.2). Section 1 says the
+recording is never lost, and a session that reports success while delivering nothing is the
+failure that rule exists to prevent, so this is now detected rather than inferred.
+
+What is recorded, on every track and in every mode:
+
+- the consumer thread counts each packet's payload as it writes it: `total_samples`,
+  `non_zero_samples` and `peak_abs_sample` (normalized to full scale), in the exact bytes that
+  become the WAV, so the numbers describe the artifact;
+- `session.json` carries them as `track_health[].audio_content`, which makes "the track is not
+  empty" a fact of the durable record rather than something a reader has to decode audio to check.
+  A sample counts as content only when it is a finite non-zero value: `-0.0f` counts as zero, and
+  `NaN` / `±Infinity` — the samples a broken tap can hand over — are counted in the total but never
+  as content and never as the peak. That last part is not cosmetic: a non-finite peak cannot be
+  written to JSON at all, so letting one through would abort the session's finalization
+  (issue #38 review, finding B1). `all_silent` is true only when the track had samples and none of
+  them held decodable content.
+
+What is *concluded* from them, and when:
+
+- a **process-loopback** track that carried samples and never carried a single decodable non-zero
+  sample is marked degraded with `degraded_reason = "silent_process_loopback"`, writes exactly one
+  `capture.silent_track` event, and is printed by the stop summary with the counts and the two
+  possible explanations: the target process rendered no audio during the session, or process
+  loopback did not deliver the target tree's audio while it was playing. The reader is told which
+  check to make and the `capture.online.loopback_mode = "system"` alternative;
+- a **process-loopback** track that started capturing and then delivered no samples at all is
+  marked degraded with `degraded_reason = "empty_process_loopback"` and the same event, whose
+  wording says that no samples reached the track — a stream that produced nothing is a capture-path
+  failure rather than a quiet target. Without this, such a track would be a completed, healthy,
+  empty file: zero chunks, zero bytes, `degraded: false`;
+- the system-loopback baseline and the microphone are **not** flagged, in either shape. An
+  all-zero system-loopback track is what a quiet render endpoint sounds like, an all-zero
+  microphone track is what an empty room sounds like, and their empty case is already the subject
+  of the gap and device-loss accounting; flagging either would trade issue #33's healthy-baseline
+  guarantee for a warning that is usually wrong. Their counters are still recorded, so the quiet
+  span is visible without being called a failure;
+- a track that already ended for its own reason (device loss, format change) keeps that reason.
+  The silence is not restated on top of it, because the reader already has a precise failure, and a
+  track whose capture never started is already the session's `capture_start_failed`; the counters
+  are recorded in every one of those cases.
+
+The verdict is a degradation, never a fatal end. A target application that renders nothing is
+indistinguishable at the capture boundary from a backend that delivers nothing, so the session
+still completes, the chunks stay closed and indexed, and the timeline is untouched: what changes
+is that the empty recording is *stated*. No silence detector based on a time window is used — a
+target may legally be silent for seconds or minutes in the middle of a meeting, and only the
+whole-span rule is free of that false positive.
+
+Evidence for the shape this detects, and for what it does not fix, is kept in
+`docs/M1_WINDOWS_VALIDATION.md` section 14.2 (the rc.1 run that recorded digital silence; on this
+branch that record lives in the release branch's copy of the document, PR #37) and section 14.3
+(the re-validation of the same target class outside the confined acceptance session, where the
+same reproducer binary recorded non-zero content). Automated coverage:
+`tests/MeetCap.Core.Tests/AudioContentStatsTests.cs` for the counters (including the non-finite
+samples), `tests/MeetCap.AudioPipeline.Tests/ProcessLoopbackSilenceTests.cs` for the verdicts,
+their scope and the content path into the recorded WAV, and
+`tests/MeetCap.AudioPipeline.Tests/ProcessLoopbackTimelineTests.cs` for the issue #33 timeline
+guarantee that this detection must not disturb.

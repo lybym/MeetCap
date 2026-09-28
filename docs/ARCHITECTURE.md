@@ -551,6 +551,72 @@ is a time, so the process-loopback timeline is resolved to the millisecond rathe
 the exact frame, and a Windows/NAudio combination whose process loopback supplies no QPC
 timestamp at all remains unsupported by design (it ends the track loudly, as above).
 
+#### Audio-content telemetry and the silent-track verdict (process loopback)
+
+Timing is only half of what a track can get wrong. Issue #38 recorded the other half: a
+process-loopback stream that activated, delivered packets at the normal 10 ms cadence, advanced
+a QPC timestamp, reported `device_position_frames = 0`, produced no `capture.discontinuity` and
+no `capture.gap` — and whose every sample was digital zero. Every timing-based check passed, the
+session ended `COMPLETED` and `degraded: false`, and the recording was empty. Timing cannot see
+that failure, so MeetCap now also records what a track's samples *contained*:
+
+- the consumer thread counts each packet's payload as it writes it to the chunk (the same bytes
+  that become the artifact, never a parallel copy): total samples, non-zero samples, and the
+  peak absolute sample normalized to full scale, so PCM and IEEE-float tracks are comparable
+  (`MeetCap.Core.Capture.AudioContentAccumulator`). Only finite non-zero values count as content:
+  `-0.0f` is silence, and `NaN` / `±Infinity` are counted but never content and never the peak,
+  because a non-finite peak cannot be written to JSON at all and would abort finalization;
+- the counters are written per track to `session.json` as
+  `track_health[].audio_content = { peak_abs_sample, non_zero_samples, total_samples, all_silent }`,
+  which is the durable evidence a validation run checks instead of decoding the WAV;
+- at the end of a track, a **process-loopback** track whose whole span held no decodable content is
+  marked degraded with one `capture.silent_track` event and one of two reasons:
+  `degraded_reason = "silent_process_loopback"` when it carried samples and not one of them was
+  non-zero, or `degraded_reason = "empty_process_loopback"` when it started and delivered no
+  samples at all — the shape that would otherwise be a completed, healthy, empty file. The stop
+  summary prints the counts and the candidate explanations (the target rendered nothing, or process
+  loopback did not deliver the target tree's audio) plus the `loopback_mode = "system"` alternative.
+
+The verdict is deliberately scoped and deliberately not fatal. It does not fire for the baseline
+system-loopback track, where an all-zero span is what a quiet render endpoint sounds like, nor for
+the microphone, where it is what an empty room sounds like — issue #33's guarantee that stable
+system-loopback audio stays healthy is not traded away for this detection. A target application
+that simply never rendered audio produces exactly the same all-zero stream as a failed tap, so
+the outcome is a visible degradation and an explicit reason rather than a failure: the session
+still completes, and the audio, chunks and timeline are untouched. A track that already ended for
+its own reason (device loss, format change) keeps that reason instead of being restated as silent
+(docs/RELIABILITY.md section 17).
+
+The scan maintains the capture-thread rule of section 7: it runs on the consumer, never in the
+audio callback, and nothing is converted, resampled or written by it.
+
+**What the issue #38 investigation established.** The evidence did not implicate NAudio's
+process-loopback wrapper or the Windows 26200 audio engine, and replacing NAudio would not have
+changed the outcome:
+
+- NAudio 3.1.0's activation path matches the documented contract (the
+  `AUDIOCLIENT_ACTIVATION_PARAMS` / `VT_BLOB` `PROPVARIANT` shape, `ActivateAudioInterfaceAsync`,
+  the `VAD\Process_Loopback` interface path, `LOOPBACK | EVENTCALLBACK`, and the
+  `IAudioCaptureClient` slots), and its process-loopback stream captured non-zero content on the
+  same machine and OS build for every target it could be pointed at — including `msedge`'s
+  `audio.mojom.AudioService` utility process, captured through Chromium's own render path;
+- a MeetCap-owned raw-WASAPI probe (no NAudio, raw vtable calls because the activated objects on
+  this build reject `QueryInterface` for their own IIDs) reproduced the same
+  `device_position_frames = 0` / advancing-QPC shape and captured the same non-zero content, so a
+  MeetCap-owned process-loopback backend would have walked the identical engine path;
+- the same `v0.3.0-rc.1` reproducer binary that recorded `peakAbsSample = 0` on 2026-09-28
+  recorded `peakAbsSample = 0.76` for a tone-playing `msedge` tree later the same day, on the
+  same machine with no reboot, outside the confined agent session the acceptance run was executed
+  in. Inside that session the confinement was directly observable: Chromium could not start at
+  all (its IPC channel creation was denied), along with every other process-and-pipe operation.
+
+The conclusion recorded for the release is therefore about *visibility*, not about a wrapper
+swap: process-loopback content is the only honest health signal for this path, so the counters
+and the verdict above are the product's answer, and
+`docs/M1_WINDOWS_VALIDATION.md` section 14.3 keeps both runs as provenance — the rc.1 acceptance
+record it re-validates is that document's section 14.2 on `release/v0.3.0` (PR #37), which main
+does not yet carry.
+
 ---
 
 ## 9. Durable audio spool
