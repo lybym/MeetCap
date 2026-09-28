@@ -553,8 +553,9 @@ meetcap start "M5 process loopback" --mode online
 > **Issue #38 note.** The timeline rows above can pass on a track that carries no audio at all, so
 > they are no longer accepted on their own: the content rows below are the ones that decide whether
 > process loopback works, and `session.json` now carries the counters they are read from. The
-> acceptance run that exposed this (rc.1, digital silence) and the re-validation that followed it
-> are recorded as sections 14.2 and 14.3.
+> acceptance run that exposed this (rc.1, digital silence) is recorded as section 14.2 of the
+> release branch's copy of this document (PR #37; main does not carry it yet), and the
+> re-validation that followed is section 14.3 here.
 
 - [ ] On a supported Windows/NAudio environment, only the named meeting application's audio
       appears on the loopback track; other system audio does not.
@@ -566,14 +567,16 @@ meetcap start "M5 process loopback" --mode online
       (Get-Content <data-root>\sessions\<id>\session.json | ConvertFrom-Json).track_health
       # expect loopback: audio_content.all_silent = false, non_zero_samples > 0
       ```
-- [ ] **A process-loopback track that carried only digital zeros is reported, not hidden.** If the
+- [ ] **A process-loopback track that carried no decodable content is reported, not hidden.** If the
       target renders nothing for the whole session, the track is `degraded` with
       `degraded_reason: "silent_process_loopback"`, `events.jsonl` carries exactly one
       `capture.silent_track` for it, and the stop summary prints the counts and the alternative
-      `loopback_mode = "system"`. The session still `COMPLETED` and the track's chunks are still
-      closed and indexed — silence is stated, never fatal, and never a silent `healthy` summary
-      (docs/RELIABILITY.md section 17). The baseline system-loopback and microphone tracks are not
-      flagged by this rule, because all-zero audio there is legitimate.
+      `loopback_mode = "system"`. A track that received no samples at all is the same report with
+      `degraded_reason: "empty_process_loopback"`. In both cases the session still `COMPLETED` and
+      the track's chunks (if any) are still closed and indexed — the missing content is stated,
+      never fatal, and never a silent `healthy` summary (docs/RELIABILITY.md section 17). The
+      baseline system-loopback and microphone tracks are not flagged by this rule, because all-zero
+      audio there is legitimate.
 - [ ] Process loopback does not create a new meeting mode — it is the same `online` session,
       just a different `loopback_mode`.
 - [ ] An invalid `capture.online.loopback_mode` value fails `meetcap start` before any
@@ -653,7 +656,7 @@ on one job primary key.
 | 13.2 M5 overlapping speech | | |
 | 13.3 M5 one track degrades | | |
 | 13.4 M5 headphones vs speakers | | |
-| 13.5 M5 process loopback | **partial** (2 of 7 rows; sections 14.1 and 14.3) | timeline rows passed 2026-09-19 (14.1); the rc.1 acceptance run recorded digital silence and a failed content row (issue #38, section 14.2 of the release branch's copy of this document); the cause investigation and the same-binary re-validation are section 14.3; rest unrun |
+| 13.5 M5 process loopback | **partial** (2 of 10 rows; sections 14.1 and 14.3) | timeline rows passed 2026-09-19 (14.1); the rc.1 acceptance run recorded digital silence and a failed content row (issue #38; that record is section 14.2 of the release branch's copy of this document, PR #37); the cause investigation and the same-binary re-validation are section 14.3; rest unrun |
 | 13.6 M5 two sessions, one data root | | |
 | 15.1 #29 config redaction | | |
 | 15.2 #29 oversized input over TOS | | |
@@ -741,10 +744,12 @@ per-row result is pinned here instead.
 
 ### 14.3 Issue #38 process-loopback content — investigation and re-validation, 2026-09-28
 
-Section 14.2 records a run in which every process-loopback row passed on timing and the track
-carried nothing but digital zeros. This section records what was established about that failure on
-the same machine, later the same day, and it is the basis for the fix that shipped with the
-`0.3.0-rc.2` release candidate.
+Section 14.2 — the rc.1 acceptance run that recorded the digital-silence failure, kept in the
+release branch's copy of this document (PR #37) because that run belongs to the `0.3.0-rc.1`
+provenance and main does not carry it — records a run in which every process-loopback row passed on
+timing and the track carried nothing but digital zeros. This section records what was established
+about that failure on the same machine, later the same day, and it is the basis for the fix that
+ships with the `0.3.0-rc.2` release candidate.
 
 Environment (section 1 fields):
 

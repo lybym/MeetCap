@@ -226,6 +226,20 @@ before M2 — or by a recording that never reached its teardown — simply lacks
   is explicit here and never silently folded into the other
   (docs/RELIABILITY.md section 8). A reader that wants the simple "is anything wrong" verdict
   reads `capture_health.is_degraded`; a reader that wants "which track" reads `track_health`.
+- `track_health[].degraded_reason` is why a track is degraded without having ended early, and it
+  is deliberately separate from `end_reason`: the track completed and it is the content of what it
+  recorded that is in question. Today it carries `silent_process_loopback` (the track held samples
+  and not one of them was decodable content) or `empty_process_loopback` (the track started and
+  delivered no samples at all) — issue #38, `docs/RELIABILITY.md` section 17. It is absent for a
+  track that ended for its own reason, which keeps `end_reason`.
+- `track_health[].audio_content` is what the track's samples actually contained, counted on the
+  consumer thread from the bytes written to the chunk: `peak_abs_sample` (normalized to full
+  scale; non-finite samples never contribute), `non_zero_samples`, `total_samples`, and the
+  derived `all_silent`, which is true only when the track had samples and none of them held
+  decodable content. It is the durable answer to "is this track empty", so a validation run does
+  not have to decode the WAV, and it is what the `silent_process_loopback` /
+  `empty_process_loopback` verdicts are read from (issue #38). The field is absent from manifests
+  written before it existed; recovery and `meetcap session repair` preserve it untouched.
 - `gaps_remain` and `gap_details` are always present, defaulting to `false` and `[]`; startup
   recovery and `meetcap session repair` set them after auditing the session: `gaps_remain` is
   true while the timeline still holds a provable gap after every repair that could be
@@ -354,6 +368,22 @@ capture.timeline_unusable  the track's buffers cannot be placed on the session t
                            it is deliberately not a degradation of otherwise healthy
                            audio: without it the unsupported environment would be
                            indistinguishable from a track that recorded normally.
+```
+
+Issue #38 adds a second:
+
+```text
+capture.silent_track       a process-loopback track carried no decodable content for its
+                           whole span: either every sample was digital zero (or a
+                           non-finite value) or no samples arrived at all. `reason` is
+                           `silent_process_loopback` or `empty_process_loopback` — the same
+                           values the track's `degraded_reason` carries — and `detail` names
+                           the counts, both candidate causes and the
+                           `capture.online.loopback_mode = "system"` alternative. Written
+                           once per track, at the end of the track, and only when the track
+                           did not already end for its own reason; the track is marked
+                           degraded by it, never ended
+                           (`docs/RELIABILITY.md` section 17).
 ```
 
 `session.repair.incomplete` is written by startup recovery and by `meetcap session repair`

@@ -563,15 +563,19 @@ that failure, so MeetCap now also records what a track's samples *contained*:
 - the consumer thread counts each packet's payload as it writes it to the chunk (the same bytes
   that become the artifact, never a parallel copy): total samples, non-zero samples, and the
   peak absolute sample normalized to full scale, so PCM and IEEE-float tracks are comparable
-  (`MeetCap.Core.Capture.AudioContentAccumulator`);
+  (`MeetCap.Core.Capture.AudioContentAccumulator`). Only finite non-zero values count as content:
+  `-0.0f` is silence, and `NaN` / `±Infinity` are counted but never content and never the peak,
+  because a non-finite peak cannot be written to JSON at all and would abort finalization;
 - the counters are written per track to `session.json` as
   `track_health[].audio_content = { peak_abs_sample, non_zero_samples, total_samples, all_silent }`,
   which is the durable evidence a validation run checks instead of decoding the WAV;
-- at the end of a track, a **process-loopback** track whose whole span held samples and not one
-  non-zero sample among them is marked degraded with `degraded_reason = "silent_process_loopback"`
-  and one `capture.silent_track` event, and the stop summary prints the counts and the two
-  candidate explanations (the target rendered nothing, or process loopback did not deliver the
-  target tree's audio) plus the `loopback_mode = "system"` alternative.
+- at the end of a track, a **process-loopback** track whose whole span held no decodable content is
+  marked degraded with one `capture.silent_track` event and one of two reasons:
+  `degraded_reason = "silent_process_loopback"` when it carried samples and not one of them was
+  non-zero, or `degraded_reason = "empty_process_loopback"` when it started and delivered no
+  samples at all — the shape that would otherwise be a completed, healthy, empty file. The stop
+  summary prints the counts and the candidate explanations (the target rendered nothing, or process
+  loopback did not deliver the target tree's audio) plus the `loopback_mode = "system"` alternative.
 
 The verdict is deliberately scoped and deliberately not fatal. It does not fire for the baseline
 system-loopback track, where an all-zero span is what a quiet render endpoint sounds like, nor for
@@ -609,7 +613,9 @@ changed the outcome:
 The conclusion recorded for the release is therefore about *visibility*, not about a wrapper
 swap: process-loopback content is the only honest health signal for this path, so the counters
 and the verdict above are the product's answer, and
-`docs/M1_WINDOWS_VALIDATION.md` sections 14.2 and 14.3 keep both runs as provenance.
+`docs/M1_WINDOWS_VALIDATION.md` section 14.3 keeps both runs as provenance — the rc.1 acceptance
+record it re-validates is that document's section 14.2 on `release/v0.3.0` (PR #37), which main
+does not yet carry.
 
 ---
 

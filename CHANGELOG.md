@@ -23,14 +23,19 @@ milestones are described as the former, never the latter
   every sample in the track was zero, so the recording was empty and the summary was green.
   Timing cannot see that failure, so MeetCap now counts what a track's samples contain: the
   consumer thread records `peak_abs_sample`, `non_zero_samples` and `total_samples` per track into
-  `session.json` as `track_health[].audio_content`, and a **process-loopback** track whose whole
-  span carried samples and not one non-zero sample is marked degraded with
-  `degraded_reason: "silent_process_loopback"` plus one actionable `capture.silent_track` event and
-  a stop-summary warning naming both possible causes and the `loopback_mode = "system"`
-  alternative. The verdict is deliberately not fatal and deliberately scoped: a target that
-  rendered nothing produces the same all-zero stream, so the session still completes and its
-  chunks stay durable, and neither the baseline system-loopback track nor the microphone is
-  flagged, because all-zero audio there is legitimate (`docs/RELIABILITY.md` section 17).
+  `session.json` as `track_health[].audio_content`, and a **process-loopback** track that carried no
+  decodable content for its whole span is marked degraded with
+  `degraded_reason: "silent_process_loopback"` (samples arrived, none of them non-zero) or
+  `"empty_process_loopback"` (the stream delivered no samples at all — the case that would otherwise
+  be a completed, healthy, empty file), plus one actionable `capture.silent_track` event and a
+  stop-summary warning naming both possible causes and the `loopback_mode = "system"` alternative.
+  Only finite non-zero samples count as content: `NaN` and `±Infinity` — the samples a broken tap
+  can hand over — are counted in the total but never as content or as the peak, because a
+  non-finite peak cannot be written to JSON at all and would abort the session's finalization. The
+  verdict is deliberately not fatal and deliberately scoped: a target that rendered nothing
+  produces the same all-zero stream, so the session still completes and its chunks stay durable,
+  and neither the baseline system-loopback track nor the microphone is flagged, because all-zero
+  audio there is legitimate (`docs/RELIABILITY.md` section 17).
   The issue's investigation does **not** implicate NAudio 3.1.0 or the Windows 26200 audio engine:
   the same `naprobe.exe` binary that recorded zero samples for a playing Edge tree in the rc.1
   session recorded `peak=0.76` for the same target class on the same machine, no reboot, outside
