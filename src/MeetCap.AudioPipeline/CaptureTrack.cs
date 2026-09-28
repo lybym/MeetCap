@@ -21,7 +21,9 @@ internal sealed record CaptureTrackOutcome(
     int ChunksClosed,
     long ClosedDataBytes,
     long LastTimelineMs,
-    bool CaptureStarted);
+    bool CaptureStarted,
+    AudioContentStats Content,
+    string? DegradedReason);
 
 /// <summary>
 /// Runs one independent capture track: it owns the capture source, the bounded packet
@@ -189,6 +191,8 @@ internal sealed class CaptureTrack : IDisposable
     private volatile bool _captureStarted;
     private Exception? _storageFailure;
     private string? _endReason;
+    private string? _degradedReason;
+    private readonly AudioContentAccumulator _content = new();
     private bool _disposed;
 
     internal CaptureTrack(
@@ -242,11 +246,32 @@ internal sealed class CaptureTrack : IDisposable
 
     public bool CaptureStarted => _captureStarted;
 
+    /// <summary>
+    /// True when this track captures a single process's audio tree rather than the render
+    /// endpoint's mix. That is the only configuration in which a track that never delivered a
+    /// non-zero sample is treated as a candidate silent-capture failure (issue #38,
+    /// docs/RELIABILITY.md section 17).
+    /// </summary>
+    internal bool IsProcessLoopbackTrack
+        => _source == AudioSource.Loopback
+           && _settings.Online is { } online
+           && string.Equals(online.LoopbackMode, LoopbackModes.Process, StringComparison.Ordinal);
+
     public bool Degraded => _degraded || _storageFailure is not null;
 
     public Exception? StorageFailure => _storageFailure;
 
     public string? EndReason => _endReason;
+
+    /// <summary>
+    /// Why this track is degraded when it was not a device loss or format change — today only
+    /// the silent process-loopback verdict (issue #38). Null when the track has no
+    /// degradation of its own.
+    /// </summary>
+    public string? DegradedReason => _degradedReason;
+
+    /// <summary>What this track's samples actually contained, counted as they were written.</summary>
+    public AudioContentStats Content => _content.Snapshot();
 
     public int ClosedChunkCount => _spool?.ClosedChunkCount ?? 0;
 
@@ -278,7 +303,9 @@ internal sealed class CaptureTrack : IDisposable
             ClosedChunkCount,
             ClosedDataBytes,
             LastTimelineMs,
-            _captureStarted);
+            _captureStarted,
+            Content,
+            _degradedReason);
 
     /// <summary>Creates the first capture source for this track. Throws on failure.</summary>
     public IAudioCaptureSource CreateInitialSource() => _createSource(_device);
@@ -489,6 +516,7 @@ internal sealed class CaptureTrack : IDisposable
             // placed (docs/RELIABILITY.md section 7).
             ApplyTerminalDeviceLoss();
             CloseActiveChunk();
+            EvaluateProcessLoopbackSilence();
         }
     }
 
@@ -1115,6 +1143,11 @@ internal sealed class CaptureTrack : IDisposable
 
         _spool!.Append(packet, timing);
 
+        // Counted from the same bytes that were just written, on the consumer thread: the
+        // statistics describe the recorded audio rather than a parallel copy of it, and the
+        // capture callback stays free of the scan (docs/ARCHITECTURE.md section 7).
+        _content.Add(packet.Data.Span, _format!);
+
         // A packet that crosses the chunk boundary rotates the chunk inside Append, so
         // the announcement happens here rather than only around an explicit close.
         AnnounceClosedChunk();
@@ -1150,6 +1183,62 @@ internal sealed class CaptureTrack : IDisposable
         // A storage failure is shared (the disk is one resource), so it ends the whole
         // session rather than just this track (docs/RELIABILITY.md section 2).
         _onStorageFailure(error);
+    }
+
+    /// <summary>
+    /// States, once, that a process-loopback track completed without a single non-zero sample
+    /// (issue #38).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Runs on the consumer thread, in the same <c>finally</c> that closes this track's final
+    /// chunk and after every packet it will ever receive has been written, so the verdict is
+    /// about the whole track rather than about a window of it. Issue #38's failure was exactly
+    /// this shape — a live stream, correct timing, and not one non-zero sample — and it ended
+    /// as <c>healthy</c> and <c>COMPLETED</c>; this is the statement that replaces that.
+    /// </para>
+    /// <para>
+    /// It deliberately does not fire for the baseline system-loopback track, where an all-zero
+    /// track is the normal state of a quiet render endpoint, nor for the microphone, where
+    /// silence is what an empty room sounds like. A process-loopback target that rendered
+    /// nothing produces the same all-zero stream, so the outcome is a degradation and an
+    /// explicit reason rather than a fatal end: the audio, the chunks and the timeline stay
+    /// exactly as they would have been (docs/RELIABILITY.md section 17).
+    /// </para>
+    /// <para>
+    /// A track that already ended for its own reason (device loss, format change) keeps that
+    /// reason and is not restated here; its content statistics are still recorded in the
+    /// session document.
+    /// </para>
+    /// </remarks>
+    private void EvaluateProcessLoopbackSilence()
+    {
+        if (!IsProcessLoopbackTrack || _endReason is not null)
+        {
+            return;
+        }
+
+        var content = _content.Snapshot();
+        if (!content.AllSilent)
+        {
+            return;
+        }
+
+        _degraded = true;
+        _degradedReason = CaptureDegradedReasons.SilentProcessLoopback;
+
+        _events.Write(new SessionEvent(SessionEventNames.CaptureSilentTrack, CurrentTimelineMs())
+        {
+            Source = _source.ToWireName(),
+            Detail =
+                $"the '{_source.ToWireName()}' track contains only digital zeros: " +
+                $"{content.NonZeroSamples} of {content.TotalSamples} samples were non-zero " +
+                $"(peak {content.PeakAbsSample.ToString("0.########", System.Globalization.CultureInfo.InvariantCulture)}). " +
+                "The target process may have rendered no audio during the session, or the process-loopback " +
+                "capture may not have delivered the target tree's audio while it was playing. " +
+                "Check whether the target was playing, or use capture.online.loopback_mode = \"system\" to " +
+                "record the render endpoint's mix instead.",
+        });
     }
 
     private long CurrentTimelineMs() => _timeline?.LastEndMs ?? 0;

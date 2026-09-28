@@ -694,7 +694,11 @@ public sealed class RecordingSession : IDisposable
                 o.Degraded,
                 o.EndReason,
                 o.ChunksClosed,
-                o.ClosedDataBytes))
+                o.ClosedDataBytes)
+            {
+                DegradedReason = o.DegradedReason,
+                AudioContent = o.Content,
+            })
             .ToList();
         _manifest.Status = status;
         _manifest.Degraded = degraded;

@@ -27,6 +27,27 @@ public static class SessionEventNames
     public const string CaptureConsumerStalled = "capture.consumer_stalled";
 
     /// <summary>
+    /// The process-loopback track carried samples but every one of them was digital zero, so
+    /// the session states that the track is silent instead of reporting it as
+    /// <c>healthy</c> and complete (issue #38).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Written at most once per track, at the end of the track, and only for
+    /// <c>capture.online.loopback_mode = "process"</c>: the baseline system-loopback track is
+    /// legitimately all-zero whenever nothing is playing, while a process-loopback track that
+    /// never delivered a single non-zero sample is the observable shape of the capture
+    /// backend returning nothing but zeros (docs/RELIABILITY.md section 17).
+    /// </para>
+    /// <para>
+    /// A silent target is not by itself a failure — an application that never rendered audio
+    /// produces exactly this — so the track is marked degraded (visible), never fatal, and
+    /// the audio it did capture stays durable and complete.
+    /// </para>
+    /// </remarks>
+    public const string CaptureSilentTrack = "capture.silent_track";
+
+    /// <summary>
     /// The track's buffers cannot be placed on the session timeline by the device timing
     /// its stream reports, so the track ends instead of writing audio at an invented
     /// position (docs/ARCHITECTURE.md section 8.1, docs/RELIABILITY.md section 7).
