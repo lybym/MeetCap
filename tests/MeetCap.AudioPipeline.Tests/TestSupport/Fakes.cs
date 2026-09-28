@@ -257,6 +257,9 @@ internal static class TestAudio
     {
         /// <summary>48 kHz mono 16-bit PCM: 2 bytes per frame, 96,000 bytes per second.</summary>
         public static readonly AudioFormat Mono48kPcm = new(48_000, 1, 16, AudioSampleFormat.Pcm);
+
+        /// <summary>48 kHz mono 32-bit IEEE float, the format WASAPI shared mode reports.</summary>
+        public static readonly AudioFormat Mono48kFloat = new(48_000, 1, 32, AudioSampleFormat.IeeeFloat);
     }
 
     public const int TenMsFrames = 480;
@@ -304,15 +307,16 @@ internal static class TestAudio
                         BitConverter.TryWriteBytes(payload.AsSpan(sample), (short)8192);
                         break;
                     case 24:
+                        // 0x200000 = 2097152 of 8388608 = quarter scale, little-endian.
                         payload[sample] = 0x00;
-                        payload[sample + 1] = 0x20;
-                        payload[sample + 2] = 0x00;
+                        payload[sample + 1] = 0x00;
+                        payload[sample + 2] = 0x20;
                         break;
                     case 32:
-                        BitConverter.TryWriteBytes(payload.AsSpan(sample), 8192);
+                        BitConverter.TryWriteBytes(payload.AsSpan(sample), 1073741824); // half of full scale
                         break;
                     default:
-                        BitConverter.TryWriteBytes(payload.AsSpan(sample), 8192L);
+                        BitConverter.TryWriteBytes(payload.AsSpan(sample), 4611686018427387904L); // half of full scale
                         break;
                 }
             }
@@ -324,6 +328,36 @@ internal static class TestAudio
     /// <summary>A frame-aligned payload of digital silence, the shape issue #38 captured.</summary>
     public static byte[] SilentPayload(AudioFormat format, int frames)
         => new byte[frames * format.BlockAlign];
+
+    /// <summary>
+    /// A frame-aligned payload of non-finite IEEE-float samples (a repeating +Infinity). It is
+    /// the shape a broken tap can hand over, and it must never become an infinite peak or a
+    /// "content" count: a non-finite peak cannot be serialized into <c>session.json</c> at all.
+    /// </summary>
+    public static byte[] NonFinitePayload(AudioFormat format, int frames)
+    {
+        var payload = new byte[frames * format.BlockAlign];
+        for (var offset = 0; offset + 4 <= payload.Length; offset += 4)
+        {
+            BitConverter.TryWriteBytes(payload.AsSpan(offset), float.PositiveInfinity);
+        }
+
+        return payload;
+    }
+
+    /// <summary>A process-loopback packet of non-finite samples, placed by QPC.</summary>
+    public static AudioPacket NonFinitePacketWithoutDevicePosition(
+        AudioFormat format,
+        long startFrame,
+        int frames,
+        AudioSource source = AudioSource.Loopback)
+        => new(
+            source,
+            format,
+            NonFinitePayload(format, frames),
+            0,
+            startFrame * 10_000_000L / format.SampleRate,
+            DateTimeOffset.UnixEpoch);
 
     public static AudioPacket Packet(
         AudioFormat format,

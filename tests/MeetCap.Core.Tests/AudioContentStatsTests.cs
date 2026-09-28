@@ -99,14 +99,55 @@ public class AudioContentStatsTests
     }
 
     [Fact]
-    public void NaN_IsNeitherContentNorAPeak()
+    public void NonFiniteSamples_AreNeitherContentNorAPeak()
     {
+        // NaN and ±Infinity are not decodable audio, and an infinite peak cannot even be written
+        // to session.json (the serializer rejects non-finite numbers), so neither may reach the
+        // counters as content or as the peak (issue #38 review, finding B1).
         var format = Format(32, AudioSampleFormat.IeeeFloat);
-        var stats = Count(format, Float32(float.NaN));
+        var payload = new byte[12];
+        BitConverter.TryWriteBytes(payload.AsSpan(0), float.PositiveInfinity);
+        BitConverter.TryWriteBytes(payload.AsSpan(4), float.NegativeInfinity);
+        BitConverter.TryWriteBytes(payload.AsSpan(8), float.NaN);
+
+        var stats = Count(format, payload);
 
         Assert.True(stats.AllSilent);
-        Assert.Equal(1, stats.TotalSamples);
+        Assert.Equal(3, stats.TotalSamples);
+        Assert.Equal(0, stats.NonZeroSamples);
+        Assert.True(double.IsFinite(stats.PeakAbsSample));
         Assert.Equal(0d, stats.PeakAbsSample);
+    }
+
+    [Fact]
+    public void Float64_NonFiniteSamples_AreExcludedToo()
+    {
+        var format = Format(64, AudioSampleFormat.IeeeFloat);
+        var payload = new byte[16];
+        BitConverter.TryWriteBytes(payload.AsSpan(0), double.PositiveInfinity);
+        BitConverter.TryWriteBytes(payload.AsSpan(8), double.NaN);
+
+        var stats = Count(format, payload);
+
+        Assert.True(stats.AllSilent);
+        Assert.Equal(2, stats.TotalSamples);
+        Assert.True(double.IsFinite(stats.PeakAbsSample));
+    }
+
+    [Fact]
+    public void FiniteAudioBesideNonFiniteSamples_StillReportsTheRealPeak()
+    {
+        var format = Format(32, AudioSampleFormat.IeeeFloat);
+        var payload = new byte[8];
+        BitConverter.TryWriteBytes(payload.AsSpan(0), float.PositiveInfinity);
+        BitConverter.TryWriteBytes(payload.AsSpan(4), 0.5f);
+
+        var stats = Count(format, payload);
+
+        Assert.False(stats.AllSilent);
+        Assert.Equal(2, stats.TotalSamples);
+        Assert.Equal(1, stats.NonZeroSamples);
+        Assert.Equal(0.5d, stats.PeakAbsSample, precision: 6);
     }
 
     [Fact]

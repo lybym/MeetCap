@@ -516,7 +516,18 @@ internal sealed class CaptureTrack : IDisposable
             // placed (docs/RELIABILITY.md section 7).
             ApplyTerminalDeviceLoss();
             CloseActiveChunk();
-            EvaluateProcessLoopbackSilence();
+
+            // The content verdict is the last thing this track does. It writes to the same event
+            // sink as the rest of the track, so a sink failure is classified exactly like any
+            // other storage failure instead of escaping the consumer's finalizer.
+            try
+            {
+                EvaluateProcessLoopbackSilence();
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                RegisterStorageFailure(ex);
+            }
         }
     }
 
@@ -1186,7 +1197,8 @@ internal sealed class CaptureTrack : IDisposable
     }
 
     /// <summary>
-    /// States, once, that a process-loopback track completed without a single non-zero sample
+    /// States, once, that a process-loopback track completed without a single sample of decodable
+    /// content — either every sample was silent or the track delivered no samples at all
     /// (issue #38).
     /// </summary>
     /// <remarks>
@@ -1207,38 +1219,63 @@ internal sealed class CaptureTrack : IDisposable
     /// </para>
     /// <para>
     /// A track that already ended for its own reason (device loss, format change) keeps that
-    /// reason and is not restated here; its content statistics are still recorded in the
-    /// session document.
+    /// reason and is not restated here, and a track whose capture never started at all is already
+    /// reported by the session's <c>capture_start_failed</c> path; both still have their content
+    /// statistics recorded in the session document.
     /// </para>
     /// </remarks>
     private void EvaluateProcessLoopbackSilence()
     {
-        if (!IsProcessLoopbackTrack || _endReason is not null)
+        if (!IsProcessLoopbackTrack || _endReason is not null || !_captureStarted)
         {
             return;
         }
 
         var content = _content.Snapshot();
-        if (!content.AllSilent)
+        var reason = content.TotalSamples == 0
+            ? CaptureDegradedReasons.EmptyProcessLoopback
+            : content.AllSilent
+                ? CaptureDegradedReasons.SilentProcessLoopback
+                : null;
+
+        if (reason is null)
         {
             return;
         }
 
+        // The verdict is set before the event is written, so a failing sink cannot lose the
+        // degradation itself.
         _degraded = true;
-        _degradedReason = CaptureDegradedReasons.SilentProcessLoopback;
+        _degradedReason = reason;
 
         _events.Write(new SessionEvent(SessionEventNames.CaptureSilentTrack, CurrentTimelineMs())
         {
             Source = _source.ToWireName(),
-            Detail =
-                $"the '{_source.ToWireName()}' track contains only digital zeros: " +
-                $"{content.NonZeroSamples} of {content.TotalSamples} samples were non-zero " +
-                $"(peak {content.PeakAbsSample.ToString("0.########", System.Globalization.CultureInfo.InvariantCulture)}). " +
-                "The target process may have rendered no audio during the session, or the process-loopback " +
-                "capture may not have delivered the target tree's audio while it was playing. " +
-                "Check whether the target was playing, or use capture.online.loopback_mode = \"system\" to " +
-                "record the render endpoint's mix instead.",
+            Reason = reason,
+            Detail = DescribeSilentProcessLoopback(reason, content),
         });
+    }
+
+    /// <summary>
+    /// The reader-facing explanation for a contentless process-loopback track: what was (not)
+    /// counted, both candidate causes, and the baseline alternative.
+    /// </summary>
+    private string DescribeSilentProcessLoopback(string reason, AudioContentStats content)
+    {
+        var source = _source.ToWireName();
+        var observations =
+            $"the '{source}' track contains no non-zero sample: {content.NonZeroSamples} of " +
+            $"{content.TotalSamples} samples were non-zero " +
+            $"(peak {content.PeakAbsSample.ToString("0.########", System.Globalization.CultureInfo.InvariantCulture)}).";
+
+        var cause = reason == CaptureDegradedReasons.EmptyProcessLoopback
+            ? "No samples reached the track at all, which points at the capture stream rather than at a quiet target."
+            : "The target process may have rendered no audio during the session, or the process-loopback " +
+              "capture may not have delivered the target tree's audio while it was playing.";
+
+        return observations + " " + cause +
+            " Check whether the target was playing, or use capture.online.loopback_mode = \"system\" to " +
+            "record the render endpoint's mix instead.";
     }
 
     private long CurrentTimelineMs() => _timeline?.LastEndMs ?? 0;

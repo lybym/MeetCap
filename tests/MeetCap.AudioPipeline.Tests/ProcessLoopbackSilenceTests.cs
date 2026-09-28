@@ -69,11 +69,12 @@ public class ProcessLoopbackSilenceTests
         // It did not end early: the reason for the degradation is the content, not an end.
         Assert.Null(loopbackHealth.EndReason);
 
-        // The content counters are the durable evidence a reader can check.
+        // The content counters are the durable evidence a reader can check. The totals are asserted
+        // exactly so a whole-span rule cannot silently become a windowed one.
         Assert.NotNull(loopbackHealth.AudioContent);
         Assert.True(loopbackHealth.AudioContent!.AllSilent);
         Assert.Equal(0, loopbackHealth.AudioContent.NonZeroSamples);
-        Assert.True(loopbackHealth.AudioContent.TotalSamples > 0);
+        Assert.Equal(576_000, loopbackHealth.AudioContent.TotalSamples); // 12 s of 48 kHz mono
         Assert.Equal(0d, loopbackHealth.AudioContent.PeakAbsSample);
 
         // The microphone track is untouched — including its own content counters, which show
@@ -82,12 +83,14 @@ public class ProcessLoopbackSilenceTests
         Assert.Null(micHealth.DegradedReason);
         Assert.NotNull(micHealth.AudioContent);
         Assert.False(micHealth.AudioContent!.AllSilent);
-        Assert.True(micHealth.AudioContent.NonZeroSamples > 0);
+        Assert.Equal(576_000, micHealth.AudioContent.TotalSamples);
+        Assert.Equal(576_000, micHealth.AudioContent.NonZeroSamples);
 
         // One explicit, actionable statement at the end of the track — not one per buffer.
         var silent = Assert.Single(EventsNamed(paths, SessionEventNames.CaptureSilentTrack));
         Assert.Equal(AudioSources.Loopback, silent.Source);
-        Assert.Contains("digital zeros", silent.Detail, StringComparison.Ordinal);
+        Assert.Equal(CaptureDegradedReasons.SilentProcessLoopback, silent.Reason);
+        Assert.Contains("no non-zero sample", silent.Detail, StringComparison.Ordinal);
         Assert.Contains("loopback_mode = \"system\"", silent.Detail, StringComparison.Ordinal);
 
         // The audio it did capture is durable: the chunk was closed and indexed exactly as a
@@ -134,7 +137,8 @@ public class ProcessLoopbackSilenceTests
 
         Assert.NotNull(loopbackHealth.AudioContent);
         Assert.False(loopbackHealth.AudioContent!.AllSilent);
-        Assert.True(loopbackHealth.AudioContent.NonZeroSamples > 0);
+        Assert.Equal(240_000, loopbackHealth.AudioContent.TotalSamples); // 5 s of 48 kHz mono
+        Assert.Equal(240_000, loopbackHealth.AudioContent.NonZeroSamples);
         Assert.Equal(0.25d, loopbackHealth.AudioContent.PeakAbsSample, precision: 6);
 
         // The recorded chunk really holds the audio: at least one non-zero sample byte after
@@ -147,6 +151,102 @@ public class ProcessLoopbackSilenceTests
         var bytes = File.ReadAllBytes(chunkPath);
         Assert.Equal("RIFF", System.Text.Encoding.ASCII.GetString(bytes, 0, 4));
         Assert.Contains(bytes[WavHeader.Size..], b => b != 0);
+    }
+
+    [Fact]
+    public async Task ProcessLoopbackTrack_OfNonFiniteSamples_IsFlaggedAndStillFinalizes()
+    {
+        // A broken tap can hand over samples that are not decodable audio, and a non-finite peak
+        // cannot be serialized into session.json at all: the exception used to escape the consumer
+        // and abort finalization, so the session never reached COMPLETED and no session.stopped
+        // was written (issue #38 review, finding B1). The loopback track is a float track here
+        // because PCM bit patterns are always finite integers.
+        var floatFormat = TestAudio.Formats.Mono48kFloat;
+        using var harness = OnlineHarness(loopbackMode: "process");
+        var micSource = MicSource(harness);
+        var loopbackSource = new FakeCaptureSource(floatFormat, harness.RenderDevice, AudioSource.Loopback)
+        {
+            Clock = CaptureClock.Qpc,
+        };
+        harness.Sources.EnqueueLoopback(loopbackSource);
+
+        var session = harness.Service.PrepareSession("Non-Finite Process Loopback");
+        var paths = new SessionPaths(harness.DataRoot, session.SessionId);
+
+        using var cancellation = new CancellationTokenSource();
+        var run = session.RunAsync(cancellation.Token);
+
+        Assert.True(await Wait.UntilAsync(() => micSource.StartCount == 1 && loopbackSource.StartCount == 1),
+            "both tracks did not start");
+
+        TestAudio.EmitSeconds(micSource, Format, 0, milliseconds: 5_000);
+        for (var frame = 0L; frame < 48_000; frame += TestAudio.TenMsFrames)
+        {
+            loopbackSource.Emit(TestAudio.NonFinitePacketWithoutDevicePosition(floatFormat, frame, TestAudio.TenMsFrames));
+        }
+
+        cancellation.Cancel();
+
+        // Finalization completes at all: the manifest is written with the verdict in it, which is
+        // what the infinite peak used to prevent.
+        var outcome = await Finish(run);
+        Assert.Equal(SessionStatus.Completed, outcome.Status);
+        Assert.True(outcome.Degraded);
+
+        var loopbackHealth = ReadManifest(paths).TrackHealth.Single(h => h.Source == AudioSources.Loopback);
+        Assert.True(loopbackHealth.Degraded);
+        Assert.Equal(CaptureDegradedReasons.SilentProcessLoopback, loopbackHealth.DegradedReason);
+        Assert.NotNull(loopbackHealth.AudioContent);
+        Assert.True(double.IsFinite(loopbackHealth.AudioContent!.PeakAbsSample));
+        Assert.Equal(0d, loopbackHealth.AudioContent.PeakAbsSample);
+        Assert.Equal(0, loopbackHealth.AudioContent.NonZeroSamples);
+        Assert.Equal(48_000, loopbackHealth.AudioContent.TotalSamples); // 1 s of 48 kHz mono
+        Assert.True(loopbackHealth.AudioContent.AllSilent);
+
+        var silent = Assert.Single(EventsNamed(paths, SessionEventNames.CaptureSilentTrack));
+        Assert.Equal(CaptureDegradedReasons.SilentProcessLoopback, silent.Reason);
+    }
+
+    [Fact]
+    public async Task ProcessLoopbackTrack_ThatDeliveredNoSamples_EndsEmptyAndDegraded()
+    {
+        // A started process-loopback stream that produces nothing at all would otherwise be a
+        // completed, healthy, empty track: zero chunks and zero bytes with degraded: false.
+        using var harness = OnlineHarness(loopbackMode: "process");
+        var micSource = MicSource(harness);
+        var loopbackSource = ProcessLoopbackSource(harness);
+
+        var session = harness.Service.PrepareSession("Empty Process Loopback");
+        var paths = new SessionPaths(harness.DataRoot, session.SessionId);
+
+        using var cancellation = new CancellationTokenSource();
+        var run = session.RunAsync(cancellation.Token);
+
+        Assert.True(await Wait.UntilAsync(() => micSource.StartCount == 1 && loopbackSource.StartCount == 1),
+            "both tracks did not start");
+
+        TestAudio.EmitSeconds(micSource, Format, 0, milliseconds: 3_000);
+        cancellation.Cancel();
+
+        var outcome = await Finish(run);
+
+        Assert.Equal(SessionStatus.Completed, outcome.Status);
+        Assert.True(outcome.Degraded);
+
+        var loopbackHealth = ReadManifest(paths).TrackHealth.Single(h => h.Source == AudioSources.Loopback);
+        Assert.True(loopbackHealth.Degraded);
+        Assert.Equal(CaptureDegradedReasons.EmptyProcessLoopback, loopbackHealth.DegradedReason);
+        Assert.Null(loopbackHealth.EndReason);
+        Assert.Equal(0, loopbackHealth.ChunksClosed);
+        Assert.Equal(0, loopbackHealth.ClosedDataBytes);
+        Assert.NotNull(loopbackHealth.AudioContent);
+        Assert.Equal(0, loopbackHealth.AudioContent!.TotalSamples);
+        Assert.False(loopbackHealth.AudioContent.AllSilent);
+
+        var silent = Assert.Single(EventsNamed(paths, SessionEventNames.CaptureSilentTrack));
+        Assert.Equal(AudioSources.Loopback, silent.Source);
+        Assert.Equal(CaptureDegradedReasons.EmptyProcessLoopback, silent.Reason);
+        Assert.Contains("No samples reached the track", silent.Detail, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -339,6 +439,7 @@ public class ProcessLoopbackSilenceTests
 
                 captured.Add(new CapturedEvent(
                     root.TryGetProperty("source", out var source) ? source.GetString() : null,
+                    root.TryGetProperty("reason", out var reason) ? reason.GetString() : null,
                     root.TryGetProperty("detail", out var detail) ? detail.GetString() : null));
             }
         }
@@ -346,5 +447,5 @@ public class ProcessLoopbackSilenceTests
         return captured;
     }
 
-    private sealed record CapturedEvent(string? Source, string? Detail);
+    private sealed record CapturedEvent(string? Source, string? Reason, string? Detail);
 }

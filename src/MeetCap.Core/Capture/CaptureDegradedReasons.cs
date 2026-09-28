@@ -9,10 +9,18 @@ namespace MeetCap.Core.Capture;
 public static class CaptureDegradedReasons
 {
     /// <summary>
-    /// A process-loopback track carried samples, but every one of them was digital zero
-    /// (issue #38). The track may simply have had a silent target, or the process-loopback
-    /// capture may have failed to deliver the target tree's audio; the session states that
-    /// the track is silent rather than reporting the run as healthy.
+    /// A process-loopback track carried samples, but not one of them held decodable content:
+    /// every sample was digital zero (or a non-finite value) (issue #38). The track may simply
+    /// have had a silent target, or the process-loopback capture may have failed to deliver the
+    /// target tree's audio; the session states that the track is silent rather than reporting the
+    /// run as healthy.
     /// </summary>
     public const string SilentProcessLoopback = "silent_process_loopback";
+
+    /// <summary>
+    /// A process-loopback track started capturing and then delivered no samples at all for the
+    /// whole session. The stream produced nothing — not even the zero-filled buffers issue #38
+    /// recorded — so the track would otherwise be a completed, healthy, empty file.
+    /// </summary>
+    public const string EmptyProcessLoopback = "empty_process_loopback";
 }

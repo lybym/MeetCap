@@ -20,8 +20,8 @@ namespace MeetCap.Core.Capture;
 /// (docs/DEVELOPMENT.md section 5: the raw source is counted, never converted).
 /// </para>
 /// </remarks>
-/// <param name="PeakAbsSample">Largest absolute sample value seen on the track, normalized to full scale.</param>
-/// <param name="NonZeroSamples">Samples whose value was not zero (a negative float zero counts as zero).</param>
+/// <param name="PeakAbsSample">Largest absolute finite sample value seen on the track, normalized to full scale.</param>
+/// <param name="NonZeroSamples">Samples holding a decodable non-zero value (a negative float zero counts as zero; NaN and ±Infinity never count).</param>
 /// <param name="TotalSamples">Samples examined on the track, across all channels.</param>
 public sealed record AudioContentStats(double PeakAbsSample, long NonZeroSamples, long TotalSamples)
 {
@@ -29,9 +29,10 @@ public sealed record AudioContentStats(double PeakAbsSample, long NonZeroSamples
     public static readonly AudioContentStats Empty = new(0, 0, 0);
 
     /// <summary>
-    /// True when the track carried samples and every one of them was digital zero: the shape
-    /// of a silent capture, which is legitimate for an idle target but is also exactly how a
-    /// capture backend that returns only zeros presents itself (issue #38).
+    /// True when the track carried samples and not one of them held decodable content: every
+    /// sample was either digital zero or a non-finite value (NaN / ±Infinity) that no reader can
+    /// decode. This is the shape of a silent capture, which is legitimate for an idle target but
+    /// is also exactly how a capture backend that returns only zeros presents itself (issue #38).
     /// </summary>
     public bool AllSilent => TotalSamples > 0 && NonZeroSamples == 0;
 }
@@ -136,9 +137,12 @@ public sealed class AudioContentAccumulator
         for (var offset = 0; offset + 4 <= samples.Length; offset += 4)
         {
             var value = BitConverter.ToSingle(samples[offset..]);
-            if (float.IsNaN(value))
+            if (!float.IsFinite(value))
             {
-                // Not audio: a NaN sample is unplaceable, so it is neither content nor a peak.
+                // Not decodable audio: NaN and ±Infinity samples are neither content nor a peak.
+                // They stay counted in the total, because the track did carry a sample there, and
+                // they must never reach the peak: a non-finite peak cannot be written to
+                // session.json at all (issue #38 review, finding B1).
                 _totalSamples++;
                 continue;
             }
@@ -154,8 +158,9 @@ public sealed class AudioContentAccumulator
         for (var offset = 0; offset + 8 <= samples.Length; offset += 8)
         {
             var value = BitConverter.ToDouble(samples[offset..]);
-            if (double.IsNaN(value))
+            if (!double.IsFinite(value))
             {
+                // See AccumulateFloat32: non-finite samples are counted, never content, never a peak.
                 _totalSamples++;
                 continue;
             }
