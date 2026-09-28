@@ -439,6 +439,19 @@ hardware against the fixed build with an actively playing target process and pas
 (`docs/M1_WINDOWS_VALIDATION.md` section 14.1), with the remaining rows, including the
 real-drop row, still unrun. The rest of the checklist is still unrun.
 
+Issue #38 added the row those timeline rows were missing. The rc.1 acceptance run recorded a
+process-loopback track that passed every timing check while carrying digital silence: the events,
+the QPC placement and the chunk spans were all correct and the audio was empty, so "does this
+track contain the target's audio at all" is now a row of its own, read from the counters
+`session.json` records per track. The same change makes an all-zero process-loopback track a
+visible degradation (`degraded_reason: "silent_process_loopback"` plus one
+`capture.silent_track` event and a stop-summary warning) instead of a green summary, without
+flagging the baseline system-loopback or microphone tracks, where silence is legitimate
+(`docs/RELIABILITY.md` section 17). The investigation behind it — NAudio 3.1.0, a MeetCap-owned
+raw-WASAPI probe and the unaltered rc.1 reproducer binary, all against the same Edge target on
+the same machine — is recorded in `docs/M1_WINDOWS_VALIDATION.md` section 14.3, and it ruled out
+both the wrapper and a wrapper replacement before the fix was chosen.
+
 ---
 
 # M6 - Speaker registry and voiceprint matching
