@@ -181,12 +181,14 @@ M0 through M6 are implemented and automatically covered. Code is added milestone
 milestone according to `docs/ROADMAP.md`; agents should not implement later milestones
 opportunistically.
 
-This is release **0.3.0**, which fixes two capture defects on top of 0.2.0: Windows process
+This is release **0.3.0**, which fixes three capture defects on top of 0.2.0: Windows process
 loopback is now placed by the QPC clock its stream actually reports instead of a device position it
-never provides, and a capture track now recovers an endpoint that disappears and returns within a
+never provides, a capture track now recovers an endpoint that disappears and returns within a
 configurable window instead of a hard-coded three one-second retries, with an unrecovered outage
-quantified as a gap rather than reported as zero. No milestone becomes newly complete. The
-hardware-dependent acceptance tests are still open and are tracked as a manual checklist in
-`docs/M1_WINDOWS_VALIDATION.md`; nothing here claims any milestone is verified end to end on real
-audio hardware yet. See `CHANGELOG.md` for the release notes and `docs/ROADMAP.md` for milestone
-status.
+quantified as a gap rather than reported as zero, and a process-loopback track that captured no
+audio at all is no longer reported as a healthy, completed session — it is marked degraded with a
+stated reason and the per-track content counters that exposed the defect. No milestone becomes
+newly complete. The hardware-dependent acceptance tests are still open and are tracked as a manual
+checklist in `docs/M1_WINDOWS_VALIDATION.md`; nothing here claims any milestone is verified end to
+end on real audio hardware yet. See `CHANGELOG.md` for the release notes and `docs/ROADMAP.md` for
+milestone status.

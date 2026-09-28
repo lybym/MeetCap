@@ -286,12 +286,27 @@ internal static class StartCommand
             foreach (var track in outcome.TrackHealth)
             {
                 var trackNote = track.Degraded
-                    ? $"degraded ({track.EndReason ?? "unknown"})"
+                    ? $"degraded ({track.DegradedReason ?? track.EndReason ?? "unknown"})"
                     : "healthy";
                 context.Out.WriteLine(
                     $"  {track.Source}: {track.ChunksClosed} chunk(s), " +
                     $"{track.BufferHealth.PeakQueuedPackets}/{track.BufferHealth.CapacityPackets} peak packets, " +
                     $"dropped {track.BufferHealth.DroppedPackets}, {trackNote}");
+
+                // A track that captured no decodable content is stated in full: the note above is
+                // a one-word verdict, and issue #38's failure mode is exactly the one a reader
+                // must not have to infer from a green summary (docs/RELIABILITY.md section 17).
+                if (track.Degraded &&
+                    (string.Equals(track.DegradedReason, CaptureDegradedReasons.SilentProcessLoopback, StringComparison.Ordinal) ||
+                     string.Equals(track.DegradedReason, CaptureDegradedReasons.EmptyProcessLoopback, StringComparison.Ordinal)))
+                {
+                    context.Out.WriteLine(
+                        $"  warning: the {track.Source} track contains no non-zero sample " +
+                        $"({track.AudioContent?.NonZeroSamples ?? 0} of {track.AudioContent?.TotalSamples ?? 0} samples non-zero, " +
+                        $"peak {track.AudioContent?.PeakAbsSample ?? 0:0.########}). The target process may have rendered no " +
+                        "audio, or process loopback may not have delivered the target tree's audio while it was playing. " +
+                        "Check that the target was playing, or use capture.online.loopback_mode = \"system\".");
+                }
             }
         }
 

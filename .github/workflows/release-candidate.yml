@@ -14,9 +14,9 @@ on:
         required: true
         default: 'release/v0.3.0'
       rc_version:
-        description: 'RC version label, e.g. 0.3.0-rc.1'
+        description: 'RC version label, e.g. 0.3.0-rc.2'
         required: true
-        default: '0.3.0-rc.1'
+        default: '0.3.0-rc.2'
 
 jobs:
   build-test-package:

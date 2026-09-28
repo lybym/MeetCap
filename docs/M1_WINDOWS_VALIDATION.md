@@ -559,9 +559,33 @@ meetcap start "M5 process loopback" --mode online
 > process-loopback track records digital silence on the acceptance machine while the target plays
 > (issue #38), so the real-drop row could not be exercised either. No checkbox below is ticked; the
 > per-row result is pinned in section 14.2.
+>
+> **Issue #38 note.** The timeline rows above can pass on a track that carries no audio at all, so
+> they are no longer accepted on their own: the content rows below are the ones that decide whether
+> process loopback works, and `session.json` now carries the counters they are read from. The
+> investigation into the failed rc.1 run, and the re-validation of the same target class outside the
+> confined acceptance session, are section 14.3 below.
 
 - [ ] On a supported Windows/NAudio environment, only the named meeting application's audio
       appears on the loopback track; other system audio does not.
+- [ ] **The loopback track actually contains the target's audio.** `session.json` reports the
+      loopback entry with a non-zero `track_health[].audio_content.non_zero_samples` and a
+      `peak_abs_sample` that matches what the target played, and the WAV decodes to non-zero
+      audio. This row is what issue #38 was: every other row passed while this one was false.
+      ```powershell
+      (Get-Content <data-root>\sessions\<id>\session.json | ConvertFrom-Json).track_health
+      # expect loopback: audio_content.all_silent = false, non_zero_samples > 0
+      ```
+- [ ] **A process-loopback track that carried no decodable content is reported, not hidden.** If the
+      target renders nothing for the whole session, the track is `degraded` with
+      `degraded_reason: "silent_process_loopback"`, `events.jsonl` carries exactly one
+      `capture.silent_track` for it, and the stop summary prints the counts and the alternative
+      `loopback_mode = "system"`. A track that received no samples at all is the same report with
+      `degraded_reason: "empty_process_loopback"`. In both cases the session still `COMPLETED` and
+      the track's chunks (if any) are still closed and indexed — the missing content is stated,
+      never fatal, and never a silent `healthy` summary (docs/RELIABILITY.md section 17). The
+      baseline system-loopback and microphone tracks are not flagged by this rule, because all-zero
+      audio there is legitimate.
 - [ ] Process loopback does not create a new meeting mode — it is the same `online` session,
       just a different `loopback_mode`.
 - [ ] An invalid `capture.online.loopback_mode` value fails `meetcap start` before any
@@ -641,7 +665,7 @@ on one job primary key.
 | 13.2 M5 overlapping speech | | |
 | 13.3 M5 one track degrades | | |
 | 13.4 M5 headphones vs speakers | | |
-| 13.5 M5 process loopback | **FAIL** (content row; sections 14.1–14.2, issue #38) | timeline/negative rows pass 2026-09-19 + 2026-09-28; loopback track delivers digital silence |
+| 13.5 M5 process loopback | **FAIL** (content row; sections 14.1–14.2, issue #38); rc.2 acceptance pending | timeline and negative rows pass 2026-09-19 (section 14.1) and 2026-09-28 (section 14.2); the rc.1 loopback track delivered digital silence on the acceptance machine while the target played (issue #38); the cause investigation and the same-binary re-validation are section 14.3 |
 | 13.6 M5 two sessions, one data root | | |
 | 15.1 #29 config redaction | | |
 | 15.2 #29 oversized input over TOS | | |
@@ -798,6 +822,79 @@ Two M1/M2 mechanical rows were exercised in the same pass against the same artif
   reports nothing further (idempotent). The live-recording half also passed: `meetcap status`
   during a running session reports the active session, finds nothing to recover, writes no
   `session.recovered`/`audio.chunk.corrupt` events, and the session stops cleanly afterwards.
+### 14.3 Issue #38 process-loopback content — investigation and re-validation, 2026-09-28
+
+Section 14.2 above records the rc.1 acceptance run in which every process-loopback row passed on
+timing and the track carried nothing but digital zeros. This section records what was established
+about that failure on the same machine, later the same day, and it is the basis for the fix that
+ships with the `0.3.0-rc.2` release candidate. Section 14.2 belongs to the `0.3.0-rc.1` provenance:
+it is present on this branch and not on `main`, whose copy of this document starts this material at
+section 14.3.
+
+Environment (section 1 fields):
+
+| Field | Value |
+| --- | --- |
+| Date | 2026-09-28 (same day as section 14.2, no reboot in between) |
+| Machine | DESKTOP-2H6MG5P (same machine as section 14.2) |
+| Windows version / build | Windows 11 Home, build 26200 (10.0.26200), AMD64 |
+| Render endpoint | `扬声器 (Realtek(R) Audio)`, `{0.0.0.00000000}.{97aa8bbe-5462-4856-916e-4ee6569b8d1e}` (same as section 14.2) |
+| NAudio | 3.1.0 (the version in `0.3.0-rc.1`) |
+| Target process | Microsoft Edge 154.0.4258.37, isolated profile, looping a 440 Hz 48 kHz stereo WAV (`docs/../rc` validation tree, same generated tone as section 14.2) |
+
+Method. The tone's presence on the endpoint was verified by a system-loopback control immediately
+before the process-loopback captures (`peak 0.623`, `nonZeroSamples 767960/768000`). Process
+loopback was then pointed at the browser main process, so `IncludeTargetProcessTree` covered
+Chromium's audio service, and the same captures were repeated with three independent readers of the
+process-loopback stream: the **unaltered `naprobe.exe` binary whose output is quoted in section
+14.2**, NAudio 3.1.0 built with the same builder shape MeetCap uses, and a MeetCap-owned raw-WASAPI
+probe that does not reference NAudio at all.
+
+| Capture | Result |
+| --- | --- |
+| `naprobe.exe` (unchanged rc.1 reproducer) over every `msedge` root | **AUDIO for the playing tree**: `pid=1840: packets=298 bytes=1051344 peak=0.762047 -> AUDIO`. `pid 1840` is the browser's `utility --utility-sub-type=audio.mojom.AudioService` child, i.e. the process hosting the WASAPI render stream. The other roots reported `peak=0 -> silence`, and they were the idle Edge trees (no rendered audio in them), which is what process loopback is supposed to do. |
+| NAudio 3.1.0, `WithProcessLoopback(pid, IncludeTargetProcessTree)`, `WithSharedMode`, `WithEventSync`, default 44.1 kHz float format and 100 ms buffer — byte-for-byte the shape section 14.2 failed with | `packets=799`, `silentFlagged=0`, `peak=0.738909` → **non-zero content** |
+| Raw-WASAPI probe, same 44.1 kHz float `WAVEFORMATEX` (tag 3), `LOOPBACK | EVENTCALLBACK`, 100 ms buffer, `device_position_frames = 0` and 10 ms QPC cadence — the same shape section 14.2 recorded | `packets=799`, `peak=0.738907`, `nonZeroSamples=701944/704718` → **non-zero content** |
+| Raw-WASAPI probe, render-endpoint mix format (48 kHz float) | `packets=799`, `peak=0.737548` → non-zero content |
+| System-loopback control, same minutes | `peak=0.623016` → non-zero content |
+| Same session, non-Edge targets (a Win32 media player playing the same tone; a second `pwsh.exe` process rendering through winmm) | Non-zero content through both NAudio and the raw probe |
+
+What this establishes, and what it rules out:
+
+- **NAudio 3.1.0's process-loopback wrapper is not the cause.** The same package, the same builder
+  call and the same parameters captured the target's audio; the activation path matches the
+  documented contract and the `naprobe.exe` output above is the same binary whose silence supplied
+  the issue's minimal-reproducer evidence.
+- **A MeetCap-owned backend would not have changed the outcome.** The raw probe walks the same
+  engine path (the activation, the virtual device and the tap are the operating system's, not the
+  wrapper's) and produced the same timing shape with the same content. This is why the shipped fix
+  is content telemetry and a silent-track verdict rather than a wrapper replacement.
+- **The Windows 26200 process-loopback engine is not the cause**, on this evidence: it delivered
+  non-zero content for the same target class on the same build.
+- **The acceptance run's session confinement is the remaining explanation, and it was directly
+  observable.** The rc.1 run was executed inside a confined agent session. Later in the same
+  machine state, that confinement could be observed denying exactly the class of operation a
+  cross-process audio tap needs: Chromium could not start at all (its IPC channel creation was
+  denied by the session policy, so `msedge.exe` aborted during startup), `git`'s HTTPS transport
+  could not create its helper's pipes, and the build and test hosts could not spawn their child
+  processes. None of those denials existed in the session that produced the table above.
+
+Residual uncertainty, stated rather than implied: the failure was *silent*, so the precise
+engine-side step the confinement broke (handle duplication, shared-section mapping, or the
+process-tree enumeration the tap performs) could not be observed from inside the confined session,
+and the conclusion here is behavioural — the same code, target and machine produce silence or
+content depending on the session's confinement — not a step-level diagnosis. A second machine or
+OS build was **not** available, so the `NOT RUN` verdict for that separation stands.
+Section 14.2's parenthetical claim that a machine-local policy hides `ffplay` and `python` from
+process enumeration is not supported by a later check: both are installed on this machine
+(`C:\Program Files\ffmpeg\bin\ffplay.exe`, the `python.exe` execution alias), which is consistent
+with the confined session's process operations misbehaving rather than with a machine policy. That
+sentence is left in section 14.2 as provenance for what the acceptance run reported; the corrected
+reading is this one.
+
+**Pending, appended when the release candidate is published:** the same rows run against the
+`v0.3.0-rc.2` release artifact, which is the artifact `docs/RELIABILITY.md` section 17's
+`audio_content` counters exist for.
 
 ---
 

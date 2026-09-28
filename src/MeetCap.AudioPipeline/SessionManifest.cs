@@ -60,6 +60,22 @@ public sealed record TrackHealth(
         0)
     {
     }
+
+    /// <summary>
+    /// Why this track is degraded when it was not a device loss or format change. Today this
+    /// carries <c>silent_process_loopback</c> for a process-loopback track that never delivered
+    /// a non-zero sample (issue #38). It is kept apart from <see cref="EndReason"/> because the
+    /// track did not end early — it completed, and this is what is wrong with its content.
+    /// </summary>
+    public string? DegradedReason { get; init; }
+
+    /// <summary>
+    /// What the track's samples actually contained: peak absolute sample, non-zero sample count
+    /// and total samples (issue #38). Recorded so "the track is not empty" is part of the
+    /// durable record a validation run can check, instead of something a reader has to decode
+    /// from the WAV. Null on manifests written before this field existed.
+    /// </summary>
+    public AudioContentStats? AudioContent { get; init; }
 }
 
 /// <summary>

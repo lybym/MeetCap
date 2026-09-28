@@ -257,6 +257,9 @@ internal static class TestAudio
     {
         /// <summary>48 kHz mono 16-bit PCM: 2 bytes per frame, 96,000 bytes per second.</summary>
         public static readonly AudioFormat Mono48kPcm = new(48_000, 1, 16, AudioSampleFormat.Pcm);
+
+        /// <summary>48 kHz mono 32-bit IEEE float, the format WASAPI shared mode reports.</summary>
+        public static readonly AudioFormat Mono48kFloat = new(48_000, 1, 32, AudioSampleFormat.IeeeFloat);
     }
 
     public const int TenMsFrames = 480;
@@ -264,6 +267,97 @@ internal static class TestAudio
     /// <summary>Frames in <paramref name="milliseconds"/> at the format's rate.</summary>
     public static int Frames(AudioFormat format, int milliseconds)
         => (int)format.MillisecondsToFrames(milliseconds);
+
+    /// <summary>
+    /// A frame-aligned payload of captured audio: every sample is a quarter-scale value, so a
+    /// fixture that means "audio was recorded" carries audio rather than zeros. Issue #38 makes
+    /// the distinction observable — a track that captures only zeros is reported as silent — so
+    /// the default fixtures must not look silent by accident.
+    /// </summary>
+    public static byte[] AudioPayload(AudioFormat format, int frames)
+    {
+        var payload = new byte[frames * format.BlockAlign];
+        var bytesPerSample = format.BitsPerSample / 8;
+
+        for (var offset = 0; offset + format.BlockAlign <= payload.Length; offset += format.BlockAlign)
+        {
+            for (var channel = 0; channel < format.Channels; channel++)
+            {
+                var sample = offset + (channel * bytesPerSample);
+                if (format.SampleFormat == AudioSampleFormat.IeeeFloat)
+                {
+                    if (format.BitsPerSample == 32)
+                    {
+                        BitConverter.TryWriteBytes(payload.AsSpan(sample), 0.25f);
+                    }
+                    else
+                    {
+                        BitConverter.TryWriteBytes(payload.AsSpan(sample), 0.25d);
+                    }
+
+                    continue;
+                }
+
+                switch (format.BitsPerSample)
+                {
+                    case 8:
+                        payload[sample] = 160; // 128 is the unsigned zero point.
+                        break;
+                    case 16:
+                        BitConverter.TryWriteBytes(payload.AsSpan(sample), (short)8192);
+                        break;
+                    case 24:
+                        // 0x200000 = 2097152 of 8388608 = quarter scale, little-endian.
+                        payload[sample] = 0x00;
+                        payload[sample + 1] = 0x00;
+                        payload[sample + 2] = 0x20;
+                        break;
+                    case 32:
+                        BitConverter.TryWriteBytes(payload.AsSpan(sample), 1073741824); // half of full scale
+                        break;
+                    default:
+                        BitConverter.TryWriteBytes(payload.AsSpan(sample), 4611686018427387904L); // half of full scale
+                        break;
+                }
+            }
+        }
+
+        return payload;
+    }
+
+    /// <summary>A frame-aligned payload of digital silence, the shape issue #38 captured.</summary>
+    public static byte[] SilentPayload(AudioFormat format, int frames)
+        => new byte[frames * format.BlockAlign];
+
+    /// <summary>
+    /// A frame-aligned payload of non-finite IEEE-float samples (a repeating +Infinity). It is
+    /// the shape a broken tap can hand over, and it must never become an infinite peak or a
+    /// "content" count: a non-finite peak cannot be serialized into <c>session.json</c> at all.
+    /// </summary>
+    public static byte[] NonFinitePayload(AudioFormat format, int frames)
+    {
+        var payload = new byte[frames * format.BlockAlign];
+        for (var offset = 0; offset + 4 <= payload.Length; offset += 4)
+        {
+            BitConverter.TryWriteBytes(payload.AsSpan(offset), float.PositiveInfinity);
+        }
+
+        return payload;
+    }
+
+    /// <summary>A process-loopback packet of non-finite samples, placed by QPC.</summary>
+    public static AudioPacket NonFinitePacketWithoutDevicePosition(
+        AudioFormat format,
+        long startFrame,
+        int frames,
+        AudioSource source = AudioSource.Loopback)
+        => new(
+            source,
+            format,
+            NonFinitePayload(format, frames),
+            0,
+            startFrame * 10_000_000L / format.SampleRate,
+            DateTimeOffset.UnixEpoch);
 
     public static AudioPacket Packet(
         AudioFormat format,
@@ -281,11 +375,25 @@ internal static class TestAudio
         => new(
             source,
             format,
-            new byte[frames * format.BlockAlign],
+            AudioPayload(format, frames),
             startFrame,
             startFrame * 10_000_000L / format.SampleRate,
             DateTimeOffset.UnixEpoch,
             flags);
+
+    /// <summary>A packet of digital silence, placed by the device position.</summary>
+    public static AudioPacket SilentPacket(
+        AudioFormat format,
+        long startFrame,
+        int frames,
+        AudioSource source)
+        => new(
+            source,
+            format,
+            SilentPayload(format, frames),
+            startFrame,
+            startFrame * 10_000_000L / format.SampleRate,
+            DateTimeOffset.UnixEpoch);
 
     /// <summary>
     /// Emits <paramref name="milliseconds"/> of contiguous audio in 100 ms buffers,
@@ -347,11 +455,80 @@ internal static class TestAudio
         => new(
             source,
             format,
-            new byte[frames * format.BlockAlign],
+            AudioPayload(format, frames),
             0,
             (startFrame * 10_000_000L / format.SampleRate) + qpcDeltaTicks,
             DateTimeOffset.UnixEpoch,
             flags);
+
+    /// <summary>
+    /// A packet of digital silence from a stream that reports no device position of its own:
+    /// the process-loopback shape issue #38 captured — a live stream carrying zeros.
+    /// </summary>
+    public static AudioPacket SilentPacketWithoutDevicePosition(
+        AudioFormat format,
+        long startFrame,
+        int frames,
+        AudioSource source = AudioSource.Loopback)
+        => new(
+            source,
+            format,
+            SilentPayload(format, frames),
+            0,
+            startFrame * 10_000_000L / format.SampleRate,
+            DateTimeOffset.UnixEpoch);
+
+    /// <summary>
+    /// Emits <paramref name="milliseconds"/> of digital silence on the QPC-only stream shape,
+    /// returning the next free position in frames.
+    /// </summary>
+    public static long EmitSilentSecondsWithoutDevicePosition(
+        FakeCaptureSource source,
+        AudioFormat format,
+        long startFrame,
+        int milliseconds,
+        int bufferMs = 100)
+    {
+        var remaining = milliseconds;
+        var frame = startFrame;
+
+        while (remaining > 0)
+        {
+            var chunkMs = Math.Min(bufferMs, remaining);
+            var frames = Frames(format, chunkMs);
+            source.Emit(SilentPacketWithoutDevicePosition(format, frame, frames, source.Source));
+            frame += frames;
+            remaining -= chunkMs;
+        }
+
+        return frame;
+    }
+
+    /// <summary>
+    /// Emits <paramref name="milliseconds"/> of digital silence placed by the device position,
+    /// returning the next free position in frames.
+    /// </summary>
+    public static long EmitSilentSeconds(
+        FakeCaptureSource source,
+        AudioFormat format,
+        long startFrame,
+        int milliseconds,
+        int bufferMs = 100)
+    {
+        var remaining = milliseconds;
+        var frame = startFrame;
+
+        while (remaining > 0)
+        {
+            var chunkMs = Math.Min(bufferMs, remaining);
+            var frames = Frames(format, chunkMs);
+            source.Emit(SilentPacket(format, frame, frames, source.Source));
+            frame += frames;
+            remaining -= chunkMs;
+        }
+
+        return frame;
+    }
 
     /// <summary>
     /// Emits <paramref name="milliseconds"/> of contiguous audio whose only timing is the

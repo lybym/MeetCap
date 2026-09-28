@@ -286,6 +286,61 @@ public class CaptureCommandTests
     }
 
     [Fact]
+    public async Task Start_WhenProcessLoopbackCarriesNoAudio_WarnsInsteadOfReportingHealthy()
+    {
+        // Issue #38 through the command line: the scripted loopback source produces exactly the
+        // stream the acceptance run recorded — packets, advancing timing, and nothing but zeros —
+        // so the run must not end as a green "healthy" summary. The warning, the manifest record
+        // and the event are all pinned here (docs/RELIABILITY.md section 17).
+        using var harness = CliHarness.Create();
+        harness.WriteOnlineCaptureConfig(chunkSeconds: 1, loopbackMode: "process", processName: "WeMeet");
+        harness.Platform.Devices.SetRenderDevices(
+            new CaptureDeviceInfo("render-default", "Test Speakers", true));
+
+        var startTask = Task.Run(() => harness.Run("start", "Silent Process Loopback", "--mode", "online"));
+
+        var sessionDirectory = WaitForSessionDirectory(harness.DataRoot);
+        Assert.NotNull(sessionDirectory);
+        WaitForActiveSession(harness.DataRoot);
+
+        var loopbackSource = await WaitForLoopbackSource(harness);
+        Assert.Equal(1, loopbackSource.StartCount);
+
+        harness.Run("stop");
+        var start = await AwaitBounded(
+            startTask,
+            TimeSpan.FromSeconds(90),
+            "meetcap start --mode online did not finish after meetcap stop");
+
+        // A degraded session is not a clean run, so the exit code is non-zero and the per-track
+        // line names the reason rather than an unknown one.
+        Assert.Equal(1, start.ExitCode);
+        Assert.Contains("  loopback: ", start.Output, StringComparison.Ordinal);
+        Assert.Contains("degraded (silent_process_loopback)", start.Output, StringComparison.Ordinal);
+        Assert.Contains(
+            "warning: the loopback track contains no non-zero sample",
+            start.Output,
+            StringComparison.Ordinal);
+        Assert.Contains("loopback_mode = \"system\"", start.Output, StringComparison.Ordinal);
+
+        // The durable record carries the same verdict and the counters it was read from. The
+        // manifest is written indented, so the assertions include the space after the colon.
+        var manifest = File.ReadAllText(Path.Combine(sessionDirectory!, "session.json"));
+        Assert.Contains("\"degraded_reason\": \"silent_process_loopback\"", manifest, StringComparison.Ordinal);
+        Assert.Contains("\"audio_content\"", manifest, StringComparison.Ordinal);
+        Assert.Contains("\"all_silent\": true", manifest, StringComparison.Ordinal);
+
+        var events = File.ReadAllText(Path.Combine(sessionDirectory!, "events.jsonl"));
+        Assert.Contains("capture.silent_track", events, StringComparison.Ordinal);
+        Assert.Contains("\"reason\":\"silent_process_loopback\"", events, StringComparison.Ordinal);
+
+        // The silence is reported, not fatal: the track's chunk was still closed and its audio
+        // directory holds no leftover .part.
+        Assert.NotEmpty(Directory.GetFiles(Path.Combine(sessionDirectory!, "audio", "loopback"), "*.wav"));
+        Assert.Empty(Directory.GetFiles(Path.Combine(sessionDirectory!, "audio", "loopback"), "*.part"));
+    }
+
+    [Fact]
     public void Start_WithAnUnknownMode_IsRejected()
     {
         using var harness = CliHarness.Create();
