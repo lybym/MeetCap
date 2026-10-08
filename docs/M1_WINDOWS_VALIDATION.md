@@ -1282,11 +1282,16 @@ rc.1 run.
 
 Non-blocking observation recorded rather than hidden: the A2DP loopback endpoint produced **7,410**
 `capture.discontinuity` events reading *"device position moved backwards; the session timeline was
-kept monotonic"* — i.e. a backwards device position on essentially every ~10 ms buffer, 7,777
-discontinuities in an 87 s session. MeetCap's designed handling kept the timeline monotonic and the
+kept monotonic"* — i.e. a backwards device position on essentially every ~10 ms buffer.
+The original run record reports **7,410 for the loopback track** and **7,777 for the entire
+87 s session across both tracks**; these are different scopes, not alternate counts of the
+loopback events. These historical counts could not be independently recounted during the
+2026-10-08 release audit because the raw evidence directory was unavailable.
+MeetCap's designed handling kept the timeline monotonic and the
 gap accounting correct (12,099 ms against a 12.3 s outage), so capture correctness is unaffected,
 but the telemetry volume is noisy. The process-loopback path on the Realtek endpoint produced zero
-loopback discontinuities in section 14.4. This deserves its own issue; it is not a release blocker.
+loopback discontinuities in section 14.4. Follow-up investigation is tracked in
+[#40](https://github.com/lybym/MeetCap/issues/40); it is not a release blocker.
 
 Not covered: the `capture.format_changed` reopened-endpoint row remains **NOT RUN** — no stable way
 to manufacture the A2DP/HFP format switch was found. The disconnect is a software PnP disable, not
