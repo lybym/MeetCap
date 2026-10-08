@@ -187,8 +187,11 @@ never provides, a capture track now recovers an endpoint that disappears and ret
 configurable window instead of a hard-coded three one-second retries, with an unrecovered outage
 quantified as a gap rather than reported as zero, and a process-loopback track that captured no
 audio at all is no longer reported as a healthy, completed session — it is marked degraded with a
-stated reason and the per-track content counters that exposed the defect. No milestone becomes
-newly complete. The hardware-dependent acceptance tests are still open and are tracked as a manual
+stated reason and the per-track content counters that exposed the defect. The published rc.2
+artifact passed the recorded process-loopback content/isolation and Bluetooth reconnect checks
+on 2026-09-29 (Windows 11 build 26200, one machine; software PnP disconnect/reconnect).
+No milestone becomes newly complete. The remaining hardware-dependent acceptance tests are
+still open and are tracked as a manual
 checklist in `docs/M1_WINDOWS_VALIDATION.md`; nothing here claims any milestone is verified end to
 end on real audio hardware yet. See `CHANGELOG.md` for the release notes and `docs/ROADMAP.md` for
 milestone status.

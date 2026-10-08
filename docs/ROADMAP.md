@@ -712,11 +712,13 @@ for ordinary 300-second live batches or block the M0-M6 release gate. It merged 
 PR #31 and ships in release 0.2.0 without changing the M0-M6 gate: the required manual real-TOS
 plus real-Seed-ASR smoke test is still **not run** (`docs/M1_WINDOWS_VALIDATION.md` section 15).
 
-Issues #33 (process-loopback timeline placed by the capture clock its source declares) and #34
-(capture recovery window and terminal-outage accounting) are the two bugfixes release 0.3.0 ships.
-Both sit inside M5's already-declared scope and complete no milestone: issue #34's real-Bluetooth
-criterion is **not run**, and only two of section 13.5's process-loopback rows were run on real
-hardware (`docs/M1_WINDOWS_VALIDATION.md` sections 14.1 and 16).
+Release 0.3.0 ships fixes for #33 (process-loopback timing), #34 (capture recovery and
+terminal-outage accounting), and #38 (silent/empty process-loopback reporting). All sit inside
+M5's already-declared scope and complete no milestone. The published rc.2 artifact passed the
+process-loopback content, timeline and isolation checks and the real-headset reconnect checks
+on 2026-09-29 (`docs/M1_WINDOWS_VALIDATION.md` sections 14.4 and 16.4). Coverage is limited to
+one Windows 11 build 26200 machine and software PnP disconnect/reconnect; physical power-off,
+format-change recovery, a real meeting application and the wider MVP checklist remain unrun.
 
 M7 may partially land before the release but MUST NOT delay core reliability unless it fixes real transcription quality.
 

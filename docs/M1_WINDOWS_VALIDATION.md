@@ -18,7 +18,14 @@ against the published `v0.3.0-rc.1` release artifact on 2026-09-28, is recorded 
 sections 14.2 and 16.3: it verifies the section 16.2 Bluetooth recovery and fatal-side rows
 and the section 13.5 negative rows, and it **fails** the section 13.5 content row — the
 process-loopback track records digital silence while the target plays (issue #38).
-Everything else in this document remains unrun.
+
+A third pass, against the published `v0.3.0-rc.2` release artifact on 2026-09-29, is recorded in
+sections 14.4 and 16.4. It re-runs the section 13.5 content row against the RC binary that ships
+the issue #38 telemetry fix, and **passes** it: the process-loopback track captured the target tone
+with `non_zero_samples = 6,698,662 / 6,701,436` and `peak_abs_sample = 0.2312`, and the recovered
+WAV was confirmed audible. It also re-runs the section 16.2 Bluetooth reconnect row on a real
+WF-1000XM5 and passes it, including post-restore loopback content. That is artifact-level capture
+acceptance for those two rows and nothing wider; everything else in this document remains unrun.
 
 Section 10 holds the same kind of checklist for the M2 additions from Issue #4 (bounded
 buffer accounting, explicit gap reporting, `meetcap session repair`).
@@ -665,7 +672,7 @@ on one job primary key.
 | 13.2 M5 overlapping speech | | |
 | 13.3 M5 one track degrades | | |
 | 13.4 M5 headphones vs speakers | | |
-| 13.5 M5 process loopback | **FAIL** (content row; sections 14.1–14.2, issue #38); rc.2 acceptance pending | timeline and negative rows pass 2026-09-19 (section 14.1) and 2026-09-28 (section 14.2); the rc.1 loopback track delivered digital silence on the acceptance machine while the target played (issue #38); the cause investigation and the same-binary re-validation are section 14.3 |
+| 13.5 M5 process loopback | **PASS** on the content row against `v0.3.0-rc.2` (section 14.4); the `v0.3.0-rc.1` content row stays a recorded **FAIL** (sections 14.1–14.2, issue #38) | rc.2 run 2026-09-29: loopback `non_zero_samples = 6,698,662 / 6,701,436`, `peak_abs_sample = 0.2312`, `degraded = false`, no `capture.silent_track`, no `capture.timeline_unusable`, no loopback `capture.discontinuity`, no gaps, and the recovered WAV is audibly the 1 kHz target tone; the process-isolation row also passes (section 14.4). The rc.1 loopback track delivered digital silence on the acceptance machine while the target played (issue #38); the cause investigation and the same-binary re-validation are section 14.3. The other section 13.5 rows remain unrun. |
 | 13.6 M5 two sessions, one data root | | |
 | 15.1 #29 config redaction | | |
 | 15.2 #29 oversized input over TOS | | |
@@ -673,7 +680,7 @@ on one job primary key.
 | 15.4 #29 cleanup failure semantics | | |
 | 15.5 #29 TOS outage isolation | | |
 | 15.6 #29 20 MiB boundary | | |
-| 16.2 #34 Bluetooth reconnect recovers | **partial** (section 16.3) | recovery + gap accounting verified on real headset 2026-09-28; loopback track recorded no audio after its restore |
+| 16.2 #34 Bluetooth reconnect recovers | **PASS** against `v0.3.0-rc.2` (section 16.4); **partial** against `v0.3.0-rc.1` (section 16.3) | rc.2 run 2026-09-29 on a real WF-1000XM5: `capture.device_lost` and `capture.device_restored` on both tracks, `capture.device_lost_fatal = 0`, loopback `gap_ms = 12099` against a 12.3 s measured outage, and — the row rc.1 could not evidence — the loopback track resumed with real 1 kHz content after its restore. The rc.1 "restored but silent" observation is attributed to tone routing; see section 16.4. |
 | 16.2 #34 unrecovered outage is a gap | **PASS** (section 16.3) | `device_lost_fatal` + `capture.gap not_captured` + non-zero `gap_count` verified 2026-09-28 |
 
 M1, M2 and M4 may be described as verified on real hardware only when every row above is filled
@@ -892,9 +899,99 @@ with the confined session's process operations misbehaving rather than with a ma
 sentence is left in section 14.2 as provenance for what the acceptance run reported; the corrected
 reading is this one.
 
-**Pending, appended when the release candidate is published:** the same rows run against the
-`v0.3.0-rc.2` release artifact, which is the artifact `docs/RELIABILITY.md` section 17's
-`audio_content` counters exist for.
+**Appended 2026-09-29:** the same rows were run against the `v0.3.0-rc.2` release artifact — the
+artifact `docs/RELIABILITY.md` section 17's `audio_content` counters exist for — and the content row
+passes. See section 14.4.
+
+### 14.4 v0.3.0-rc.2 process-loopback acceptance run — 2026-09-29
+
+Run against the **published `v0.3.0-rc.2` release artifact** (not a source build), on the section
+14.2/14.3 machine, in an **unconfined** session. This is the run section 14.3 deferred: the same
+content row, against the binary that ships the issue #38 telemetry.
+
+Artifact and provenance:
+
+| Field | Value |
+| --- | --- |
+| Artifact | `meetcap-0.3.0-rc.2-win-x64.zip`, 110,494,591 bytes, from GitHub Release `v0.3.0-rc.2` |
+| SHA256 | `e0ccfefa56b987b9eeb0ccf481e7d323a1edea4d9fe7131489eadd18ea9324d1`, identical across the GitHub asset digest, the bundled `.sha256` asset, the build-info record and a fresh `gh release download` re-hashed on the test machine |
+| Source SHA | `eae8d7856a9d1351e96f1180acc3f92129e0cba9` (release `targetCommitish` and this branch's HEAD) |
+| `meetcap --version` | `0.3.0+eae8d7856a9d1351e96f1180acc3f92129e0cba9`, exit 0; `ProductVersion 0.3.0+eae8d785…`, 103 files extracted |
+| Run object | the extracted `app\meetcap.exe` only; no `dotnet run/build/publish` and no `bin/Release` binary was used |
+
+Environment (section 1 fields):
+
+| Field | Value |
+| --- | --- |
+| Date | 2026-09-29 |
+| Tester | coding agent, unattended DSH session (unconfined file policy) |
+| Machine | DESKTOP-2H6MG5P (LENOVO 21LF) |
+| Windows version / build | Windows 11 家庭版, build 26200 (10.0.26200), AMD64 |
+| Toolchain | .NET SDK 10.0.401 / runtime 10.0.12, ffmpeg+ffplay gyan.dev full build |
+| Render endpoint (loopback source) | `扬声器 (Realtek(R) Audio)`, `{0.0.0.00000000}.{97aa8bbe-5462-4856-916e-4ee6569b8d1e}` |
+| Target process | `ffplay.exe` PID 32880, `-nodisp -autoexit -loop 0`, playing a generated 1000 Hz 48 kHz mono WAV, active for the whole run |
+| `capture.chunk_seconds` | 15 (`device_recovery_seconds = 20`) |
+| ASR / speakers | both disabled |
+
+Method: `capture.online.loopback_mode = "process"`, `capture.online.process_name = "ffplay"`, an
+out-of-tree data root, and the CLI's global options before the subcommand:
+
+```powershell
+meetcap --config-dir <cfg> --data-root <data> start "v0.3.0-rc.2 process-loopback acceptance" --mode online
+# ~76 s with the target playing, then
+meetcap --config-dir <cfg> --data-root <data> stop
+```
+
+Session `ses_20260929T152700Z_76ed3f85`, 75,980 ms, `start` exit 0, `stop` exit 0.
+
+Evidence is retained locally and deliberately **not** committed (large WAVs, out-of-tree session
+data): `C:\CODE.release-validation\v0.3.0-rc.2\evidence\` holds `artifact-provenance.txt`,
+`rc2-version.txt`, `environment.txt`, `devices.txt`, the raw `process-loopback-session.json` and
+`process-loopback-events.jsonl`, the six loopback WAVs plus the concatenated recovered track,
+`process-loopback-ffprobe.txt`, `process-loopback-astats.txt`,
+`process-loopback-frequency-analysis.txt`, `process-loopback-spectrogram.png`,
+`process-isolation-analysis.txt`, `manual-playback.txt`, and
+`v0.3.0-rc.2-acceptance-report.md`. The key hashes and metrics are recorded in this section.
+
+Per-row result (the section 13.5 content row):
+
+| Row | Result |
+| --- | --- |
+| Stable process audio captures real content and does not mark the loopback track degraded | **PASS.** `session.json`: `COMPLETED`, `end_reason: stop_requested`, `degraded: false`, `gap_count: 0`, `gap_total_ms: 0`. Loopback track health: `degraded: false`, no `degraded_reason` at all (in particular **no** `silent_process_loopback` and **no** `empty_process_loopback`), 6 chunks closed. **`audio_content`: `total_samples = 6,701,436`, `non_zero_samples = 6,698,662`, `peak_abs_sample = 0.2311875969171524`, `all_silent: false`.** `events.jsonl` (29 events): `capture.silent_track = 0`, `capture.timeline_unusable = 0`, loopback `capture.discontinuity = 0`, `capture.gap = 0`, `capture.device_lost* = 0`. The single `capture.discontinuity` in the session is the microphone's first-buffer `DataDiscontinuity` stream flag at `at_ms=0`. |
+| The loopback track's chunks cover the session span | **PASS.** 6 chunks `0→15000→30000→45000→60000→75000→75980 ms`, identical boundaries to the microphone track (which ends 75,940 ms); loopback 44,100 Hz stereo float; `session.stopped` `end_ms = 75980`, `count = 12`. |
+| Only the named application's audio appears on the loopback track | **PASS** (process-isolation check below, in this section). |
+
+WAV verification (the mandatory manual check):
+
+- `ffprobe` on the concatenation of the 6 loopback chunks: 00:01:15.98, 44100 Hz, 2 ch, PCM.
+- `ffmpeg … -af astats`: **peak −12.719934 dB, RMS −15.743167 dB**, 3,350,718 frames, flat factor 0.
+- Band-pass 1000 Hz ±50 Hz: RMS **−15.744444 dB** — statistically identical to the full-band RMS.
+  Band-reject 1000 Hz ±50 Hz: RMS **−59.312785 dB**. High-pass 5 kHz: RMS −44.452901 dB.
+  Essentially all captured energy sits at the target tone's frequency.
+- Spectrogram of the recovered track: an unbroken 1 kHz line across all 76 s.
+- **Manual playback: PASS.** The recovered track was played back through the render endpoint and a
+  human tester confirmed a steady continuous 1 kHz tone. This is what rc.1 could not produce.
+
+Process isolation (section 8.6 shape), same run window, two live sources on the one endpoint — the
+target `ffplay.exe` at 1000 Hz and a distinctly-named second player at 880 Hz:
+
+| Capture | RMS | RMS @1 kHz | RMS @880 Hz |
+| --- | --- | --- | --- |
+| system loopback control | −11.486 dB | −21.971 dB | **−11.723 dB** (non-target clearly present) |
+| process loopback (target = `ffplay`) | −24.112 dB | −24.114 dB | **−37.431 dB** |
+
+The 880 Hz non-target leaked into the tap only as much as the −37.4 dB the band reads when no
+880 Hz source exists at all (reproduced with the source dead), i.e. filter leakage, ~25.7 dB below
+the control. **Isolation PASS.**
+
+**Explicitly not covered by this run** — still unrun and not to be read as passed: sections 13.1,
+13.2, 13.4, 13.6; a real meeting application as the target (the target here is `ffplay`, the
+reproduction's own stand-in); the `capture.format_changed` reopened-endpoint row; and every other
+scenario in this document.
+
+Environment limits: one machine, Windows build 26200 only. The rc.1 silence was reached in a
+**confined** agent session and did not reproduce in an unconfined one (section 14.3); this run was
+unconfined, which is a property of the test harness, not of the product.
 
 ---
 
@@ -1122,5 +1219,80 @@ chunk after the restore, so both tracks wrote audio on both sides" did not fully
 loopback track wrote nothing after its restore), so the block is left unticked with the per-row
 evidence pinned here; block 2's three rows are fully evidenced by BT-3 and are marked **PASS** in
 the section 14 table.
+
+### 16.4 v0.3.0-rc.2 Bluetooth reconnect acceptance run — 2026-09-29
+
+Re-run of the section 16.2 rows against the **published `v0.3.0-rc.2` release artifact**, on the
+same machine, with the real headset present. Artifact SHA256
+`e0ccfefa56b987b9eeb0ccf481e7d323a1edea4d9fe7131489eadd18ea9324d1`, source SHA
+`eae8d7856a9d1351e96f1180acc3f92129e0cba9`, Windows 11 家庭版 build 26200, DESKTOP-2H6MG5P.
+
+Device and configuration: Sony **WF-1000XM5**, capture
+`{0.0.1.00000000}.{e285b8cf-2437-48f2-a08a-aa2be8a05d51}`, render
+`{0.0.0.00000000}.{97644e66-70d1-4286-8854-979a505009d3}`, both pinned; `loopback_mode = "system"`,
+`chunk_seconds = 15`, `device_recovery_seconds = 20`, ASR and speakers disabled, out-of-tree data
+root. A 1000 Hz tone played through the headset for the whole run.
+
+Disconnect/reconnect mechanism: **software PnP disable/enable** (`pnputil /disable-device` then
+`/enable-device`) of `BTHENUM\DEV_88C9E8FD1ECC\…` and the A2DP MEDIA devnode
+`BTHENUM\{0000110B-…}_VID&0002054C_PID&0E63\…`. This is **not** a physical headset power-off. The
+`BTHHFENUM` Hands-Free node cannot be disabled on this OS build ("not supported on this OS
+product"), so the HFP endpoint survives — the same limitation the rc.1 record notes.
+
+Measured outage: render endpoint observed gone at 23:37:03.31 and present again at 23:37:15.01 →
+**12.3 s**, inside the 20 s window. Session `ses_20260929T153624Z_c9188ffb`, 87,136 ms,
+`COMPLETED`, `end_reason: stop_requested`.
+
+Evidence retained locally, not committed: `C:\CODE.release-validation\v0.3.0-rc.2\evidence\`
+(`bluetooth2-timeline.txt`, `bluetooth-session.json`, `bluetooth-events.jsonl`,
+`bluetooth-post-restore-content.txt`, `bluetooth-unrecovered-session.json`,
+`bluetooth-unrecovered-events.jsonl`).
+
+| Row | Result |
+| --- | --- |
+| `capture.device_lost` once per affected track, and **no** `capture.device_lost_fatal` | **PASS.** `capture.device_lost`: loopback @ `at_ms=36979`, mic @ `at_ms=47980`. `capture.device_lost_fatal = 0`. |
+| `capture.device_restored` once per track, `gap_ms` ≈ real disconnect | **PASS.** loopback `gap_ms = 12099`, close to the 12.3 s observed render-endpoint outage. Mic `gap_ms = 1006`; its HFP endpoint survived the A2DP disable, so this is a separately observed shorter interruption, not evidence of a 12.3 s mic outage. |
+| Each track resumed with a new WAV chunk after the restore, audio on both sides of the outage | **PASS.** Loopback chunks `000001–000003` precede the loss (ending exactly at 36,979 ms) and `000004–000006` follow the restore, resuming at 49,078 ms. Mic resumed at `000005–000007`. |
+| `session.json` reports `gap_count >= 1` and a non-zero `gap_total_ms` | **PASS.** `gap_count = 2`, `gap_total_ms = 13105`; `capture.gap` ×2, both `reason = "the device skipped audio between buffers"`. |
+| Session did not end with `end_reason = "device_lost"`; unaffected track kept recording | **PASS.** `end_reason: stop_requested`; the mic track kept recording across the loopback outage. |
+
+**Did loopback produce non-zero audio after restore? YES.** Post-restore loopback content, measured
+per chunk:
+
+| Loopback chunk | Timeline | Peak | RMS | RMS @1 kHz |
+| --- | --- | --- | --- | --- |
+| 000004.wav | 49,078–64,077 ms | −21.05 dB | −24.32 dB | −24.32 dB |
+| 000005.wav | 64,077–79,077 ms | −21.28 dB | −24.28 dB | −24.28 dB |
+| 000006.wav | 79,077–86,617 ms | −21.28 dB | −24.28 dB | −24.28 dB |
+
+In each post-restore chunk the 1 kHz band-pass RMS equals the full-band RMS: the recovered audio is
+the target tone, not noise. Session totals for the loopback track: `total_samples = 7,153,848`,
+`non_zero_samples = 7,141,046`, `peak_abs_sample = 0.08858`.
+
+Why this differs from the rc.1 observation, and what that does and does not prove. rc.1 recorded
+`device_restored` with no loopback audio afterwards (section 16.3). A WASAPI playback stream dies
+when its endpoint is removed, and after re-enumeration Windows does not necessarily re-route the
+player to the headset, so "restored but silent" can be an artefact of the *tone source* rather than
+of the recovered track. This run removed that confound: the outage length was measured, the headset
+was re-confirmed as the default render endpoint after the restore, and the tone source was
+restarted **before** the post-restore window was measured. Under that method the post-restore
+loopback audio is present and is the tone. The rc.1 observation is therefore inferred to have been
+tone routing rather than a capture defect — an inference from this run, not a proven fact about the
+rc.1 run.
+
+Non-blocking observation recorded rather than hidden: the A2DP loopback endpoint produced **7,410**
+`capture.discontinuity` events reading *"device position moved backwards; the session timeline was
+kept monotonic"* — i.e. a backwards device position on essentially every ~10 ms buffer, 7,777
+discontinuities in an 87 s session. MeetCap's designed handling kept the timeline monotonic and the
+gap accounting correct (12,099 ms against a 12.3 s outage), so capture correctness is unaffected,
+but the telemetry volume is noisy. The process-loopback path on the Realtek endpoint produced zero
+loopback discontinuities in section 14.4. This deserves its own issue; it is not a release blocker.
+
+Not covered: the `capture.format_changed` reopened-endpoint row remains **NOT RUN** — no stable way
+to manufacture the A2DP/HFP format switch was found. The disconnect is a software PnP disable, not
+a physical power-off.
+
+**Verdict: section 16.2 block 1 = PASS on the rc.2 artifact**, including the post-restore content
+row that rc.1 could not evidence.
 
 ---
