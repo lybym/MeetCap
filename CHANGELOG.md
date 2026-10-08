@@ -12,7 +12,22 @@ manual checklist in `docs/M1_WINDOWS_VALIDATION.md` has been run on real hardwar
 milestones are described as the former, never the latter
 (`docs/DEVELOPMENT.md` section 7).
 
-## [Unreleased]
+## [0.3.0] - 2026-10-08
+
+The third MVP-track release. It fixes three capture defects on top of 0.2.0: Windows process
+loopback was placed by a device position its stream never reports, capture recovery after an
+endpoint disappeared and returned was a hard-coded three one-second budget that also discarded the
+outage it had measured, and a process-loopback track that captured no audio at all was reported as
+a healthy, completed session — so the release now records what each track's samples contained and
+states that failure instead of hiding it. No milestone becomes newly complete in this release: M0
+through M6 remain *implemented and automatically covered*, not *verified end to end*, and the MVP
+umbrella issue ([#1](https://github.com/lybym/MeetCap/issues/1)) and the architecture-baseline
+issue ([#9](https://github.com/lybym/MeetCap/issues/9)) remain OPEN by design.
+
+There is no database migration in this release. Migrations `0001` through `0006` are unchanged,
+`track_health` in `session.json` and the `events.jsonl` vocabulary are extended by values rather
+than columns, and `capture.device_recovery_seconds` is an additive configuration key, so an
+existing `config.toml` and an existing data root are upgraded with no manual step.
 
 ### Fixed
 
@@ -143,17 +158,22 @@ milestones are described as the former, never the latter
   of to the exact frame (`docs/ARCHITECTURE.md` section 8.1).
 - No persisted schema change: `track_health` in `session.json` and the `events.jsonl` vocabulary
   are extended by values, not by columns, so no migration is added.
-- The manual M5 process-loopback checklist (`docs/M1_WINDOWS_VALIDATION.md` section 13.5) gained
-  rows for this behaviour and is still **not run**; the automated coverage is
+- The published `v0.3.0-rc.2` artifact passed the process-loopback content, timeline and
+  isolation checks on 2026-09-29 (`docs/M1_WINDOWS_VALIDATION.md` section 14.4).
+  The remaining section 13.5 rows, including a real meeting application and format-change
+  recovery, remain **not run**. The automated coverage is
   `tests/MeetCap.Core.Tests/Capture/CaptureTimelineTests.cs`,
   `tests/MeetCap.AudioPipeline.Tests/ProcessLoopbackTimelineTests.cs` and
   `tests/MeetCap.WindowsAudio.Tests/NAudioLoopbackClockTests.cs`.
-- Issue [#34](https://github.com/lybym/MeetCap/issues/34)'s real-hardware criterion is **not
-  run**: the machine this work was prepared on has no Bluetooth audio endpoint, so a headset
-  disconnect/reconnect could not be exercised. The recovery window, both tracks' reconnect
-  behaviour, the gap quantification and the reporting are covered by
-  `tests/MeetCap.AudioPipeline.Tests/DeviceRecoveryWindowTests.cs`, and the run to perform on a
-  machine with a headset is written down in `docs/M1_WINDOWS_VALIDATION.md` section 16.
+- Issue [#34](https://github.com/lybym/MeetCap/issues/34)'s rc.2 reconnect acceptance passed
+  on a real Sony WF-1000XM5, including non-zero loopback audio after restore and measured gap
+  accounting (`docs/M1_WINDOWS_VALIDATION.md` section 16.4). The test used software PnP
+  disable/enable, not physical headset power-off; format-change recovery remains **not run**.
+  Automated coverage remains in `tests/MeetCap.AudioPipeline.Tests/DeviceRecoveryWindowTests.cs`.
+- These are recorded acceptance results from one Windows 11 build 26200 machine, not new tests
+  performed for the stable release. M0-M6 end-to-end validation remains incomplete; issues #1
+  and #9 stay open. The locally retained raw evidence path recorded in the acceptance document
+  was unavailable during the 2026-10-08 release preparation, so its raw files were not re-audited.
 
 ## [0.2.0] - 2026-09-19
 
