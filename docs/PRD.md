@@ -464,7 +464,7 @@ Example JSONL:
 {"start_ms":12340,"end_ms":16420,"source":"loopback","speaker_label":"speaker_1","speaker_name":"Alice","text":"We need to check the final quotation."}
 ```
 
-`speaker_label` is anonymous/session-scoped. `speaker_name` is a persistent local identity resolved later and may remain null.
+`speaker_label` is anonymous and scoped to its provider job. `speaker_name` is a persistent local identity resolved later and may remain null.
 
 ---
 

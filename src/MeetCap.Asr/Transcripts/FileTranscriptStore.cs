@@ -19,7 +19,7 @@ public sealed class FileTranscriptStore : ITranscriptStore
 
     /// <summary>Anonymous label caveat printed once at the top of every Markdown transcript.</summary>
     private const string SpeakerLabelNotice =
-        "Speaker labels such as `speaker_1` are anonymous, session-scoped provider labels. " +
+        "Speaker labels such as `speaker_1` are anonymous, provider-job-scoped labels. " +
         "They are not persistent identities and are never assigned to a person by this milestone.";
 
     public int AppendJsonl(string path, IReadOnlyList<TranscriptSegment> segments)

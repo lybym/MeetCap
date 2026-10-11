@@ -1233,7 +1233,7 @@ Normalized segment:
 }
 ```
 
-`speaker_label` is anonymous and session/provider scoped. It is not a stable human identity.
+`speaker_label` is anonymous and provider-job scoped. It is not a stable human identity.
 
 Never overwrite `raw_text`.
 
@@ -1277,7 +1277,7 @@ Volcengine file ASR
   -> anonymous speaker labels
 ```
 
-MeetCap preserves these labels exactly as provider/session-scoped anonymous identities.
+MeetCap preserves these labels exactly as provider-job-scoped anonymous labels.
 
 Optional future/fallback implementations may provide local diarization, including sherpa-onnx, but they are not required for MVP.
 
@@ -1327,6 +1327,15 @@ MeetCap owns:
 - manual lock semantics.
 
 Manual mapping always wins.
+
+An anonymous provider label is scoped to its ASR job, even when the same text appears
+in another job of the session. The current attribution artifact and assignment store
+have one entry per `(session_id, speaker_label)`. If that label occurs on multiple
+source tracks or in multiple provider jobs, automatic matching must leave the whole
+session entry unknown and emit a warning; one sample cannot establish that all those
+segments belong to one person. Missing job provenance also leaves the label unknown
+automatically. An explicit manual assignment remains locked and applies
+to every segment with that label in the session, so the operator must verify that scope.
 
 Priority:
 

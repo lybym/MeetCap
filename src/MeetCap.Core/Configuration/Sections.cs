@@ -139,7 +139,7 @@ public sealed class VolcengineSection
 
     /// <summary>
     /// Ask the provider for anonymous speaker information. These labels are the default
-    /// MVP diarization source and stay anonymous session/provider-scoped data, never
+    /// MVP diarization source and stay anonymous provider-job-scoped data, never
     /// persistent identities.
     /// </summary>
     public bool RequestSpeakerInfo { get; set; } = true;

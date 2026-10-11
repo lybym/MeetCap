@@ -9,7 +9,7 @@ using System.Text.Json.Serialization;
 /// </summary>
 /// <remarks>
 /// <see cref="RawText"/> is immutable and is never overwritten by later processing.
-/// <see cref="SpeakerLabel"/> is an anonymous, session/provider-scoped label such as
+/// <see cref="SpeakerLabel"/> is an anonymous, provider-job-scoped label such as
 /// <c>speaker_1</c>; it is not a stable human identity. <see cref="SpeakerId"/>,
 /// <see cref="SpeakerName"/>, and <see cref="SpeakerConfidence"/> stay null until the
 /// local identity pipeline (M6) resolves them, and
@@ -30,7 +30,7 @@ public sealed record TranscriptSegment
 
     public required string RawText { get; init; }
 
-    /// <summary>Anonymous provider/session-scoped speaker label. Never a person.</summary>
+    /// <summary>Anonymous provider-job-scoped speaker label. Never a person.</summary>
     public string? SpeakerLabel { get; init; }
 
     /// <summary>Persistent identity, resolved only by the local identity pipeline. Null in M3.</summary>

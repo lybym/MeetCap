@@ -44,6 +44,9 @@ public interface ISpeakerStore
     /// <summary>Inserts or replaces the assignment for (session, label). Manual assignments set Locked.</summary>
     void UpsertAssignment(SpeakerAssignment assignment);
 
+    /// <summary>Writes an automatic result only if no manual or locked assignment exists at write time.</summary>
+    bool TryUpsertAutomaticAssignment(SpeakerAssignment assignment);
+
     IReadOnlyList<SpeakerAssignment> ListAssignments(string sessionId);
 
     /// <summary>The assignment for one (session, label), or null.</summary>

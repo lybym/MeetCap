@@ -91,6 +91,20 @@ public sealed class SpeakerAttributionService
         {
             var labelSegments = segments.Where(s => s.SpeakerLabel == label).ToList();
             var manual = _store.GetAssignment(sessionId, label);
+            var multipleTracks = labelSegments.Select(s => s.Source)
+                .Distinct(StringComparer.Ordinal).Take(2).Count() > 1;
+            var multipleJobs = labelSegments.Select(s => s.ProviderJobId)
+                .Distinct(StringComparer.Ordinal).Take(2).Count() > 1;
+            var missingJobProvenance = labelSegments.Any(s => string.IsNullOrWhiteSpace(s.ProviderJobId));
+            var ambiguous = multipleTracks || multipleJobs || missingJobProvenance;
+            if (ambiguous)
+            {
+                var scope = missingJobProvenance ? "missing provider job provenance"
+                    : multipleTracks && multipleJobs ? "multiple tracks and provider jobs"
+                    : multipleTracks ? "multiple tracks" : "multiple provider jobs";
+                warnings.Add($"anonymous label {label} has {scope}; automatic identity matching is skipped. " +
+                    "A manual assignment applies to every segment with this label in the session.");
+            }
 
             SpeakerResolution resolution;
             if (manual is not null && (manual.Locked || manual.Source == SpeakerAssignmentSource.Manual))
@@ -100,19 +114,33 @@ public sealed class SpeakerAttributionService
             }
             else
             {
-                // Try voiceprint identification. If the provider fails, the label stays unknown
-                // and the raw artifacts are untouched (docs/ARCHITECTURE.md section 20).
-                var candidates = await IdentifySafelyAsync(
+                // Anonymous labels can be reused by independent ASR jobs. One session-wide
+                // identity would then name unrelated voices, so only an unambiguous label
+                // can reach the voiceprint provider.
+                IReadOnlyList<SpeakerCandidate> candidates = ambiguous ? [] : await IdentifySafelyAsync(
                     label, labelSegments, sampleExtractor, enrolled, warnings, cancellationToken);
 
                 resolution = SpeakerMatchingPolicy.Resolve(label, manual, candidates, _policy);
 
-                // Persist the voiceprint resolution so it survives a re-run and so the
-                // attribution artifact is reproducible. Only non-manual, non-locked results
-                // are written here; manual assignments are written by the assign command.
-                if (resolution.Source != SpeakerAssignmentSource.Unknown)
+                // Replace a prior automatic binding if a later job reuses its label.
+                // Manual assignments are written only by the assign command.
+                if (resolution.Source != SpeakerAssignmentSource.Unknown || (ambiguous && manual is not null))
                 {
-                    PersistVoiceprintAssignment(sessionId, resolution);
+                    var currentManual = PersistAutomaticAssignment(sessionId, resolution, warnings);
+                    if (currentManual is not null)
+                    {
+                        resolution = SpeakerMatchingPolicy.Resolve(label, currentManual, [], _policy);
+                    }
+                }
+                else
+                {
+                    // A manual assignment may have arrived while the provider was running,
+                    // even when no automatic result was eligible for persistence.
+                    var current = _store.GetAssignment(sessionId, label);
+                    if (current is { Locked: true } or { Source: SpeakerAssignmentSource.Manual })
+                    {
+                        resolution = SpeakerMatchingPolicy.Resolve(label, current, [], _policy);
+                    }
                 }
             }
 
@@ -184,12 +212,6 @@ public sealed class SpeakerAttributionService
             return [];
         }
 
-        if (labelSegments.Select(s => s.Source).Distinct(StringComparer.Ordinal).Take(2).Count() > 1)
-        {
-            warnings.Add($"anonymous label {label} occurs on multiple tracks; use a manual assignment after verifying the speakers.");
-            return [];
-        }
-
         var ranges = CleanSampleSelector.Select(labelSegments, _sampleMinSeconds, _sampleMaxSeconds);
         if (ranges.Count == 0)
         {
@@ -231,12 +253,13 @@ public sealed class SpeakerAttributionService
         return [];
     }
 
-    private void PersistVoiceprintAssignment(string sessionId, SpeakerResolution resolution)
+    private SpeakerAssignment? PersistAutomaticAssignment(
+        string sessionId, SpeakerResolution resolution, List<string> warnings)
     {
         try
         {
             var now = DateTimeOffset.UtcNow;
-            _store.UpsertAssignment(new SpeakerAssignment
+            var written = _store.TryUpsertAutomaticAssignment(new SpeakerAssignment
             {
                 Id = Ids.NewSpeakerAssignmentId(),
                 SessionId = sessionId,
@@ -244,16 +267,19 @@ public sealed class SpeakerAttributionService
                 SpeakerId = resolution.SpeakerId,
                 SpeakerName = resolution.SpeakerName,
                 Confidence = resolution.Confidence,
-                Source = SpeakerAssignmentSource.Voiceprint,
+                Source = resolution.Source,
                 Locked = false,
                 CreatedAt = now,
                 UpdatedAt = now,
             });
+            return written ? null : _store.GetAssignment(sessionId, resolution.SpeakerLabel);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             // Persisting the assignment is best-effort; the attribution artifact is
             // still returned. A store failure does not compromise the transcript.
+            warnings.Add($"speaker assignment could not be persisted for {resolution.SpeakerLabel}: {ex.Message}");
+            return null;
         }
     }
 }
