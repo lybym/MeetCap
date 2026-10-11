@@ -204,7 +204,8 @@ M4 additions, stated precisely:
   `next_retry_at` has passed, so backoff survives a network outage exactly as it does a restart;
 - `meetcap asr resume --force` processes retry-wait jobs whose schedule has not come due yet.
   That is for the operator who knows the outage is over, and it is the only way the schedule is
-  bypassed;
+  bypassed. `--max-jobs N` caps the combined due and forced-retry selection at N distinct jobs,
+  retaining due-first ordering; it does not cap result queries or provider transport retries;
 - `VolcengineAsrProvider` wraps the transport exceptions its Polly pipeline rethrows
   (`HttpRequestException`, `TimeoutRejectedException`, a cancelled request) in
   `AsrTransientException`, so a lost network reaches the durable state machine as a retryable

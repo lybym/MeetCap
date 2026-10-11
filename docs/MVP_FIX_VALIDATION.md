@@ -47,13 +47,37 @@ Evidence is outside the repository at `C:\CODE\artifacts\meetcap-fixes-20261011`
   Existing capture/gap/recovery, process-QPC and provider tests remain part of the full suite.
   Full Debug and Release suites: 847 passed each, zero failures. Compiler: zero warnings/errors.
 
+## Sampled cloud recovery and job budget (2026-10-11)
+
+After explicit upload authorization, the user reduced the recovery to a sample to save API
+fees. An isolated SQLite backup retained only four existing jobs and their batch artifacts:
+one retry-wait and one pending job per mic/loopback track. The original queue was untouched.
+Each batch contained 45 seconds (180 seconds total). No other batch was submitted.
+
+- The real Release CLI and Volcengine completed all four jobs; submit/completion events total
+  four each. Native 17,280,044-byte float WAVs became verified 1,440,078-byte 16 kHz mono PCM16
+  derivatives. Request, response, normalized result, raw JSONL and live Markdown were retained.
+- All four provider responses contained empty text. Both mic samples were digitally silent;
+  loopback samples had low signal energy but no recognized speech. This verifies sampled
+  queue/transport recovery, **not** speech recognition, speaker labels or transcript timestamps.
+  No further audio was submitted to seek a better result.
+- A second resume reported no jobs needing work; submit/completion counts stayed at four.
+  All 324 original WAV hashes were unchanged, and the original queue remained 49 retry-wait /
+  33 pending. The sample session's completed state refers only to its four-job copy.
+- No API key appeared in the sample logs or report artifacts. Evidence:
+  `C:\CODE\artifacts\meetcap-fixes-20261011\outage-sample\audit.json`.
+- Inspection also found #43: force mode could add up to N deferred retry jobs after already
+  selecting N due jobs. The fix fills only the remaining `--max-jobs` budget. Seven regression
+  cases cover negative/zero/small/full limits, due-first ordering, provider submissions and
+  unchanged unselected jobs; four cases failed before the fix. The ASR suite passed 83 tests,
+  and the full Release suite passed 854 tests with zero failures.
+  This caps distinct jobs, not polling requests or provider transport retries.
+
 ## Remaining release gates
 
-- The 82-job outage recovery upload was rejected by automatic permission review because it
-  requires explicit permission to send potentially sensitive recorded audio to Volcengine.
-  No recovery command ran. Authorization has been requested; local work continued.
-- Real provider validation of normalized live batches and continuously persisted dual-track
-  transcripts remains required. Large-file TOS round-trip was not rerun.
+- Full 82-job outage recovery was intentionally not attempted after the user's sampling request.
+  The sampled real provider transport passed; continuously persisted dual-track transcripts
+  with actual recognized speech remain required. Large-file TOS round-trip was not rerun.
 - A new, globally meeting-disjoint 97-clip experiment completed initial calibration and a
   frozen independent test; see `SPEAKER_CALIBRATION.md`. Candidate 0.46 / 0.01 accepted 10/12
   known test clips with 0/24 unknown false accepts; default 0.82 / 0.08 accepted 0/12.

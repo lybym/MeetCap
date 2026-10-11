@@ -406,6 +406,45 @@ public class AsrJobProcessorTests : IDisposable
         Assert.Equal(AsrJobStatus.Succeeded, _jobs.Get(job.Id)!.Status);
     }
 
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    [InlineData(6)]
+    public async Task RunDue_ForceRespectsTheCombinedDueAndScheduledJobBudget(int maxJobs)
+    {
+        var originals = new List<AsrJob>
+        {
+            CreateJob(jobId: "due_1"),
+            CreateJob(jobId: "due_2"),
+        };
+        var future = DateTimeOffset.UtcNow.AddDays(1);
+        for (var index = 0; index < 3; index++)
+        {
+            originals.Add(CreateJob(
+                status: AsrJobStatus.RetryWait,
+                attempts: 1,
+                nextRetryAt: future.AddMinutes(index),
+                jobId: $"scheduled_{index}"));
+        }
+
+        _provider.OnPoll = _ => Completed();
+        var results = await CreateProcessor().RunDueAsync(maxJobs, ignoreRetrySchedule: true);
+        var expectedCount = Math.Clamp(maxJobs, 0, originals.Count);
+
+        Assert.Equal(expectedCount, results.Count);
+        Assert.Equal(originals.Take(expectedCount).Select(job => job.Id), results.Select(result => result.Job.Id));
+        Assert.Equal(expectedCount, _provider.Submissions.Count);
+        Assert.All(results, result => Assert.Equal(AsrJobOutcome.Succeeded, result.Outcome));
+        foreach (var unselected in originals.Skip(expectedCount))
+        {
+            Assert.Equal(unselected, _jobs.Get(unselected.Id));
+        }
+    }
+
     [Fact]
     public async Task RunDue_FinishesAJobThatIsWaitingAtTheSubmittedStep()
     {
