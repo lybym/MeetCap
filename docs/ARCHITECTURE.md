@@ -526,6 +526,18 @@ Discontinuities are never smoothed over:
   explicit `capture.format_changed` event (naming both formats) and a non-zero exit,
   instead of writing new bytes under the old header.
 
+Repeated device-position anomalies are reported immediately, then aggregated at five-second
+session-time intervals, with any pending count flushed at stream restart or stop. Each event
+retains the latest device position and QPC reading and uses `reason = device_position_backwards`;
+the sum of `count` is the number of observed anomalies. Device buffer flags and real gap events
+remain separate diagnostics. On a Sony Bluetooth endpoint the position can advance more slowly
+than the captured buffer's frame count (hardware evidence in `M1_WINDOWS_VALIDATION.md` section
+16.5), so "backwards" means behind the expected continuation, not necessarily an absolute
+decrease. No clock mode is inferred from this observation. If a later positive skip occurs while
+the original position anchor is behind the monotonic timeline, the next buffer is placed no
+earlier than the previous end plus the measured skip. This preserves a non-empty gap interval
+instead of collapsing missing audio into the monotonic clamp.
+
 M2 makes the missing time explicit on both sides of a crash: the live timeline counts every
 discontinuity once as `CaptureTimeline.GapTotalMs` / `GapCount` and persists it in
 `session.json`, and startup recovery re-derives the same question from the chunk index with the

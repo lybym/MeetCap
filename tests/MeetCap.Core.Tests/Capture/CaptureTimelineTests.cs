@@ -253,6 +253,32 @@ public class CaptureTimelineTests
     }
 
     [Fact]
+    public void GapInterval_AForwardSkipAfterRepeatedBackwardsPositions_RemainsOnTheTimeline()
+    {
+        var timeline = new CaptureTimeline(Mono48k);
+
+        // Sony system loopback supplied 480 audio frames per 10 ms buffer, while its
+        // position advanced only 160. The monotonic clamp puts the stream ahead of
+        // its original position anchor; a later real skip must survive that clamp.
+        for (var i = 0; i < 100; i++)
+            timeline.Observe(Packet(i * 160, TenMs));
+
+        var resumePosition = 99 * 160 + TenMs + 2_880;
+        var timing = timeline.Observe(Packet(resumePosition, TenMs));
+        var next = timeline.Observe(Packet(resumePosition + TenMs, TenMs));
+
+        Assert.Equal(60, timing.GapMs);
+        Assert.Equal(1_000, timing.GapStartMs);
+        Assert.Equal(1_060, timing.GapEndMs);
+        Assert.Equal(1_060, timing.StartMs);
+        Assert.Equal(1_070, timing.EndMs);
+        Assert.Equal(timing.EndMs, next.StartMs);
+        Assert.False(next.IsIrregular);
+        Assert.Equal(1, timeline.GapCount);
+        Assert.Equal(60, timeline.GapTotalMs);
+    }
+
+    [Fact]
     public void GapInterval_IsAbsentWhenNothingIsMissing()
     {
         var timeline = new CaptureTimeline(Mono48k);

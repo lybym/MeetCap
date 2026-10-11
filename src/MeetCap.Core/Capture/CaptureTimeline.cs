@@ -405,9 +405,13 @@ public sealed class CaptureTimeline
     private PacketTiming Place(long durationMs, bool flagged, Placement placement)
     {
         var startMs = placement.StartMs;
-        if (startMs < _lastEndMs)
+        // A backwards source position can leave its original anchor behind the
+        // monotonic timeline. A later positive skip is still missing audio: clamp
+        // after that measured gap, rather than collapsing its interval to zero.
+        var earliestStartMs = _lastEndMs + placement.GapMs;
+        if (startMs < earliestStartMs)
         {
-            startMs = _lastEndMs;
+            startMs = earliestStartMs;
         }
 
         var endMs = startMs + durationMs;
