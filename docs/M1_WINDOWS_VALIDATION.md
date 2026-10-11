@@ -1408,7 +1408,7 @@ no false gaps or accumulated drift, while preserving a subsequent actual 8 s hol
 use `qpc_position_backwards`, rather than incorrectly describing device frame positions.
 The regressions also pin live/audited gap interval equality,
 aggregate tail counts, independent microphone health and durable audio. Release build passed
-with zero warnings/errors; the complete local Release suite passed **871/871**, with no skips,
+with zero warnings/errors; the complete local Release suite passed **873/873**, with no skips,
 including microphone, baseline system loopback, process QPC and device-recovery regressions.
 
 Limitations: these short runs do not repeat the two-hour soak test or prove endpoint format
@@ -1420,5 +1420,7 @@ high-water build's steady recording is scoped separately from the earlier real r
 the latter proves first-frame recovery anchoring/content and exposed the drift now covered by
 metadata-shaped regressions. No new physical disconnect is claimed for the steady run.
 The steady recording uses the final QPC placement logic; subsequent changes only preserve start
-failure diagnostics and defer the restored event until successful `Start()`. Those event changes
-are covered by the final 871-test suite, without claiming another hardware recording.
+failure diagnostics, defer the restored event until successful `Start()`, and clear startup
+outages before the first captured packet defines an origin. The latter prevents an invented gap
+on the second buffer after a failed initial start. Those changes are covered by the final
+873-test suite, without claiming another hardware recording.

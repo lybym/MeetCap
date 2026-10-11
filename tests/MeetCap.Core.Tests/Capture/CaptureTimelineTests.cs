@@ -459,6 +459,24 @@ public class CaptureTimelineTests
         Assert.Equal(19_020, timeline.QpcToSessionMs(250_200_000));
     }
 
+    [Theory]
+    [InlineData(CaptureClock.DevicePosition)]
+    [InlineData(CaptureClock.Qpc)]
+    public void StartupRecoveryBeforeOrigin_DoesNotInsertItsOutageIntoTheSecondPacket(CaptureClock clock)
+    {
+        var timeline = new CaptureTimeline(Mono48k, clock);
+        timeline.RecordDeviceLoss(5_000);
+        var first = timeline.Observe(Packet(0, TenMs, qpc: 10_000_000));
+        var second = timeline.Observe(Packet(TenMs, TenMs, qpc: 10_100_000));
+        Assert.Equal(0, first.StartMs);
+        Assert.Equal(10, second.StartMs);
+        Assert.Equal(20, second.EndMs);
+        Assert.False(second.IsNewSegment);
+        Assert.False(second.IsIrregular);
+        Assert.Equal(0, timeline.GapTotalMs);
+        Assert.Equal(0, timeline.GapCount);
+    }
+
     [Fact]
     public void QpcClock_EarlyTimestampsThenCorrections_DoNotInventRepeatedGaps()
     {

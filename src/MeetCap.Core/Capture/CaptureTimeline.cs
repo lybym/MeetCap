@@ -292,6 +292,11 @@ public sealed class CaptureTimeline
         // like a placed track (docs/RELIABILITY.md section 7).
         var qpcTicks = _clock == CaptureClock.Qpc ? RequireQpcTicks(packet) : packet.QpcPositionTicks;
 
+        // A device that failed before any audio was captured leaves no prior span to
+        // lose. Its first successful packet defines the origin, so do not carry that
+        // startup retry into the second packet as an invented restart/gap.
+        _pendingGapMs = 0;
+        _pendingSegmentRestart = false;
         _hasOrigin = true;
         _originFrames = packet.DevicePositionFrames;
         _originQpcTicks = qpcTicks;
