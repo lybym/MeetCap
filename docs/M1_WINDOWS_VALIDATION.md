@@ -1422,16 +1422,18 @@ New regressions cover 3,000 packets of both 480-frame controls and 512-frame pay
 floor-rounded QPC and half-ms early readings, followed by a real 8,000 ms gap. Core placement
 and the durable one-second chunk index now end at the full captured duration, with identical
 live/audited gap counts and intervals. After this correction, **36 CaptureTimeline tests and
-97 pipeline/process/recovery/start/chunk-recovery tests passed**. The updated full build/suite
-and new CI are pending at the user-requested pause; the earlier 873 result is not claimed for
-the corrected head.
+97 pipeline/process/recovery/start/chunk-recovery tests passed**. At corrected head
+`c1ce35f1294efc2a6fd608b1a19f815758eba508`, the official
+[CI run 38113266812](https://github.com/lybym/MeetCap/actions/runs/38113266812)
+passed Release build with zero warnings/errors and **878/878 tests**, with no skips.
+The earlier 873 result remains scoped to the reviewed head.
 
 Limitations: these short runs do not repeat the two-hour soak test or prove endpoint format
 changes. The historical rc.2 post-reconnect result in section 16.4 stays separately scoped to that
 artifact and OS. Initial per-track QPC origins still start each track at zero; a shared initial
 session epoch is separate work. The old 60 ms hardware event was captured before the gap-boundary
-fix; deterministic regressions establish the corrected frame-clock interval. The exact final
-high-water build's steady recording is scoped separately from the earlier real reconnect test:
+fix; deterministic regressions establish the corrected frame-clock interval. The pre-review
+high-water snapshot's steady recording is scoped separately from the earlier real reconnect test:
 the latter proves first-frame recovery anchoring/content and exposed the drift now covered by
 metadata-shaped regressions. No new physical disconnect is claimed for the steady run.
 The steady recording uses the pre-review high-water placement logic; subsequent changes preserve start
