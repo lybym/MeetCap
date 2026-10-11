@@ -95,7 +95,10 @@ Large-file transport is specified and implemented by issue #29 (PR #31, merged t
 0.2.0). Files at or below 20 MiB stay on inline `audio.data`; larger files are temporarily staged
 in a private Volcengine TOS object using
 the official TOS .NET SDK and submitted through an SDK-generated presigned `audio.url`. TOS is
-optional for ordinary 300-second live batches and never replaces local durable audio. The job row
+optional for ordinary 300-second live batches: native live WAVs are normalized on the ASR worker
+to 16 kHz mono PCM16 before transport selection (about 9.6 MB for five minutes).
+FFmpeg/FFprobe are required for that preparation; failures leave capture independent and jobs retryable.
+TOS never replaces local durable audio. The job row
 keeps the stable bucket and object key — never the signed URL — so a restart can re-sign and can
 finish the idempotent `DeleteObject` cleanup; a cleanup failure is recorded retryable debt and does
 not invalidate a successful transcript.

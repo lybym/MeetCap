@@ -44,7 +44,13 @@ MeetCap keeps its local-first workflow. Under issue #29, normalized WAV artifact
 20 MiB stay on the official `audio.data` Base64 path; larger inputs use a private Volcengine TOS
 object uploaded with the official TOS .NET SDK, then submit an SDK-generated presigned GET URL
 through `audio.url`. TOS is therefore a large-file transport fallback, not a prerequisite for
-ordinary 300-second live batches and never a replacement for durable local audio.
+ordinary 300-second live batches after normalization, and never a replacement for durable local audio.
+Native live batches can be much larger (48 kHz stereo float is about 115.2 MB for five minutes).
+Before submission, the ASR worker uses the existing FFmpeg boundary to write a 16 kHz mono PCM16
+copy under `asr/jobs/<job_id>/normalized.wav` (about 9.6 MB). The copy is finalized through `.part`
+and revalidated before transport selection. Native batches/chunks, track separation, job identity
+and session offsets are preserved. Polling and TOS cleanup do not require FFmpeg; preparation
+failures become `audio.normalization` retries and never interrupt healthy capture.
 
 Authoritative interface reference:
 

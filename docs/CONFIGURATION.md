@@ -317,7 +317,10 @@ fallback is configured.
 ## 8.1 TOS large-file ASR transport
 
 TOS is optional infrastructure for oversized file-ASR inputs. It is not required for normal
-300-second live batches and does not replace the local session/audio artifact tree.
+300-second live batches after the ASR worker's 16 kHz mono PCM16 preparation, and does not
+replace the local session/audio artifact tree. A native five-minute 48 kHz stereo float batch
+is about 115.2 MB; its prepared ASR copy is about 9.6 MB. Configure FFmpeg/FFprobe for live ASR
+as for imports. Missing tooling causes persistent ASR retries while recording stays independent.
 
 ```toml
 [asr.tos]
@@ -433,6 +436,18 @@ sample_max_seconds = 15
 ```
 
 Initial thresholds are placeholders until calibrated on real Chinese meeting recordings.
+The 2026-10-09 held-out base-model check ranked 18/18 known-person samples correctly, but
+accepted 0/18 at the default 0.82 threshold; 10/10 unenrolled-person samples were rejected.
+These small, previously observed samples do not justify lowering the product default.
+Use separate calibration and test recordings before selecting a different threshold/margin.
+
+`speakers attribute` reads imported audio through the durable `session.json` source mapping,
+preferring the normalized artifact. Live samples are read from the transcript's source track.
+Only the requested WAV frames are loaded. A label occurring on multiple tracks remains unknown
+automatically, with a warning, because the current session-label assignment schema cannot
+represent distinct people sharing that label; manual assignment still applies to the whole label.
+Embedding model name, version and dimension must match; equal dimensions alone do not imply
+compatibility. The actual dimension comes from the loaded model, not a hard-coded size.
 
 Validation rules:
 

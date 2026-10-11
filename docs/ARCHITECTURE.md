@@ -1526,8 +1526,8 @@ when a process dies between writing the transcript and persisting the terminal j
 
 Imported and recorded sessions therefore share the same transcript and speaker-identity pipeline.
 
-Imports continue to prefer one provider file request. `main` is inline-Base64-only; issue #29 (PR
-#31) adds a transport fallback where inputs above 20 MiB are streamed to a private TOS object with
+Imports continue to prefer one provider file request. Issue #29 (PR #31) provides a transport
+fallback where prepared inputs above 20 MiB are streamed to a private TOS object with
 the official .NET SDK and submitted as a presigned `audio.url`. This does not bypass provider
 file/duration limits and does not introduce automatic splitting; split mapping with preserved
 timestamps remains a later concern (`ASR_STRATEGY.md` section 12).
@@ -1535,7 +1535,9 @@ timestamps remains a later concern (`ASR_STRATEGY.md` section 12).
 The transport is selected by artifact size alone and is not user-tunable: there is no setting that
 can push a small file through TOS or a large file through `audio.data`. When an oversized artifact
 needs TOS and `[asr.tos]` is absent the submission fails actionably; MeetCap never splits,
-downsamples, changes the ASR tier, or opens a streaming request as a substitute.
+changes the ASR tier, or opens a streaming request as a substitute. Live native capture audio
+is normalized to the standard 16 kHz mono PCM16 ASR target before this transport decision
+(#41); that preparation is independent of whether TOS is configured and preserves native audio.
 
 ### 21.1 Live recording (M4)
 
@@ -1553,7 +1555,8 @@ recording loop (Ctrl+C, `meetcap stop`, or an unrecoverable capture/storage fail
   per durably closed chunk:  -> append to the batch window of its track
   when a window closes:      -> asr/batches/<source>/batch-NNNNNN.wav (+ .json)
                              -> asr_jobs row (pending)
-  background drain:          -> submit -> poll -> retain raw response -> normalize
+  background drain:          -> prepare verified normalized.wav on ASR worker
+                             -> submit -> poll -> retain raw response -> normalize
                              -> asr/jobs/<job-id>/{request.json,response.json,normalized.jsonl}
                              -> transcript/raw.jsonl (rebuilt from every job's normalized.jsonl)
                              -> transcript/live.md

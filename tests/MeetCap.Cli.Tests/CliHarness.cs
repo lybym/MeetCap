@@ -54,23 +54,29 @@ internal sealed class CliHarness : IDisposable
     {
         using var output = new StringWriter();
         using var error = new StringWriter();
+        var previousUiCulture = System.Globalization.CultureInfo.CurrentUICulture;
+        System.Globalization.CultureInfo.CurrentUICulture = System.Globalization.CultureInfo.GetCultureInfo("en-US");
+        try
+        {
 
-        // No explicit store: the harness relies on the production store resolution so
-        // the one-shot --config-dir override is exercised end to end. The ASR transport is
-        // the harness's stand-in, so the command composition, the SQLite queue, the
-        // transcript writer, and the Volcengine adapter are all the shipped ones and only
-        // the network boundary is replaced (docs/DEVELOPMENT.md section 7).
-        var exitCode = Program.Run(
-            args,
-            Environment,
-            configurationStore: null,
-            invocationConfiguration: new InvocationConfiguration { Output = output, Error = error },
-            platformFactory: Platform,
-            asrHttpHandler: AsrHttp);
+            // No explicit store: the harness relies on the production store resolution so
+            // the one-shot --config-dir override is exercised end to end. The ASR transport is
+            // the harness's stand-in, so the command composition, the SQLite queue, the
+            // transcript writer, and the Volcengine adapter are all the shipped ones and only
+            // the network boundary is replaced (docs/DEVELOPMENT.md section 7).
+            var exitCode = Program.Run(
+                args,
+                Environment,
+                configurationStore: null,
+                invocationConfiguration: new InvocationConfiguration { Output = output, Error = error },
+                platformFactory: Platform,
+                asrHttpHandler: AsrHttp);
 
-        // Capture the text after Run returns; the harness owns the writers and the
-        // production pipeline does not write once Run has completed.
-        return new CliResult(exitCode, output.ToString(), error.ToString());
+            // Capture the text after Run returns; the harness owns the writers and the
+            // production pipeline does not write once Run has completed.
+            return new CliResult(exitCode, output.ToString(), error.ToString());
+        }
+        finally { System.Globalization.CultureInfo.CurrentUICulture = previousUiCulture; }
     }
 
     /// <summary>Provider transport stand-in, installed by <see cref="WriteLiveAsrConfig"/>.</summary>
@@ -216,6 +222,35 @@ internal sealed class CliHarness : IDisposable
         public TestCliEnvironment(string configDirectory) => _configDirectory = configDirectory;
 
         public override string DefaultConfigDirectory => _configDirectory;
+
+        public override MeetCap.Core.Media.IMediaPipeline CreateMediaPipeline(MeetCapConfiguration configuration)
+            => new FakeLiveMediaPipeline();
+    }
+
+    // External-tool seam: queue/timeline/provider HTTP tests do not require FFmpeg in CI.
+    private sealed class FakeLiveMediaPipeline : MeetCap.Core.Media.IMediaPipeline
+    {
+        public MeetCap.Core.Media.MediaInfo Inspect(string path)
+        {
+            var header = MeetCap.AudioPipeline.Wave.WavHeader.Parse(File.ReadAllBytes(path));
+            var format = header.Format ?? throw new MeetCap.Core.Media.MediaProbeException("Invalid test WAV");
+            return new MeetCap.Core.Media.MediaInfo { Path = path, FormatName = "wav",
+                DurationMs = header.DeclaredDataBytes * 1000L / format.AverageBytesPerSecond,
+                ByteLength = new FileInfo(path).Length, AudioCodec = format.BitsPerSample == 16 ? "pcm_s16le" : "pcm_f32le",
+                SampleRateHz = format.SampleRate, Channels = format.Channels, BitDepth = format.BitsPerSample };
+        }
+        public Task NormalizeAsync(string input, string output, MeetCap.Core.Media.MediaNormalizationPlan plan, CancellationToken ct = default)
+        {
+            var info = Inspect(input);
+            var format = new AudioFormat(16000, 1, 16, AudioSampleFormat.Pcm);
+            var bytes = (int)(info.DurationMs * 32);
+            Directory.CreateDirectory(Path.GetDirectoryName(output)!);
+            using var writer = new MeetCap.AudioPipeline.Wave.WaveChunkWriter(output, output + ".closed", format, Math.Max(bytes, 2), 1);
+            writer.Append(new byte[bytes]);
+            writer.Close(DateTimeOffset.UtcNow);
+            File.Move(output + ".closed", output);
+            return Task.CompletedTask;
+        }
     }
 }
 

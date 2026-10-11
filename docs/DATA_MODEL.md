@@ -279,6 +279,18 @@ section 6 already indexes the artifact each ASR job consumed through `input_arti
 
 Append-only operational events, one JSON object per line.
 
+Backwards-device-position diagnostics use `capture.discontinuity` with
+`reason = "device_position_backwards"` and a `count` of observations represented by that record.
+The first observation is immediate; repeats are aggregated over five-second session-time
+windows and the tail is flushed on restart/graceful completion. Sum `count`, not event lines,
+for these observations. The record retains the last observation's timing metadata.
+Gap events remain individual records. A forced kill can omit the pending diagnostic window.
+
+Live ASR preparation adds `asr/jobs/<job_id>/normalized.wav` as a derived 16 kHz mono PCM16
+copy, finalized through `.part` and validated before transport. Native input artifacts and
+the indexed `input_artifact` remain authoritative; the sanitized submitted request records
+the prepared path. Polling does not read this derivative and a retry regenerates it.
+
 ```json
 {"event":"session.started","at_ms":0}
 {"event":"audio.chunk.opened","at_ms":0,"source":"mic","chunk":"000001.wav","start_ms":0,"device_position_frames":0,"qpc_position_ticks":123456}

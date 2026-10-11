@@ -72,6 +72,18 @@ public class SpeakerAttributionServiceTests : IDisposable
             });
 
     [Fact]
+    public async Task SameAnonymousLabelOnTwoTracks_RemainsUnknownWithoutReadingWrongAudio()
+    {
+        await EnrollSpeaker("Alice", [1, 0, 0, 0]);
+        var service = new SpeakerAttributionService(_database.Speakers, ProviderByLabel(), _policy, 5, 15);
+        var segments = new[] { Seg("speaker_0", "local"), Seg("speaker_0", "remote") with { Source = "loopback" } };
+        var result = await service.BuildAsync("ses_1", segments,
+            (_, _, _, _) => throw new Exception("ambiguous track must not reach extraction"));
+        Assert.All(result.AttributedSegments, s => Assert.Null(s.SpeakerId));
+        Assert.Contains(result.Warnings, w => w.Contains("multiple tracks", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task ManualAssignment_WinsOverVoiceprint()
     {
         await EnrollSpeaker("Alice", [1, 0, 0, 0]);

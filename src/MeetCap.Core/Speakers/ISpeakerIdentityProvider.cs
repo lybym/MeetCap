@@ -24,7 +24,7 @@ public interface ISpeakerIdentityProvider
     /// <summary>The embedding model version.</summary>
     string ModelVersion { get; }
 
-    /// <summary>The dimension of embeddings this provider produces (192 for ERes2Net-base).</summary>
+    /// <summary>The actual dimension reported by the loaded embedding model.</summary>
     int EmbeddingDimension { get; }
 
     /// <summary>
