@@ -205,7 +205,7 @@ public class ProcessLoopbackTimelineTests
         var unusable = Assert.Single(EventsNamed(paths, SessionEventNames.CaptureTimelineUnusable));
         Assert.Equal(AudioSources.Loopback, unusable.Source);
         Assert.Contains("QPC", unusable.Detail, StringComparison.Ordinal);
-        Assert.Contains("loopback_mode = \"system\"", unusable.Detail, StringComparison.Ordinal);
+        Assert.Contains("offline microphone", unusable.Detail, StringComparison.Ordinal);
 
         // The audio captured before the failure is durable: the track closed and renamed its
         // chunk when it ended rather than leaving it as a .part.
@@ -334,15 +334,14 @@ public class ProcessLoopbackTimelineTests
     {
         // Issue #33's third expectation on a QPC-placed track, end to end: a real outage has to
         // appear exactly once as a gap, the audio captured before it has to become durable on
-        // its own chunk, and the recovered stream has to stay on its declared clock instead of
-        // displacing the measured outage with the new stream's own reading
+        // its own chunk, and the recovered stream has to retain its original system QPC
+        // anchor so the first restored frame determines the final missing interval
         // (docs/RELIABILITY.md sections 7 and 8, docs/ARCHITECTURE.md section 8.1).
         using var harness = OnlineProcessLoopbackHarness();
         var micSource = MicSource(harness);
         var firstLoopback = ProcessLoopbackSource(harness);
 
-        // The replacement stream, scripted like a real reopen: its own QPC starts from a fresh
-        // origin that says nothing about session time.
+        // Reopening resets the stream's frame position, but not system QPC.
         var reopened = new FakeCaptureSource(Format, harness.RenderDevice, AudioSource.Loopback)
         {
             Clock = CaptureClock.Qpc,
@@ -372,9 +371,9 @@ public class ProcessLoopbackTimelineTests
             await Wait.UntilAsync(() => reopened.StartCount == 1, timeoutMs: 15_000),
             "the loopback endpoint was not reopened");
 
-        // The reopened stream continues, but its own QPC sits far from where the outage ended.
+        // The first resumed frame is at 23 s on the original system counter.
         TestAudio.EmitSecondsWithoutDevicePosition(
-            reopened, Format, 0, milliseconds: 20_000, qpcDeltaTicks: 900_000_000);
+            reopened, Format, 0, milliseconds: 20_000, qpcDeltaTicks: 230_000_000);
 
         cancellation.Cancel();
         var outcome = await Finish(run);

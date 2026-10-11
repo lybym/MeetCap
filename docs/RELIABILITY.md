@@ -111,6 +111,18 @@ The window is snapshotted at session start with the rest of the capture settings
 recording that is already running keeps the policy it started with
 (`docs/CONFIGURATION.md` section 12).
 
+An opened endpoint is not yet resumed audio. `capture.device_restored.gap_ms` measures the time
+until reopening, so it is a lower bound, not the final audio gap. The restored event is published
+only after replacement `Start()` succeeds; construction alone or a refused format is not a
+restore. A start failure keeps its exception message, underlying type and HRESULT in the loss
+diagnostic, and consumes the existing bounded retry budget. The first replacement buffer
+keeps the restart boundary with itself through the queue. QPC tracks retain the original system
+counter anchor and measure the final gap to the buffer's first frame; frame-clock tracks measure
+to the capture callback. The latter is an observation-time estimate, not acoustically exact.
+Neither measurement includes consumer queue delay. If no replacement buffer arrives before
+stop or another device loss, the waiting interval is included in the pending terminal outage,
+once. Unusable QPC ends only that track with explicit diagnostics and durable previous audio.
+
 ### 8.2 An outage that never recovers is still a gap
 
 A measured outage is normally placed on the session timeline by the *next* buffer: only then

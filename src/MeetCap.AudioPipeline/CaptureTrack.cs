@@ -123,6 +123,8 @@ internal sealed class CaptureTrack : IDisposable
         /// while the measured outage was still unplaced.
         /// </summary>
         FormatChanged = 3,
+
+        TimingUnusable = 4,
     }
 
     private readonly SessionPaths _paths;
@@ -159,7 +161,8 @@ internal sealed class CaptureTrack : IDisposable
     private CaptureClock _captureClock = CaptureClock.DevicePosition;
     private CaptureTimeline? _timeline;
     private ChunkSpool? _spool;
-    private Channel<AudioPacket>? _channel;
+    private readonly record struct QueuedPacket(AudioPacket Packet, long? RestartGapMs);
+    private Channel<QueuedPacket>? _channel;
     private CaptureBacklogMonitor? _backlog;
 
     private TaskCompletionSource? _segmentEnded;
@@ -185,6 +188,8 @@ internal sealed class CaptureTrack : IDisposable
     private int _timelineUnusable;
     private int _announcedChunkSequence;
     private long _pendingGapMs;
+    private long _awaitingFirstBufferSinceUtcTicks;
+    private long _lastReopenDowntimeMs;
     private long _stallObservedMs;
     private int _closedChunkCountAtLastStallCheck;
     private DateTimeOffset? _lastStallEventAt;
@@ -337,7 +342,7 @@ internal sealed class CaptureTrack : IDisposable
             _events,
             _clock);
         _backlog = new CaptureBacklogMonitor(QueueCapacity(_settings));
-        _channel = Channel.CreateBounded<AudioPacket>(new BoundedChannelOptions(_backlog.Capacity)
+        _channel = Channel.CreateBounded<QueuedPacket>(new BoundedChannelOptions(_backlog.Capacity)
         {
             SingleReader = true,
             SingleWriter = false,
@@ -383,6 +388,7 @@ internal sealed class CaptureTrack : IDisposable
     private async Task RunCaptureSegmentsAsync(IAudioCaptureSource source, CancellationToken cancellationToken)
     {
         var attempts = 0;
+        var isReplacement = false;
 
         while (true)
         {
@@ -390,6 +396,15 @@ internal sealed class CaptureTrack : IDisposable
 
             if (started)
             {
+                if (isReplacement)
+                {
+                    _events.Write(new SessionEvent(SessionEventNames.CaptureDeviceRestored, CurrentTimelineMs())
+                    {
+                        Source = _source.ToWireName(),
+                        GapMs = _lastReopenDowntimeMs,
+                        Detail = $"capture started on device='{source.Device.DisplayName}'",
+                    });
+                }
                 await WaitForSegmentEndAsync(cancellationToken).ConfigureAwait(false);
                 StopSegment(source);
             }
@@ -398,6 +413,8 @@ internal sealed class CaptureTrack : IDisposable
                 DetachSegmentHandlers(source);
                 source.Dispose();
             }
+
+            ExtendOutageUntilFirstBufferOrSegmentEnd();
 
             if (cancellationToken.IsCancellationRequested)
             {
@@ -434,7 +451,7 @@ internal sealed class CaptureTrack : IDisposable
                 Source = _source.ToWireName(),
                 Detail = started
                     ? _segmentFault?.Message ?? "capture stopped unexpectedly"
-                    : "capture could not be started",
+                    : StartFailureDetail(),
             });
 
             var (replacement, nextAttempts, exhausted) =
@@ -458,6 +475,7 @@ internal sealed class CaptureTrack : IDisposable
 
             if (!FormatsMatch(_format, replacement.Format))
             {
+                ExtendOutageUntilFirstBufferOrSegmentEnd();
                 WriteFormatChangedFatal(_format!, replacement.Format);
                 replacement.Dispose();
                 EndTrack(FormatChangedEndReason);
@@ -466,6 +484,7 @@ internal sealed class CaptureTrack : IDisposable
             }
 
             source = replacement;
+            isReplacement = true;
         }
     }
 
@@ -617,6 +636,14 @@ internal sealed class CaptureTrack : IDisposable
         }
     }
 
+    private string StartFailureDetail()
+    {
+        if (_segmentFault is not { } error) return "capture could not be started";
+        var cause = error.GetBaseException();
+        return $"capture could not be started: {error.Message}; " +
+            $"{cause.GetType().Name} (HRESULT=0x{cause.HResult:X8}): {cause.Message}";
+    }
+
     private void StopSegment(IAudioCaptureSource source)
     {
         DetachSegmentHandlers(source);
@@ -699,18 +726,13 @@ internal sealed class CaptureTrack : IDisposable
             }
 
             var downtimeMs = MeasuredDowntime(downtimeStart);
+            _lastReopenDowntimeMs = downtimeMs;
             Interlocked.Add(ref _pendingGapMs, downtimeMs);
+            Interlocked.Exchange(ref _awaitingFirstBufferSinceUtcTicks, _clock.UtcNow.UtcTicks);
 
             // Signals the consumer that the next buffer starts a fresh device stream, so
             // it must close the audio captured before the outage.
             Interlocked.Exchange(ref _deviceRestarted, 1);
-
-            _events.Write(new SessionEvent(SessionEventNames.CaptureDeviceRestored, CurrentTimelineMs())
-            {
-                Source = _source.ToWireName(),
-                GapMs = downtimeMs,
-                Detail = $"device='{replacement.Device.DisplayName}'",
-            });
 
             return (replacement, attempts, false);
         }
@@ -834,9 +856,12 @@ internal sealed class CaptureTrack : IDisposable
         // statement and must not be worded as one.
         Interlocked.Exchange(
             ref _terminalDeviceLoss,
-            (int)(string.Equals(reason, FormatChangedEndReason, StringComparison.Ordinal)
-                ? TerminalDeviceLossCause.FormatChanged
-                : TerminalDeviceLossCause.RecoveryWindowClosed));
+            (int)(reason switch
+            {
+                FormatChangedEndReason => TerminalDeviceLossCause.FormatChanged,
+                "timeline_unusable" => TerminalDeviceLossCause.TimingUnusable,
+                _ => TerminalDeviceLossCause.RecoveryWindowClosed,
+            }));
     }
 
     /// <summary>
@@ -852,12 +877,13 @@ internal sealed class CaptureTrack : IDisposable
     /// consumer's own <c>Observe</c> calls.
     /// </para>
     /// <para>
-    /// Three situations reach here with an outage that was measured but never placed: the
+    /// Situations with an outage that was measured but never placed include: the
     /// recovery window closed with the endpoint still gone and the track ended fatally, the
     /// track successfully reopened the endpoint and the session then stopped before that
     /// endpoint delivered a single buffer, and the endpoint came back at a format the session
-    /// refused to splice. All three are real missing audio on a span this track did capture, so
-    /// all three are reported; they share an interval and a reason and differ only in the
+    /// refused to splice, or its first replacement buffer supplied unusable timing. All
+    /// are missing audio on a span this track did capture, so they are reported; they
+    /// share an interval and a reason and differ only in the
     /// wording of the <c>detail</c>, which is taken from the cause the capture thread recorded
     /// when the track ended rather than from anything inferred after the fact
     /// (docs/RELIABILITY.md section 8.2).
@@ -906,6 +932,10 @@ internal sealed class CaptureTrack : IDisposable
     private string TerminalDeviceLossDetail(TerminalDeviceLossCause cause)
         => cause switch
         {
+            TerminalDeviceLossCause.TimingUnusable =>
+                "the reopened capture stream supplied unusable timing, so the track ended with its " +
+                "previous audio durable. This missing interval was measured at the capture callback " +
+                "boundary; it is not an estimate of future audio.",
             TerminalDeviceLossCause.FormatChanged =>
                 "the capture endpoint returned but at a different format, so the track ended instead of " +
                 "splicing audio the session cannot place into what it already captured; this stretch of the " +
@@ -945,7 +975,7 @@ internal sealed class CaptureTrack : IDisposable
     /// </summary>
     /// <remarks>
     /// <para>
-    /// This is the unsupported-process-loopback outcome docs/ARCHITECTURE.md section 8.1
+    /// This is the unusable-loopback-timing outcome docs/ARCHITECTURE.md section 8.1
     /// requires: one explicit, actionable statement and a track that ends, instead of a
     /// track that keeps running while every buffer is quietly reported as a backwards
     /// device position and the whole recording is written off as degraded
@@ -993,16 +1023,40 @@ internal sealed class CaptureTrack : IDisposable
             return;
         }
 
-        if (_channel!.Writer.TryWrite(packet))
+        // Attach a restart to the replacement stream's first accepted buffer. An old
+        // buffer still waiting in the consumer queue must not consume this boundary.
+        var restarted = Interlocked.Exchange(ref _deviceRestarted, 0) == 1;
+        var pendingGap = restarted ? Interlocked.Exchange(ref _pendingGapMs, 0) : 0;
+        var waitingSince = restarted ? Interlocked.Exchange(ref _awaitingFirstBufferSinceUtcTicks, 0) : 0;
+        var gap = pendingGap + ObservedFirstBufferWaitMs(waitingSince);
+        if (_channel!.Writer.TryWrite(new QueuedPacket(packet, restarted ? gap : null)))
         {
             _backlog!.RecordProduced();
             return;
+        }
+
+        if (restarted)
+        {
+            // A full queue did not accept the restart. Keep its original measurement
+            // until a later packet succeeds or the track ends; do not add the wait twice.
+            Interlocked.Add(ref _pendingGapMs, pendingGap);
+            Interlocked.Exchange(ref _awaitingFirstBufferSinceUtcTicks, waitingSince);
+            Interlocked.Exchange(ref _deviceRestarted, 1);
         }
 
         // The queue is full, so the packet is dropped instead of blocking the capture
         // callback (docs/RELIABILITY.md section 4 step 1).
         _backlog!.RecordDropped();
         Interlocked.Exchange(ref _overflowSignalled, 1);
+    }
+
+    private long ObservedFirstBufferWaitMs(long sinceUtcTicks)
+        => sinceUtcTicks == 0 ? 0 : Math.Max(0, (_clock.UtcNow.UtcTicks - sinceUtcTicks) / TimeSpan.TicksPerMillisecond);
+
+    private void ExtendOutageUntilFirstBufferOrSegmentEnd()
+    {
+        var since = Interlocked.Exchange(ref _awaitingFirstBufferSinceUtcTicks, 0);
+        Interlocked.Add(ref _pendingGapMs, ObservedFirstBufferWaitMs(since));
     }
 
     private void OnCaptureStopped(object? sender, CaptureStoppedEventArgs e)
@@ -1063,8 +1117,9 @@ internal sealed class CaptureTrack : IDisposable
         }
     }
 
-    private void ProcessPacket(AudioPacket packet)
+    private void ProcessPacket(QueuedPacket queued)
     {
+        var packet = queued.Packet;
         if (Volatile.Read(ref _timelineUnusable) == 1)
         {
             // The track already ended on its first unplaceable buffer; the remaining
@@ -1073,10 +1128,7 @@ internal sealed class CaptureTrack : IDisposable
             return;
         }
 
-        var restarted = Interlocked.Exchange(ref _deviceRestarted, 0) == 1;
-        var pendingGap = Interlocked.Exchange(ref _pendingGapMs, 0);
-
-        if (restarted)
+        if (queued.RestartGapMs is { } pendingGap)
         {
             // The outage this track measured has now been placed by the first buffer of the
             // restarted stream, and the pending measurement is consumed here, so a later stop
@@ -1093,6 +1145,8 @@ internal sealed class CaptureTrack : IDisposable
         }
         catch (CaptureFailedException ex)
         {
+            if (queued.RestartGapMs is { } unplacedGap)
+                Interlocked.Add(ref _pendingGapMs, unplacedGap);
             // The track's declared clock cannot place this buffer at all, so there is no
             // honest position to write it at (docs/RELIABILITY.md section 7). The track
             // ends itself with one explicit diagnostic instead of degrading silently, and
@@ -1151,7 +1205,10 @@ internal sealed class CaptureTrack : IDisposable
                 Source = _source.ToWireName(),
                 DevicePositionFrames = packet.DevicePositionFrames,
                 QpcPositionTicks = packet.QpcPositionTicks,
-                Detail = "device position moved backwards; the session timeline was kept monotonic.",
+                Reason = _captureClock == CaptureClock.Qpc ? "qpc_position_backwards" : "device_position_backwards",
+                Detail = _captureClock == CaptureClock.Qpc
+                    ? "QPC timestamp was behind the expected audio continuation; the session timeline was kept monotonic."
+                    : "device position moved backwards; the session timeline was kept monotonic.",
             });
         }
 

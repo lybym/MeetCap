@@ -37,11 +37,10 @@ public interface IAudioCaptureSource : IDisposable
     /// </summary>
     /// <remarks>
     /// <para>
-    /// The default is <see cref="CaptureClock.DevicePosition"/>, which is what WASAPI
-    /// microphone capture and system loopback report. A source declares
-    /// <see cref="CaptureClock.Qpc"/> only when the captured stream has no position of its
-    /// own, which is how Windows process loopback behaves: every buffer carries
-    /// <c>device_position_frames = 0</c> while the QPC timestamp advances.
+    /// The default is <see cref="CaptureClock.DevicePosition"/> for WASAPI microphone
+    /// capture. Both loopback modes declare <see cref="CaptureClock.Qpc"/>: process
+    /// loopback can lack a position, and system loopback position units can differ
+    /// from its mix format. System QPC measures the first frame's time in either case.
     /// </para>
     /// <para>
     /// The recording pipeline reads this from the same source that supplied

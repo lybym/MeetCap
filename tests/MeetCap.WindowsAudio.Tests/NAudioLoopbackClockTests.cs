@@ -18,15 +18,15 @@ public class NAudioLoopbackClockTests
     private static readonly CaptureDeviceInfo RenderDevice = new("render-1", "Speakers", true);
 
     [Fact]
-    public void LoopbackClock_SystemRequest_IsPlacedByTheEndpointsDevicePosition()
+    public void LoopbackClock_SystemRequest_IsPlacedBySystemQpc()
     {
         var request = new LoopbackCaptureRequest(RenderDevice, LoopbackMode.System, "ffplay");
 
-        // A system request ignores the process name, and system loopback reports the render
-        // endpoint's own stream position.
+        // A system request ignores the process name. Bluetooth position units can differ
+        // from the endpoint mix format, while QPC always names the first frame's time.
         Assert.False(request.IsProcessLoopback);
         Assert.Equal(
-            CaptureClock.DevicePosition,
+            CaptureClock.Qpc,
             NAudioCaptureSourceFactory.LoopbackClock(request));
     }
 

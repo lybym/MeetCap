@@ -17,7 +17,7 @@ internal sealed class DevicePositionAnomalyReporter
     public void Flush(ISessionEventSink events)
     {
         if (_pending == 0 || _latest is null) return;
-        events.Write(_latest with { Count = _pending, Reason = "device_position_backwards" });
+        events.Write(_latest with { Count = _pending, Reason = _latest.Reason ?? "device_position_backwards" });
         _lastReportedMs = _latest.AtMs;
         _pending = 0;
     }

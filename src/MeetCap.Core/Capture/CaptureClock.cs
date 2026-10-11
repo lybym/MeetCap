@@ -22,15 +22,15 @@ namespace MeetCap.Core.Capture;
 public enum CaptureClock
 {
     /// <summary>
-    /// The device's own stream position, in frames. The default, and what WASAPI
-    /// microphone capture and system loopback both report: the position counts the
-    /// frames the endpoint's stream has produced, so it is an exact sample count.
+    /// The device's own stream position, in frames. The default and the WASAPI
+    /// microphone clock; loopback uses QPC because position units can differ
+    /// from the render mix format on Bluetooth endpoints.
     /// </summary>
     DevicePosition,
 
     /// <summary>
-    /// The device's QPC timestamp, in 100-nanosecond units, used when the captured
-    /// stream has no position of its own.
+    /// The system QPC timestamp of the first frame, in 100-nanosecond units.
+    /// Used by both WASAPI loopback modes, with one origin across stream restarts.
     /// </summary>
     /// <remarks>
     /// Windows process loopback is the case this exists for. It captures a process

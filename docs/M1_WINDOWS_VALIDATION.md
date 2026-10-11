@@ -1306,8 +1306,10 @@ row that rc.1 could not evidence.
 
 Real hardware re-validation of [#40](https://github.com/lybym/MeetCap/issues/40), against source
 `0e815a2f43e5acbcda2f558ddd07d9661e46be0b` on Windows 11 build **26300**, Sony **WF-1000XM5**.
-Both pinned sources use `clock = device_position`, with microphone 16,000 Hz mono float32 and
-system loopback 48,000 Hz stereo float32. Endpoint ids: capture
+The initial and gap-boundary-only runs below use `clock = device_position` for both pinned sources,
+with microphone 16,000 Hz mono float32 and system loopback 48,000 Hz stereo float32. The final
+source-clock fix declares system loopback `clock = qpc`, while microphone keeps `device_position`.
+Endpoint ids: capture
 `{0.0.1.00000000}.{bf854d3c-1cdf-40f9-afe7-775414a2ccb5}`, render
 `{0.0.0.00000000}.{97878ecf-638a-4623-8145-e5033241eea9}`. The recordings, event logs and manifest
 metadata remain local under `C:\CODE\artifacts\meetcap-stable-20261011`; audio, speech transcripts
@@ -1319,7 +1321,9 @@ and credentials are not committed. A hardware-only audit is `issue40-hardware-au
 | `live-data`, session `ses_20261011T035538Z_865f4893`, 71.49 s wall time | 7,041 loopback position anomalies represented by **16** aggregate events. Both tracks have 5 closed chunks and non-zero audio. Both have 0 gaps, 0 dropped packets and 0 stalls. The session remains degraded because anomalies and device buffer flags are explicitly visible; this is not a claim of missing audio. ASR coverage belongs to the separate MVP verification. |
 | `bluetooth-data`, session `ses_20261011T035820Z_da3bac2b`, 116,163 ms session timeline, ASR disabled | Physical device loss occurred on both tracks. The endpoints did not return inside the configured 20 s window: each track emits one `device_lost` and one `device_lost_fatal` with `count = 20`. Terminal gaps are loopback 95,569–115,957 ms (**20,388 ms**) and mic 95,910–116,163 ms (**20,253 ms**); total 40,641 ms. No `device_restored` was recorded. This proves bounded failure and gap reporting, **not post-reconnect content**. |
 | `preflight-fixed-data`, session `ses_20261011T040401Z_99d1b58c`, 16.29 s wall time, ASR disabled | Fresh Release build with the gap-boundary fix: 1,453 loopback anomalies represented by **4** aggregate events. Both tracks close 3 chunks with non-zero audio, 0 gaps, 0 dropped packets and 0 stalls. No positive skip occurred, so this is hardware regression evidence, **not a hardware proof of the corrected gap boundary**. |
-| `bluetooth3-data`, session `ses_20261011T040445Z_0740cd96`, fixed Release build, physical disconnect/reconnect confirmed by the operator, ASR disabled | **PASS on restart/content:** each track records one `device_lost` and one `device_restored`, with no fatal loss. Mic gap 13,770–22,877 ms = **9,107 ms**; loopback gap 13,519–22,693 ms = **9,174 ms**. Both intervals exactly equal their `gap_ms`, and session totals are 2 gaps / 18,281 ms. Both tracks resume with closed WAVs and monotonic chunk intervals. 3,385 loopback anomalies become **10** events, including restart and stop tails; 0 drops/stalls. |
+| `bluetooth3-data`, session `ses_20261011T040445Z_0740cd96`, gap-boundary-only Release build, physical disconnect/reconnect confirmed by the operator, ASR disabled | **Timing defect reproduced; restart/content present:** each track records one loss/restore without fatal loss. Mic gap 13,770–22,877 ms = 9,107 ms; loopback gap 13,519–22,693 ms = 9,174 ms. Both equal their reported counts, but loopback omits the additional wait until its first actual frame. Both resume closed WAVs with non-zero audio and monotonic intervals. 3,385 loopback position anomalies become 10 aggregate events; 0 drops/stalls. This run does **not** pass the corrected timing gate. |
+| `qpc-bluetooth-data`, session `ses_20261011T042213Z_3e138ae5`, first QPC iteration, physical disconnect/reconnect with playback deliberately restarted 10 s after both restore events, ASR disabled | **Timing defect reproduced:** original QPC anchor correctly places the first restored loopback frame at 33,587 ms, including the playback wait; both tracks restore and contain non-zero resumed audio. However early QPC/corrections generate **988 loopback gaps**, inflating its 29,649.25 ms of captured audio to a 57,849 ms end through 28,199 ms of reported gaps. This run exposed the continuation update defect and does **not** pass the final timing gate. |
+| `qpc-steady-preflight-data`, session `ses_20261011T043238Z_94203f4f`, QPC high-water build, normal microphone permissions, playback warmed up 2 s before recording and stopped after recording, ASR disabled | **PASS for steady timing/content:** mic records 18,860 ms, 4 chunks, 0 gaps, 244,060 non-zero samples. Loopback records 18,879.625 ms of audio, 4 chunks, end 19,550 ms, with **3 gaps / 669 ms**. Captured duration plus missing time agrees with its end within **2 ms**; the old repeating 4–5 ms drift is absent. 1,714 QPC-behind-continuation observations become **5** aggregate events including stop tail. Both tracks have 0 drops/stalls and no loss/restore or unusable timing. |
 
 Source-clock evidence: the first preflight loopback anomaly has `device_position_frames = 320`,
 `qpc_position_ticks = 5575003799450`, `at_ms = 9`. The next aggregate at 5,009 ms carries position
@@ -1329,9 +1333,12 @@ Source-clock evidence: the first preflight loopback anomaly has `device_position
 Consequently each position is behind the previous position plus the audio frame count, even
 though positions increase in absolute terms. This explains the repetitive diagnostics on this
 endpoint. It is evidence of a position/audio-rate mismatch on this run, not a general Windows
-guarantee or a proven driver-internal cause. The conservative remedy remains diagnostic
-aggregation; microphone, normal system device-position capture and process QPC selection stay
-unchanged.
+guarantee or a proven driver-internal cause. A frame-based adapter cannot reliably measure gaps
+on this endpoint: a position skip could understate elapsed time by a factor of three. The fix
+therefore uses the existing QPC timeline for **all system loopback sources**, as an explicit
+source-mode contract, without Sony-name checks or inferred clock switching. Microphone keeps
+its frame clock and process loopback keeps its QPC clock. Aggregate device-position diagnostics
+remain available for frame-clock sources; QPC-placed sources retain actual buffer flags and gaps.
 
 The preflight also exposed a gap-boundary defect: its 60 ms event originally carried equal
 `gap_start_ms` and `gap_end_ms` (14,469 ms), because previous monotonic clamps had put the session
@@ -1342,7 +1349,26 @@ reproduces the position-rate mismatch and proves the corrected interval and sing
 the live event and durable chunk audit, preserved audio and independent healthy microphone
 capture. Existing device-position, QPC, and device-recovery suites cover their respective paths.
 
-Post-restore WAV scans (`issue40-postrestore-content.json` in the local evidence directory):
+The third run also proves why reopening an endpoint is not the final recovery boundary. Its
+first restored loopback packet's system QPC is **13.817 s later** than the microphone's. The old
+adapter inserted only endpoint-open downtime and moved the replacement clock origin to that
+boundary; loopback ended at 43,042 ms versus mic 56,997 ms, hiding the waiting period before
+loopback delivered audio. Playback was restarted during recovery, which exposes a real interval
+without captured loopback packets. The new QPC path retains each track's original system anchor
+and places the first replacement frame at its actual QPC time. WASAPI defines QPC as the system
+performance counter expressed in 100 ns units, independent of a reopened stream's frame origin
+([GetBuffer contract](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudiocaptureclient-getbuffer)).
+`device_restored.gap_ms` remains the endpoint-open lower bound; `capture.gap` is the final missing
+interval when audio returns. Restore is announced only after replacement `Start()` succeeds;
+merely constructing a source which cannot start no longer reports recovery. Start failures retain
+the underlying exception message/type/HRESULT and the existing finite retry budget. Frame-clock
+recovery instead measures through `PacketAvailable`,
+an observed callback boundary rather than an acoustically exact timestamp. Neither path reads
+the later consumer's clock to position audio. No-first-packet stop/repeated loss is counted once;
+missing/error/backwards restart QPC emits an actionable `timeline_unusable` and ends that track
+with preceding WAVs durable, leaving independent microphone capture running.
+
+Post-restore WAV scans for the preliminary third run (`issue40-postrestore-content.json`):
 loopback chunks 000004–000008 have **1,949,246 non-zero samples / 1,953,564**, peak 0.951216;
 mic chunks 000004–000010 have **458,084 / 545,920**, peak 0.010468. Both therefore contain actual
 recorded audio after their restart. The script's reconnect flag was set after observing persisted
@@ -1350,14 +1376,49 @@ restore events; it is not an independent timestamp of the operator's physical re
 An intermediate attempt (`bluetooth2-data`) did not physically disconnect, as the operator
 subsequently clarified, so it is not counted as restart evidence.
 
+The final steady run retains observed holes instead of forcing a zero-gap result. Its first
+loopback packet has position 131,040; the next packet at 673 ms has position 640 and
+`DataDiscontinuity`, naming a **663 ms** packet-free interval. The reset while the headset
+microphone starts is consistent with a Bluetooth profile transition, an inference rather than a
+driver-internal diagnosis. A further 5 ms gap and 1 ms gap remain visible; integer millisecond
+rounding makes their reported interval lengths differ from the count by at most **1 ms**.
+Later loopback chunk starts are 5,668 / 10,670 / 15,670 ms, against QPC-relative anchors
+5,668.448 / 10,663.730 / 15,665.960 ms. The bounded early timestamps are visible in the QPC
+aggregate counts, without accumulating gaps or shifting time by seconds. Original device buffer
+flags are still reported separately.
+
+Environment controls: `qpc-fixed-preflight-data` and `qpc-control-preflight-data` ran with restricted
+microphone permissions and captured no microphone chunks; their enumerated sources repeatedly
+failed `Start()`. The Realtek control exhausted 20 retries, confirming the existing finite budget.
+Running the same binary/control with normal permissions immediately recorded microphone audio
+without loss or gaps. These two restricted runs are **not hardware passes or headset defects**.
+They exposed the lost start-error detail and premature restored event, addressed by the diagnostic
+and start-confirmation regressions. Playback-stop-before-capture-stop in the preliminary scripts
+also explains an observed 209 ms terminal loopback hole; the final script keeps playback running
+until capture has stopped.
+
+Meaningful deterministic regressions cover the 48 kHz payload/16 kHz position mismatch with a
+full 8 s QPC gap, a first replacement frame 14 s after endpoint opening, a callback later than the
+actual frame, stop/repeated loss before any replacement packet, unusable replacement QPC, and
+queued pre-loss buffers with a delayed consumer. A first QPC hardware iteration also exposed
+early timestamps followed by corrections: its old expected-end update moved backwards while
+the audio was clamped forwards, inventing repeated 4–5 ms gaps. The corrected expected QPC end
+advances monotonically by the captured frames. A 500-buffer metadata-shaped regression proves
+no false gaps or accumulated drift, while preserving a subsequent actual 8 s hole. QPC anomalies
+use `qpc_position_backwards`, rather than incorrectly describing device frame positions.
+The regressions also pin live/audited gap interval equality,
+aggregate tail counts, independent microphone health and durable audio. Release build passed
+with zero warnings/errors; the complete local Release suite passed **871/871**, with no skips,
+including microphone, baseline system loopback, process QPC and device-recovery regressions.
+
 Limitations: these short runs do not repeat the two-hour soak test or prove endpoint format
 changes. The historical rc.2 post-reconnect result in section 16.4 stays separately scoped to that
-artifact and OS. On the successful restart run, the first restored loopback packet's QPC is
-13.817 s later than the microphone's; post-restore spans are 20.349 s loopback and 34.120 s mic.
-Playback was restarted during recovery, and no separate render-packet probe was collected, so
-this evidence proves per-track monotonicity and non-zero resumed content, not cross-track
-alignment across that delayed playback interval. The 60 ms hardware event above was captured
-before the gap-boundary fix; the corrected boundary is established by the deterministic
-regressions. The fresh hardware run had no skip to test that boundary. Release build passed with
-zero warnings/errors; the complete local Release test suite passed **856/856**, with no skips,
-including microphone/baseline system loopback, process QPC and device-recovery regressions.
+artifact and OS. Initial per-track QPC origins still start each track at zero; a shared initial
+session epoch is separate work. The old 60 ms hardware event was captured before the gap-boundary
+fix; deterministic regressions establish the corrected frame-clock interval. The exact final
+high-water build's steady recording is scoped separately from the earlier real reconnect test:
+the latter proves first-frame recovery anchoring/content and exposed the drift now covered by
+metadata-shaped regressions. No new physical disconnect is claimed for the steady run.
+The steady recording uses the final QPC placement logic; subsequent changes only preserve start
+failure diagnostics and defer the restored event until successful `Start()`. Those event changes
+are covered by the final 871-test suite, without claiming another hardware recording.
