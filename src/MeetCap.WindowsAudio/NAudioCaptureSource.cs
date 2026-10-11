@@ -335,11 +335,10 @@ public sealed class NAudioCaptureSourceFactory : IAudioCaptureSourceFactory
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Process loopback captures a process tree rather than an endpoint's own stream, and the
-    /// audio engine reports a device position of 0 for every buffer in that case. The QPC
-    /// timestamp it does report is what places the track, so the session timeline stays
-    /// monotonic instead of flagging one backwards device position per buffer
-    /// (docs/ARCHITECTURE.md section 8.1).
+    /// WASAPI supplies system QPC timing for both loopback modes. Process loopback may
+    /// report no device position; Bluetooth system loopback can report position units
+    /// at a different rate from its audio format. QPC avoids both mismatches without
+    /// guessing from device names or changing the microphone's frame clock.
     /// </para>
     /// <para>
     /// The decision is a pure function of the request so it is covered by a test without
@@ -349,7 +348,7 @@ public sealed class NAudioCaptureSourceFactory : IAudioCaptureSourceFactory
     internal static CaptureClock LoopbackClock(LoopbackCaptureRequest request)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return request.IsProcessLoopback ? CaptureClock.Qpc : CaptureClock.DevicePosition;
+        return CaptureClock.Qpc;
     }
 
     /// <summary>

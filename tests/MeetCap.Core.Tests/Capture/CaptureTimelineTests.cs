@@ -253,6 +253,32 @@ public class CaptureTimelineTests
     }
 
     [Fact]
+    public void GapInterval_AForwardSkipAfterRepeatedBackwardsPositions_RemainsOnTheTimeline()
+    {
+        var timeline = new CaptureTimeline(Mono48k);
+
+        // Sony system loopback supplied 480 audio frames per 10 ms buffer, while its
+        // position advanced only 160. The monotonic clamp puts the stream ahead of
+        // its original position anchor; a later real skip must survive that clamp.
+        for (var i = 0; i < 100; i++)
+            timeline.Observe(Packet(i * 160, TenMs));
+
+        var resumePosition = 99 * 160 + TenMs + 2_880;
+        var timing = timeline.Observe(Packet(resumePosition, TenMs));
+        var next = timeline.Observe(Packet(resumePosition + TenMs, TenMs));
+
+        Assert.Equal(60, timing.GapMs);
+        Assert.Equal(1_000, timing.GapStartMs);
+        Assert.Equal(1_060, timing.GapEndMs);
+        Assert.Equal(1_060, timing.StartMs);
+        Assert.Equal(1_070, timing.EndMs);
+        Assert.Equal(timing.EndMs, next.StartMs);
+        Assert.False(next.IsIrregular);
+        Assert.Equal(1, timeline.GapCount);
+        Assert.Equal(60, timeline.GapTotalMs);
+    }
+
+    [Fact]
     public void GapInterval_IsAbsentWhenNothingIsMissing()
     {
         var timeline = new CaptureTimeline(Mono48k);
@@ -399,42 +425,133 @@ public class CaptureTimelineTests
     }
 
     [Fact]
-    public void QpcClock_RecordDeviceLoss_PlacesTheRestartedStreamAfterTheOutage()
+    public void QpcClock_RecordDeviceLoss_KeepsSystemOriginAndIncludesDelayedFirstFrame()
     {
         var timeline = new CaptureTimeline(Mono48k, CaptureClock.Qpc);
 
-        // The stream's own QPC starts far away from the session origin, so the restart can
-        // only be placed by the measured outage, never by the new stream's position.
-        timeline.Observe(ProcessLoopbackPacket(1_000, qpcDeltaTicks: 50_000_000));
+        // The endpoint reopens after 5 s, but the first physical frame is 14 s later.
+        // System QPC keeps the same origin across stream restart.
+        timeline.Observe(ProcessLoopbackPacket(48_000, qpcDeltaTicks: 50_000_000));
         timeline.RecordDeviceLoss(5_000);
 
-        var restarted = timeline.Observe(ProcessLoopbackPacket(0, qpcDeltaTicks: 900_000_000));
+        var restarted = timeline.Observe(ProcessLoopbackPacket(0, qpcDeltaTicks: 250_100_000));
 
         Assert.True(restarted.IsNewSegment);
-        Assert.Equal(5_000, restarted.GapMs);
-        Assert.Equal(5_010, restarted.StartMs);
-        Assert.Equal(5_020, restarted.EndMs);
+        Assert.Equal(19_000, restarted.GapMs);
+        Assert.Equal(19_010, restarted.StartMs);
+        Assert.Equal(19_020, restarted.EndMs);
         Assert.Equal(10, restarted.GapStartMs);
-        Assert.Equal(5_010, restarted.GapEndMs);
+        Assert.Equal(19_010, restarted.GapEndMs);
         Assert.False(restarted.DevicePositionAnomaly);
-        Assert.Equal(5_000, timeline.GapTotalMs);
+        Assert.Equal(19_000, timeline.GapTotalMs);
         Assert.Equal(1, timeline.GapCount);
 
-        // The new stream is re-anchored: the buffer after it continues contiguously, and the
-        // rewritten origin is what puts the next buffer one buffer past the restart.
+        // The next buffer continues against the original system QPC anchor.
         var after = timeline.Observe(
-            ProcessLoopbackPacket(TenMs, qpcDeltaTicks: 900_000_000));
+            ProcessLoopbackPacket(TenMs, qpcDeltaTicks: 250_100_000));
 
-        Assert.Equal(5_020, after.StartMs);
-        Assert.Equal(5_030, after.EndMs);
+        Assert.Equal(19_020, after.StartMs);
+        Assert.Equal(19_030, after.EndMs);
         Assert.Equal(0, after.GapMs);
         Assert.False(after.DevicePositionAnomaly);
 
-        // Audio stopped at 10 ms and resumes at 5010 ms even though the new stream's own
-        // clock says something else entirely (docs/RELIABILITY.md section 7): the restart
-        // buffer's own QPC reading now maps to where the outage put it.
-        Assert.Equal(5_010, timeline.QpcToSessionMs(900_000_000));
-        Assert.Equal(5_020, timeline.QpcToSessionMs(900_100_000));
+        Assert.Equal(19_010, timeline.QpcToSessionMs(250_100_000));
+        Assert.Equal(19_020, timeline.QpcToSessionMs(250_200_000));
+    }
+
+    [Theory]
+    [InlineData(480, false)]
+    [InlineData(512, false)]
+    [InlineData(512, true)]
+    public void QpcClock_FractionalBuffersKeepCapturedDurationAndARealGap(int frames, bool early)
+    {
+        const int count = 3_000;
+        const long origin = 10_000_000;
+        var timeline = new CaptureTimeline(Mono48k, CaptureClock.Qpc);
+        for (var i = 0; i < count; i++)
+        {
+            var qpc = origin + i * (long)frames * 10_000_000 / Mono48k.SampleRate;
+            if (early && i > 0) qpc -= 5_000; // a half-ms early reading must retain fractional audio
+            var timing = timeline.Observe(Packet(0, frames, qpc));
+            Assert.Equal(i * (long)frames * 1_000 / Mono48k.SampleRate, timing.StartMs);
+            Assert.Equal((i + 1) * (long)frames * 1_000 / Mono48k.SampleRate, timing.EndMs);
+            Assert.False(timing.IsIrregular);
+        }
+        var capturedMs = count * (long)frames * 1_000 / Mono48k.SampleRate;
+        Assert.Equal(capturedMs, timeline.LastEndMs);
+        Assert.Equal(0, timeline.GapCount);
+        var resumed = timeline.Observe(Packet(0, frames,
+            origin + count * (long)frames * 10_000_000 / Mono48k.SampleRate + 80_000_000));
+        Assert.Equal(8_000, resumed.GapMs);
+        Assert.Equal(capturedMs, resumed.GapStartMs);
+        Assert.Equal(capturedMs + 8_000, resumed.GapEndMs);
+        Assert.Equal(resumed.GapMs, resumed.GapEndMs - resumed.GapStartMs);
+        Assert.Equal(8_000, timeline.GapTotalMs);
+        Assert.Equal(1, timeline.GapCount);
+    }
+
+    [Theory]
+    [InlineData(CaptureClock.DevicePosition)]
+    [InlineData(CaptureClock.Qpc)]
+    public void StartupRecoveryBeforeOrigin_DoesNotInsertItsOutageIntoTheSecondPacket(CaptureClock clock)
+    {
+        var timeline = new CaptureTimeline(Mono48k, clock);
+        timeline.RecordDeviceLoss(5_000);
+        var first = timeline.Observe(Packet(0, TenMs, qpc: 10_000_000));
+        var second = timeline.Observe(Packet(TenMs, TenMs, qpc: 10_100_000));
+        Assert.Equal(0, first.StartMs);
+        Assert.Equal(10, second.StartMs);
+        Assert.Equal(20, second.EndMs);
+        Assert.False(second.IsNewSegment);
+        Assert.False(second.IsIrregular);
+        Assert.Equal(0, timeline.GapTotalMs);
+        Assert.Equal(0, timeline.GapCount);
+    }
+
+    [Fact]
+    public void QpcClock_EarlyTimestampsThenCorrections_DoNotInventRepeatedGaps()
+    {
+        var timeline = new CaptureTimeline(Mono48k, CaptureClock.Qpc);
+        // Real Sony metadata: the first two frames are 10 ms apart, the third QPC
+        // repeats the preceding timestamp, and later readings lag ~11 ms. Returning
+        // to a normal reading must not count the already-clamped frames a second time.
+        for (var i = 0; i < 500; i++)
+        {
+            var ticks = i switch { 0 => 0L, 1 => 100_000L, 2 => 102_133L,
+                _ => i * 100_000L - 110_660L + (i % 3) * 500L };
+            var timing = timeline.Observe(Packet(0, TenMs, qpc: 10_000_000 + ticks));
+            Assert.Equal(i * 10, timing.StartMs);
+            Assert.False(timing.HasGap);
+        }
+        Assert.Equal(5_000, timeline.LastEndMs);
+        Assert.Equal(0, timeline.GapTotalMs);
+        // A subsequent real 8 s hole is retained, after all 5 s of captured frames.
+        var resumed = timeline.Observe(Packet(0, TenMs, qpc: 140_000_000));
+        Assert.Equal(8_000, resumed.GapMs);
+        Assert.Equal(5_000, resumed.GapStartMs);
+        Assert.Equal(13_000, resumed.GapEndMs);
+    }
+
+    [Fact]
+    public void QpcClock_RestartWithBackwardsSystemCounter_FailsInsteadOfInventingANewOrigin()
+    {
+        var timeline = new CaptureTimeline(Mono48k, CaptureClock.Qpc);
+        timeline.Observe(ProcessLoopbackPacket(1_000));
+        timeline.RecordDeviceLoss(5_000);
+        var error = Assert.Throws<CaptureFailedException>(() => timeline.Observe(ProcessLoopbackPacket(0)));
+        Assert.Contains("backwards", error.Message, StringComparison.Ordinal);
+        Assert.Equal(10, timeline.LastEndMs);
+        Assert.Equal(0, timeline.GapCount);
+    }
+
+    [Fact]
+    public void QpcClock_TimestampError_RefusesTheTimestampBeforeChangingTheTimeline()
+    {
+        var timeline = new CaptureTimeline(Mono48k, CaptureClock.Qpc);
+        timeline.Observe(ProcessLoopbackPacket(0));
+        Assert.Throws<CaptureFailedException>(() => timeline.Observe(
+            ProcessLoopbackPacket(TenMs, flags: AudioBufferFlags.TimestampError)));
+        Assert.Equal(10, timeline.LastEndMs);
     }
 
     [Fact]
@@ -511,7 +628,7 @@ public class CaptureTimelineTests
             () => timeline.Observe(PacketWithoutAnyTiming()));
 
         Assert.Contains("QPC", exception.Message, StringComparison.Ordinal);
-        Assert.Contains("loopback_mode = \"system\"", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("offline microphone", exception.Message, StringComparison.Ordinal);
         Assert.False(timeline.HasOrigin);
 
         // The same guard holds after the track has been placed for a while, so a stream

@@ -84,10 +84,10 @@ public readonly record struct TerminalGap(long GapStartMs, long GapEndMs, long G
 /// <para>
 /// The first observed buffer defines the session origin. Everything after it is
 /// placed by the track's declared <see cref="CaptureClock"/>: the device position in
-/// frames when the stream has one of its own (<see cref="CaptureClock.DevicePosition"/>),
-/// otherwise the device QPC timestamp (<see cref="CaptureClock.Qpc"/>). Either way the
-/// placement comes from the device, so a device that restarts its stream cannot make the
-/// session timeline run backwards: it is clamped and flagged instead.
+    /// frames for microphone capture (<see cref="CaptureClock.DevicePosition"/>), or the
+    /// system QPC timestamp for loopback (<see cref="CaptureClock.Qpc"/>). Frame positions
+    /// may restart, but system QPC retains its origin across a reopened stream. Unusable
+    /// restart QPC is rejected instead of inventing a replacement origin.
 /// </para>
 /// <para>
 /// The clock is declared rather than guessed, because a stream that reports no position
@@ -106,16 +106,15 @@ public sealed class CaptureTimeline
 
     /// <summary>
     /// How far a QPC-placed buffer may sit behind the expected continuation before the
-    /// timeline calls it a restarted stream.
+    /// timeline flags its timing as backwards.
     /// </summary>
     /// <remarks>
     /// A device position is an exact sample count, so any negative step in it is a real
     /// event. A QPC reading is a <em>time</em>, and the same stream can deliver a buffer a
     /// fraction of a millisecond "early" once the reading is expressed in whole
     /// milliseconds, so a sub-millisecond step backwards is measurement resolution rather
-    /// than a restarted stream. One millisecond is that resolution and nothing more: a
-    /// genuinely restarted stream reports a position from its own new origin, which is not
-    /// within a millisecond of where the previous stream ended.
+    /// than broken timing. One millisecond is that resolution and nothing more: system
+    /// QPC does not acquire a different origin when the capture stream is reopened.
     /// </remarks>
     internal const long QpcBackwardsToleranceTicks = TicksPerMillisecond;
 
@@ -124,7 +123,9 @@ public sealed class CaptureTimeline
     private bool _hasOrigin;
     private long _originFrames;
     private long _nextExpectedFrames;
-    private long _nextExpectedQpcTicks;
+    // QPC ticks scaled by sample rate: one captured frame is exactly TicksPerSecond
+    // units, so fractional ticks/milliseconds survive every monotonic continuation.
+    private Int128 _nextExpectedQpcUnits;
     private long _lastEndMs;
     private long? _originQpcTicks;
     private long _pendingGapMs;
@@ -262,11 +263,9 @@ public sealed class CaptureTimeline
             return ObserveRestartedStream(packet, frames, durationMs, flagged);
         }
 
-        var placement = _clock == CaptureClock.Qpc
-            ? PlaceByQpc(packet)
-            : PlaceByDevicePosition(packet, frames);
-
-        return Place(durationMs, flagged, placement);
+        return _clock == CaptureClock.Qpc
+            ? PlaceByQpc(packet, flagged, restarted: false)
+            : Place(durationMs, flagged, PlaceByDevicePosition(packet, frames));
     }
 
     /// <summary>
@@ -293,6 +292,11 @@ public sealed class CaptureTimeline
         // like a placed track (docs/RELIABILITY.md section 7).
         var qpcTicks = _clock == CaptureClock.Qpc ? RequireQpcTicks(packet) : packet.QpcPositionTicks;
 
+        // A device that failed before any audio was captured leaves no prior span to
+        // lose. Its first successful packet defines the origin, so do not carry that
+        // startup retry into the second packet as an invented restart/gap.
+        _pendingGapMs = 0;
+        _pendingSegmentRestart = false;
         _hasOrigin = true;
         _originFrames = packet.DevicePositionFrames;
         _originQpcTicks = qpcTicks;
@@ -301,7 +305,7 @@ public sealed class CaptureTimeline
 
         if (_clock == CaptureClock.Qpc)
         {
-            _nextExpectedQpcTicks = FramesToTicks(frames);
+            _nextExpectedQpcUnits = FramesToQpcUnits(frames);
         }
 
         return new PacketTiming(0, durationMs, 0, flagged, false);
@@ -313,11 +317,14 @@ public sealed class CaptureTimeline
         long durationMs,
         bool flagged)
     {
-        // First buffer after a device restart: keep the session timeline
-        // continuous by placing the new stream immediately after the outage.
+        // First buffer after a device restart: place frame-clock sources after the
+        // observed outage, and QPC sources at their first frame's system timestamp.
         var gap = _pendingGapMs;
         _pendingGapMs = 0;
         _pendingSegmentRestart = false;
+
+        if (_clock == CaptureClock.Qpc)
+            return PlaceByQpc(packet, flagged, restarted: true);
 
         // Audio stopped where the last placed buffer ended, and resumes where the new
         // stream is placed. Captured before _lastEndMs moves.
@@ -326,20 +333,8 @@ public sealed class CaptureTimeline
         var endMs = targetMs + durationMs;
         _lastEndMs = endMs;
 
-        if (_clock == CaptureClock.Qpc)
-        {
-            // Re-anchor the stream's own clock so this buffer sits at targetMs: the
-            // restart position of the new stream says nothing about session time, which
-            // is exactly why the measured outage is what gets inserted.
-            var qpcTicks = RequireQpcTicks(packet);
-            _originQpcTicks = qpcTicks - (targetMs * TicksPerMillisecond);
-            _nextExpectedQpcTicks = (targetMs * TicksPerMillisecond) + FramesToTicks(frames);
-        }
-        else
-        {
-            _originFrames = packet.DevicePositionFrames - _format.MillisecondsToFrames(targetMs);
-            _nextExpectedFrames = packet.DevicePositionFrames + frames;
-        }
+        _originFrames = packet.DevicePositionFrames - _format.MillisecondsToFrames(targetMs);
+        _nextExpectedFrames = packet.DevicePositionFrames + frames;
 
         var gapStart = GapIntervalStart(gap, gapStartMs);
 
@@ -376,38 +371,49 @@ public sealed class CaptureTimeline
         return new Placement(_lastEndMs, 0, true, null);
     }
 
-    private Placement PlaceByQpc(AudioPacket packet)
+    private PacketTiming PlaceByQpc(AudioPacket packet, bool flagged, bool restarted)
     {
         var positionTicks = RequireQpcTicks(packet) - _originQpcTicks!.Value;
-        var skippedTicks = positionTicks - _nextExpectedQpcTicks;
-        _nextExpectedQpcTicks = positionTicks + FramesToTicks(packet.FrameCount);
+        var positionUnits = (Int128)positionTicks * _format.SampleRate;
+        var skippedUnits = positionUnits - _nextExpectedQpcUnits;
+        var toleranceUnits = (Int128)QpcBackwardsToleranceTicks * _format.SampleRate;
+        if (restarted && skippedUnits < -toleranceUnits)
+            throw new CaptureFailedException("The restarted capture stream supplied a QPC timestamp " +
+                "that moved backwards. Its system timing is unusable; reconnect the endpoint " +
+                "or use an audio device with valid WASAPI timestamps.");
 
-        if (skippedTicks >= 0)
+        // Keep the high-water protection for early timestamps, but advance by exact
+        // frame units. Rounding each buffer's ticks or duration would accumulate error.
+        var startUnits = positionUnits > _nextExpectedQpcUnits ? positionUnits : _nextExpectedQpcUnits;
+        var startMs = QpcUnitsToMilliseconds(startUnits);
+        var previousEndMs = _lastEndMs;
+        var gap = skippedUnits >= (Int128)TicksPerMillisecond * _format.SampleRate
+            ? startMs - previousEndMs : 0;
+        _nextExpectedQpcUnits = startUnits + FramesToQpcUnits(packet.FrameCount);
+        _lastEndMs = QpcUnitsToMilliseconds(_nextExpectedQpcUnits);
+        if (gap > 0)
         {
-            var startMs = positionTicks / TicksPerMillisecond;
-            return skippedTicks > 0
-                // The stream produced no audio for this stretch of its own clock time, so
-                // the hole is real and is reported rather than absorbed.
-                ? new Placement(startMs, skippedTicks / TicksPerMillisecond, false, _lastEndMs)
-                : new Placement(startMs, 0, false, null);
+            GapTotalMs += gap;
+            GapCount++;
         }
-
-        if (skippedTicks >= -QpcBackwardsToleranceTicks)
+        return new PacketTiming(startMs, _lastEndMs, gap, flagged,
+            !restarted && skippedUnits < -toleranceUnits, SegmentRestart: restarted)
         {
-            // Within a millisecond of the expected continuation: the same stream, read a
-            // fraction early once the time is expressed in whole milliseconds.
-            return new Placement(_lastEndMs, 0, false, null);
-        }
-
-        return new Placement(_lastEndMs, 0, true, null);
+            GapStartMs = gap > 0 ? previousEndMs : null,
+            GapEndMs = gap > 0 ? startMs : null,
+        };
     }
 
     private PacketTiming Place(long durationMs, bool flagged, Placement placement)
     {
         var startMs = placement.StartMs;
-        if (startMs < _lastEndMs)
+        // A backwards source position can leave its original anchor behind the
+        // monotonic timeline. A later positive skip is still missing audio: clamp
+        // after that measured gap, rather than collapsing its interval to zero.
+        var earliestStartMs = _lastEndMs + placement.GapMs;
+        if (startMs < earliestStartMs)
         {
-            startMs = _lastEndMs;
+            startMs = earliestStartMs;
         }
 
         var endMs = startMs + durationMs;
@@ -447,36 +453,33 @@ public sealed class CaptureTimeline
     /// (docs/DATA_MODEL.md section 4.1).
     /// </para>
     /// <para>
-    /// QPC integer-tick rounding makes this reachable on ordinary hardware, because a buffer
-    /// length is rarely a whole number of ticks. At 3000 Hz a 1000-frame buffer is 3,333,333.33
-    /// ticks, and the rounded per-buffer expectation falls one tick behind the stream's own
-    /// reading by the third buffer — a forward step of a single tick, far below the millisecond
-    /// this timeline measures holes in.
+    /// Integer QPC readings can differ from exact frame time by fractional ticks. QPC placement
+    /// retains the rational frame continuation and reports only whole-ms gaps, so that source
+    /// quantisation cannot introduce an empty gap interval.
     /// </para>
     /// </remarks>
     private static long? GapIntervalStart(long gapMs, long? gapStartMs)
         => gapMs > 0 ? gapStartMs : null;
 
     /// <summary>
-    /// Frames as QPC ticks, rounded to the nearest tick.
+    /// Exact frame duration in QPC ticks scaled by sample rate.
     /// </summary>
     /// <remarks>
-    /// Rounding matters: a buffer length that is not a whole number of ticks (512 frames at
-    /// 48 kHz is 106666.67) would otherwise hand back a remainder on every buffer, and the
-    /// accumulated remainder would eventually be reported as a gap that never happened.
-    /// Comparing each buffer only against its immediate predecessor keeps the arithmetic
-    /// self-contained either way.
+    /// 512 frames at 48 kHz is 106666.67 ticks. Keeping its rational numerator rather than
+    /// rounding each buffer retains both the frame duration and its fractional tick remainder.
     /// </remarks>
-    private long FramesToTicks(long frames)
-        => ((frames * TicksPerSecond) + (_format.SampleRate / 2)) / _format.SampleRate;
+    private static Int128 FramesToQpcUnits(long frames) => (Int128)frames * TicksPerSecond;
+
+    private long QpcUnitsToMilliseconds(Int128 units)
+        => (long)(units / ((long)_format.SampleRate * TicksPerMillisecond));
 
     private static long RequireQpcTicks(AudioPacket packet)
-        => packet.QpcPositionTicks
-           ?? throw new CaptureFailedException(
-               "the capture stream reported neither a usable device position nor a QPC timestamp, " +
-               "so its buffers have no device timing to be placed on the session timeline by. " +
-               "MeetCap will not invent one from a wall-clock read (docs/ARCHITECTURE.md section " +
-               "8.1). This is the unsupported-process-loopback case: use the baseline " +
-               "capture.online.loopback_mode = \"system\" on this machine, or a " +
-               "Windows/NAudio combination whose process loopback supplies a QPC timestamp.");
+    {
+        if (packet.QpcPositionTicks is { } ticks && ticks >= 0
+            && !packet.Flags.HasFlag(AudioBufferFlags.TimestampError)) return ticks;
+        throw new CaptureFailedException(
+            "The capture stream supplied no usable QPC timestamp (missing, negative or TimestampError), " +
+            "so its audio cannot be placed on the session timeline. Reconnect the endpoint or use " +
+            "an audio device with valid WASAPI timestamps; offline microphone capture is also available.");
+    }
 }

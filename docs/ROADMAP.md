@@ -388,11 +388,10 @@ Implemented (issue #7):
   baseline) and `.WithProcessLoopback` (process, the additive option), reusing the same
   span-based `WasapiRecorder` callback and the same MeetCap-owned `NAudioCaptureSource`
   adapter the microphone uses — no raw `ActivateAudioInterfaceAsync` / COM plumbing
-  (docs/ARCHITECTURE.md section 2). The two paths declare different capture clocks: system
-  loopback reports the render endpoint's device position, while process loopback reports
-  none and is placed by its QPC timestamp, so the process track's timeline is monotonic
-  instead of flagging one backwards device position per buffer (issue #33,
-  docs/ARCHITECTURE.md section 8.1);
+  (docs/ARCHITECTURE.md section 2). Both loopback paths declare QPC: process loopback can lack
+  positions (issue #33), and system Bluetooth positions can use a different rate from the audio
+  format (issue #40). System QPC preserves elapsed gaps and the original origin across restarts;
+  microphone capture retains device-position timing (docs/ARCHITECTURE.md section 8.1);
 - `RecordingSession` orchestrates one `CaptureTrack` per source (mic for offline; mic +
   loopback for online). Each track owns its own capture callback, bounded queue, chunk
   spool, timeline and device-loss recovery, so one capture callback never waits for the

@@ -129,7 +129,8 @@ internal sealed class SessionHarness : IDisposable
     /// can install the seam on both tracks. The harness must have been constructed with
     /// <c>mode: "online"</c>.
     /// </param>
-    public RecordingSession PrepareSessionDirect(string title = "Direct Session", bool online = false)
+    public RecordingSession PrepareSessionDirect(string title = "Direct Session", bool online = false,
+        Action? afterPacketWritten = null)
     {
         var paths = Workspace.Paths;
         var tracks = online ? new[] { AudioSources.Mic, AudioSources.Loopback } : new[] { AudioSources.Mic };
@@ -164,7 +165,7 @@ internal sealed class SessionHarness : IDisposable
             manifest,
             DeviceRecoveryAttempts,
             recordingLock,
-            afterPacketWritten: null,
+            afterPacketWritten: afterPacketWritten,
             beforeReopenAttempt: _beforeReopenAttempt);
     }
 

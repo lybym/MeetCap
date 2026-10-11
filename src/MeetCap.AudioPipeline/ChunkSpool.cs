@@ -133,7 +133,7 @@ public sealed class ChunkSpool : IDisposable
 
             offset += written;
             var framesConsumed = _format.BytesToFrames(offset);
-            _currentEndMs = timing.StartMs + _format.FramesToMilliseconds(framesConsumed);
+            _currentEndMs = PacketOffsetMs(packet, timing, framesConsumed);
 
             if (_writer.IsFull)
             {
@@ -208,7 +208,7 @@ public sealed class ChunkSpool : IDisposable
 
         var sequence = ++_sequence;
         var framesIntoPacket = _format.BytesToFrames(offset);
-        _currentStartMs = timing.StartMs + _format.FramesToMilliseconds(framesIntoPacket);
+        _currentStartMs = PacketOffsetMs(packet, timing, framesIntoPacket);
         _currentEndMs = _currentStartMs;
         _currentDevicePositionFrames = packet.DevicePositionFrames + framesIntoPacket;
         _currentQpcTicks = packet.QpcPositionTicks;
@@ -238,6 +238,13 @@ public sealed class ChunkSpool : IDisposable
             QpcPositionTicks = _currentQpcTicks,
         });
     }
+
+    private long PacketOffsetMs(AudioPacket packet, PacketTiming timing, long framesIntoPacket)
+        // Anchor offsets to the timeline's end so a fractional duration is not truncated
+        // a second time. Both sides of a split use the same boundary; full packets use
+        // EndMs exactly. Intermediate cuts retain whole-ms reporting resolution.
+        => framesIntoPacket == 0 ? timing.StartMs
+            : timing.EndMs - _format.FramesToMilliseconds(packet.FrameCount - framesIntoPacket);
 
     private void UpsertChunk(string chunkId, int sequence, long dataBytes, string status, DateTimeOffset? closedAt)
     {

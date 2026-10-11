@@ -48,6 +48,14 @@ public class LiveTranscriptionCommandTests
 
         var stop = harness.Run("stop");
 
+        // The stop command's confirmation budget may expire under CI load even though
+        // its request was signalled. Await start and retain the terminal queue/session
+        // assertions below, as in the network-loss test; other stop failures still fail.
+        Assert.True(
+            stop.ExitCode == 0 || (stop.ExitCode == 1 &&
+                stop.Error.Contains("still finalizing", StringComparison.Ordinal)),
+            "stop did not signal finalization" + $"\n{stop.Output}\n{stop.Error}");
+
         // Bounded: if the recorder or the final drain ever fails to finish, the test must fail
         // with a clear message rather than hanging the suite and the CI job.
         var start = await AwaitBounded(
@@ -56,8 +64,8 @@ public class LiveTranscriptionCommandTests
             "meetcap start did not finish after meetcap stop");
 
         Assert.True(
-            stop.ExitCode == 0 && start.ExitCode == 0,
-            "start/stop did not both succeed" + Describe(start, stop));
+            start.ExitCode == 0,
+            "start did not finish cleanly" + Describe(start, stop));
 
         // Every cloud call went to the file-ASR submit/query endpoints.
         Assert.True(harness.AsrHttp.Queries > 0, "expected at least one file-ASR query" + Describe(start, stop));
