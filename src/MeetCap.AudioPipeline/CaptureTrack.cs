@@ -57,6 +57,7 @@ internal sealed record CaptureTrackOutcome(
 /// </remarks>
 internal sealed class CaptureTrack : IDisposable
 {
+    private readonly DevicePositionAnomalyReporter _positionAnomalies = new();
     /// <summary>Assumed capture callback rate, used to bound the packet queue.</summary>
     internal const int PacketsPerSecondEstimate = 100;
 
@@ -522,6 +523,7 @@ internal sealed class CaptureTrack : IDisposable
             // other storage failure instead of escaping the consumer's finalizer.
             try
             {
+                _positionAnomalies.Flush(_events);
                 EvaluateProcessLoopbackSilence();
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
@@ -1101,6 +1103,7 @@ internal sealed class CaptureTrack : IDisposable
 
         if (timing.IsNewSegment)
         {
+            _positionAnomalies.Flush(_events);
             // Capture restarted on a fresh device stream: close what was captured before
             // the outage so it is durable without waiting for the chunk boundary.
             CloseActiveChunk();
@@ -1143,7 +1146,7 @@ internal sealed class CaptureTrack : IDisposable
         if (timing.DevicePositionAnomaly)
         {
             _degraded = true;
-            _events.Write(new SessionEvent(SessionEventNames.CaptureDiscontinuity, timing.StartMs)
+            _positionAnomalies.Observe(_events, new SessionEvent(SessionEventNames.CaptureDiscontinuity, timing.StartMs)
             {
                 Source = _source.ToWireName(),
                 DevicePositionFrames = packet.DevicePositionFrames,

@@ -94,9 +94,7 @@ internal sealed class AsrStack : ILiveAsrHost, IDisposable
         {
             try
             {
-                media = FFmpegMediaPipeline.Create(
-                    configuration.Media.FfmpegBinaryFolder,
-                    configuration.Media.FfmpegTemporaryFolder);
+                media = context.CreateMediaPipeline(configuration);
             }
             catch (MediaToolingException ex)
             {
@@ -130,7 +128,7 @@ internal sealed class AsrStack : ILiveAsrHost, IDisposable
 
         var processor = new AsrJobProcessor(
             database.AsrJobs,
-            provider,
+            new NormalizingAsrProvider(provider, () => media ?? context.CreateMediaPipeline(configuration), dataRoot),
             new VolcengineResponseNormalizer(),
             transcripts,
             database.Sessions,

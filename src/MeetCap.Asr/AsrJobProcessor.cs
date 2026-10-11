@@ -179,7 +179,8 @@ public sealed class AsrJobProcessor
         // backoff is gone — the network is back — so a job waiting out its durable
         // `next_retry_at` is processed anyway. The schedule is otherwise respected, which is
         // what keeps repeated commands from creating a retry storm.
-        if (ignoreRetrySchedule)
+        var remainingJobBudget = maxJobs - due.Count;
+        if (ignoreRetrySchedule && remainingJobBudget > 0)
         {
             var scheduled = _jobs
                 .ListResumable(DateTimeOffset.MaxValue, int.MaxValue, sessionId)
@@ -187,7 +188,7 @@ public sealed class AsrJobProcessor
                 .Where(job => due.All(candidate => !string.Equals(candidate.Id, job.Id, StringComparison.Ordinal)))
                 .OrderBy(job => job.NextRetryAt ?? DateTimeOffset.MinValue)
                 .ThenBy(job => job.Id, StringComparer.Ordinal)
-                .Take(maxJobs);
+                .Take(remainingJobBudget);
 
             due = due.Concat(scheduled).ToList();
         }

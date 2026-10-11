@@ -76,7 +76,7 @@ public sealed class SherpaOnnxSpeakerIdentityProvider : ISpeakerIdentityProvider
 
     public string ModelVersion => _modelVersion;
 
-    /// <summary>The embedding dimension produced by this model (192 for ERes2Net-base).</summary>
+    /// <summary>The actual embedding dimension reported by the loaded model.</summary>
     public int EmbeddingDimension => _extractor.Dim;
 
     /// <summary>
@@ -147,8 +147,15 @@ public sealed class SherpaOnnxSpeakerIdentityProvider : ISpeakerIdentityProvider
                 // score wins (docs/DATA_MODEL.md section 9: "Store multiple embeddings
                 // per person").
                 var bestScore = 0.0;
+                var compatible = false;
                 foreach (var emb in speaker.Embeddings)
                 {
+                    if (emb.ModelName != probe.ModelName || emb.ModelVersion != probe.ModelVersion ||
+                        emb.Values.Length != probe.Values.Length)
+                    {
+                        continue;
+                    }
+                    compatible = true;
                     var score = CosineSimilarity.Compute(probe.Values, emb.Values);
                     if (score > bestScore)
                     {
@@ -156,6 +163,7 @@ public sealed class SherpaOnnxSpeakerIdentityProvider : ISpeakerIdentityProvider
                     }
                 }
 
+                if (!compatible) continue;
                 candidates.Add(new SpeakerCandidate
                 {
                     SpeakerId = speaker.SpeakerId,

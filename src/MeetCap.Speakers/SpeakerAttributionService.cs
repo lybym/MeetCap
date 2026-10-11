@@ -184,6 +184,12 @@ public sealed class SpeakerAttributionService
             return [];
         }
 
+        if (labelSegments.Select(s => s.Source).Distinct(StringComparer.Ordinal).Take(2).Count() > 1)
+        {
+            warnings.Add($"anonymous label {label} occurs on multiple tracks; use a manual assignment after verifying the speakers.");
+            return [];
+        }
+
         var ranges = CleanSampleSelector.Select(labelSegments, _sampleMinSeconds, _sampleMaxSeconds);
         if (ranges.Count == 0)
         {

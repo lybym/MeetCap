@@ -269,11 +269,16 @@ internal static class SpeakersCommand
             configuration.Speakers.Identity.SampleMinSeconds,
             configuration.Speakers.Identity.SampleMaxSeconds);
 
-        // The sample extractor reads audio from the session's batch WAV files. If audio
-        // is unavailable (no batches, or the range falls outside them), the label stays
-        // unknown rather than being forcibly named.
+        // Keep the sample on the transcript's source track. An ambiguous cross-track
+        // label must not silently read another participant's audio.
         SpeakerSampleExtractor extractor = (label, startMs, endMs, ct) =>
-            Task.FromResult(ExtractSampleFromBatches(paths, label, startMs, endMs));
+        {
+            ct.ThrowIfCancellationRequested();
+            var sources = segments.Where(s => s.SpeakerLabel == label && s.StartMs < endMs && s.EndMs > startMs)
+                .Select(s => s.Source).Distinct(StringComparer.Ordinal).ToArray();
+            return Task.FromResult(sources.Length == 1
+                ? SessionSpeakerSampleReader.Extract(paths, sources[0], label, startMs, endMs) : null);
+        };
 
         SpeakerAttributionResult result;
         try
@@ -322,106 +327,6 @@ internal static class SpeakersCommand
         }
 
         return 0;
-    }
-
-    // --- audio sample extraction from batch WAVs ---
-
-    /// <summary>
-    /// Best-effort extraction of a mono float[] sample for a time range from the session's
-    /// batch WAV files. Returns null when no batch covers the range, so the attribution
-    /// pipeline leaves that label unknown rather than crashing.
-    /// </summary>
-    private static SpeakerAudioSample? ExtractSampleFromBatches(
-        SessionArtifactPaths paths,
-        string speakerLabel,
-        long startMs,
-        long endMs)
-    {
-        if (!Directory.Exists(paths.AsrBatchesDirectory))
-        {
-            return null;
-        }
-
-        // Find the first batch WAV that covers the requested range.
-        foreach (var wavPath in Directory.EnumerateFiles(paths.AsrBatchesDirectory, "*.wav", SearchOption.AllDirectories)
-            .OrderBy(p => p, StringComparer.Ordinal))
-        {
-            var manifestPath = Path.ChangeExtension(wavPath, ".json");
-            if (!File.Exists(manifestPath))
-            {
-                continue;
-            }
-
-            var batch = TryReadBatchManifest(manifestPath);
-            if (batch is null) continue;
-
-            // The batch's own span on the session timeline.
-            if (startMs < batch.StartMs || endMs > batch.EndMs)
-            {
-                continue;
-            }
-
-            // Read the samples from the batch WAV at the offset within the batch.
-            try
-            {
-                var (samples, sampleRate) = ReadWavSamples(wavPath);
-                var offsetMs = startMs - batch.StartMs;
-                var durationMs = endMs - startMs;
-                var frameStart = (int)(offsetMs * sampleRate / 1000.0);
-                var frameCount = (int)(durationMs * sampleRate / 1000.0);
-
-                if (frameStart + frameCount > samples.Length)
-                {
-                    frameCount = samples.Length - frameStart;
-                }
-
-                if (frameCount <= 0)
-                {
-                    return null;
-                }
-
-                var slice = new float[frameCount];
-                Array.Copy(samples, frameStart, slice, 0, frameCount);
-                return new SpeakerAudioSample
-                {
-                    Samples = slice,
-                    SampleRate = sampleRate,
-                    SourceSessionId = paths.SessionId,
-                    SpeakerLabel = speakerLabel,
-                    StartMs = startMs,
-                    EndMs = endMs,
-                };
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        return null;
-    }
-
-    private sealed record BatchSpan(long StartMs, long EndMs);
-
-    private static BatchSpan? TryReadBatchManifest(string path)
-    {
-        try
-        {
-            var json = File.ReadAllText(path);
-            using var doc = System.Text.Json.JsonDocument.Parse(json);
-            var root = doc.RootElement;
-            if (!root.TryGetProperty("start_ms", out var startEl) ||
-                !root.TryGetProperty("end_ms", out var endEl))
-            {
-                return null;
-            }
-
-            return new BatchSpan(startEl.GetInt64(), endEl.GetInt64());
-        }
-        catch
-        {
-            return null;
-        }
     }
 
     // --- minimal WAV reader ---

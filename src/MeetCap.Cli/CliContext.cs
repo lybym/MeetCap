@@ -5,6 +5,7 @@ using MeetCap.AudioPipeline;
 using MeetCap.Core.Capture;
 using MeetCap.Core.Configuration;
 using MeetCap.Core.Diagnostics;
+using MeetCap.Core.Media;
 using MeetCap.Core.Secrets;
 using MeetCap.Persistence.Storage;
 using Microsoft.Extensions.Logging;
@@ -20,6 +21,10 @@ internal class CliEnvironment
     /// <summary>The default configuration directory, <c>%APPDATA%\MeetCap</c>.</summary>
     public virtual string DefaultConfigDirectory =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "MeetCap");
+
+    /// <summary>Media boundary; tests can substitute external tools without changing production orchestration.</summary>
+    public virtual IMediaPipeline CreateMediaPipeline(MeetCapConfiguration configuration) =>
+        FFmpegMediaPipeline.Create(configuration.Media.FfmpegBinaryFolder, configuration.Media.FfmpegTemporaryFolder);
 }
 
 /// <summary>
@@ -65,6 +70,8 @@ internal sealed class CliContext
     /// (<c>docs/DEVELOPMENT.md</c> section 7). Production passes <c>null</c>.
     /// </remarks>
     public HttpMessageHandler? AsrHttpHandler { get; }
+
+    public IMediaPipeline CreateMediaPipeline(MeetCapConfiguration configuration) => _environment.CreateMediaPipeline(configuration);
 
     /// <summary>Logger category used by every command handler.</summary>
     public const string LoggerCategory = "MeetCap";
