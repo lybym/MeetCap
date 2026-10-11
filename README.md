@@ -77,8 +77,9 @@ person, resolves anonymous ASR speaker labels through the normative priority
 `manual > high-confidence voiceprint > unknown`, and writes `transcript/final.jsonl` and
 `transcript/final.md` with attributed speaker names.
 
-Provider speaker labels are preserved exactly as anonymous, session-scoped data. They are never
-treated as persistent human identities.
+Provider speaker labels are preserved exactly as anonymous data. Their meaning is scoped to
+each provider job; repeated label text across jobs or tracks stays unknown automatically.
+They are never treated as persistent human identities.
 
 Real Volcengine transcription is not verified by CI: no credentials are available there, so the
 provider boundary is mocked in tests. The real 3D-Speaker/sherpa-onnx model is likewise not

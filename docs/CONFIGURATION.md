@@ -306,7 +306,7 @@ per-request timeout enforced by the Polly timeout strategy inside the provider a
 `request_speaker_info = true` asks Seed-ASR 2.0 Standard HTTP for anonymous speaker information
 when that capability is supported by the official interface.
 
-Provider speaker labels are session-scoped anonymous labels. They are not persistent identities
+Provider speaker labels are provider-job-scoped anonymous labels. They are not persistent identities
 and must not be treated as names.
 
 Because these labels are the default MVP diarization source, `speakers.enabled = true` with
@@ -447,9 +447,10 @@ default; see `SPEAKER_CALIBRATION.md` for selection, sample limits and evidence.
 
 `speakers attribute` reads imported audio through the durable `session.json` source mapping,
 preferring the normalized artifact. Live samples are read from the transcript's source track.
-Only the requested WAV frames are loaded. A label occurring on multiple tracks remains unknown
-automatically, with a warning, because the current session-label assignment schema cannot
-represent distinct people sharing that label; manual assignment still applies to the whole label.
+Only the requested WAV frames are loaded. A label occurring on multiple tracks or in separate
+provider jobs remains unknown automatically, with a warning, because the current session-label
+assignment schema cannot represent distinct people sharing that label. Manual assignment still
+applies to every segment with that label in the session and remains locked.
 Embedding model name, version and dimension must match; equal dimensions alone do not imply
 compatibility. The actual dimension comes from the loaded model, not a hard-coded size.
 

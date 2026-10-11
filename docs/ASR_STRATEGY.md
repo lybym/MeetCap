@@ -253,7 +253,7 @@ Volcengine Seed-ASR 2.0
 
 MeetCap requests speaker information when supported by the Seed-ASR 2.0 Standard HTTP API and preserves it in normalized segments.
 
-Provider speaker labels are anonymous and session/provider scoped. They are not persistent identities and must never be treated as stable names.
+Provider speaker labels are anonymous and provider-job scoped. They are not persistent identities and must never be treated as stable names.
 
 Do not add a second default diarization engine until real recordings demonstrate the need.
 

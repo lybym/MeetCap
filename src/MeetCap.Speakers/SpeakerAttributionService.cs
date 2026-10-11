@@ -91,6 +91,18 @@ public sealed class SpeakerAttributionService
         {
             var labelSegments = segments.Where(s => s.SpeakerLabel == label).ToList();
             var manual = _store.GetAssignment(sessionId, label);
+            var multipleTracks = labelSegments.Select(s => s.Source)
+                .Distinct(StringComparer.Ordinal).Take(2).Count() > 1;
+            var multipleJobs = labelSegments.Select(s => s.ProviderJobId)
+                .Distinct(StringComparer.Ordinal).Take(2).Count() > 1;
+            var ambiguous = multipleTracks || multipleJobs;
+            if (ambiguous)
+            {
+                var scope = multipleTracks && multipleJobs ? "multiple tracks and provider jobs"
+                    : multipleTracks ? "multiple tracks" : "multiple provider jobs";
+                warnings.Add($"anonymous label {label} occurs in {scope}; automatic identity matching is skipped. " +
+                    "A manual assignment applies to every segment with this label in the session.");
+            }
 
             SpeakerResolution resolution;
             if (manual is not null && (manual.Locked || manual.Source == SpeakerAssignmentSource.Manual))
@@ -100,19 +112,19 @@ public sealed class SpeakerAttributionService
             }
             else
             {
-                // Try voiceprint identification. If the provider fails, the label stays unknown
-                // and the raw artifacts are untouched (docs/ARCHITECTURE.md section 20).
-                var candidates = await IdentifySafelyAsync(
+                // Anonymous labels can be reused by independent ASR jobs. One session-wide
+                // identity would then name unrelated voices, so only an unambiguous label
+                // can reach the voiceprint provider.
+                IReadOnlyList<SpeakerCandidate> candidates = ambiguous ? [] : await IdentifySafelyAsync(
                     label, labelSegments, sampleExtractor, enrolled, warnings, cancellationToken);
 
                 resolution = SpeakerMatchingPolicy.Resolve(label, manual, candidates, _policy);
 
-                // Persist the voiceprint resolution so it survives a re-run and so the
-                // attribution artifact is reproducible. Only non-manual, non-locked results
-                // are written here; manual assignments are written by the assign command.
-                if (resolution.Source != SpeakerAssignmentSource.Unknown)
+                // Replace a prior automatic binding if a later job reuses its label.
+                // Manual assignments are written only by the assign command.
+                if (resolution.Source != SpeakerAssignmentSource.Unknown || (ambiguous && manual is not null))
                 {
-                    PersistVoiceprintAssignment(sessionId, resolution);
+                    PersistAutomaticAssignment(sessionId, resolution);
                 }
             }
 
@@ -184,12 +196,6 @@ public sealed class SpeakerAttributionService
             return [];
         }
 
-        if (labelSegments.Select(s => s.Source).Distinct(StringComparer.Ordinal).Take(2).Count() > 1)
-        {
-            warnings.Add($"anonymous label {label} occurs on multiple tracks; use a manual assignment after verifying the speakers.");
-            return [];
-        }
-
         var ranges = CleanSampleSelector.Select(labelSegments, _sampleMinSeconds, _sampleMaxSeconds);
         if (ranges.Count == 0)
         {
@@ -231,7 +237,7 @@ public sealed class SpeakerAttributionService
         return [];
     }
 
-    private void PersistVoiceprintAssignment(string sessionId, SpeakerResolution resolution)
+    private void PersistAutomaticAssignment(string sessionId, SpeakerResolution resolution)
     {
         try
         {
@@ -244,7 +250,7 @@ public sealed class SpeakerAttributionService
                 SpeakerId = resolution.SpeakerId,
                 SpeakerName = resolution.SpeakerName,
                 Confidence = resolution.Confidence,
-                Source = SpeakerAssignmentSource.Voiceprint,
+                Source = resolution.Source,
                 Locked = false,
                 CreatedAt = now,
                 UpdatedAt = now,
