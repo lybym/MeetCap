@@ -123,7 +123,9 @@ public sealed class CaptureTimeline
     private bool _hasOrigin;
     private long _originFrames;
     private long _nextExpectedFrames;
-    private long _nextExpectedQpcTicks;
+    // QPC ticks scaled by sample rate: one captured frame is exactly TicksPerSecond
+    // units, so fractional ticks/milliseconds survive every monotonic continuation.
+    private Int128 _nextExpectedQpcUnits;
     private long _lastEndMs;
     private long? _originQpcTicks;
     private long _pendingGapMs;
@@ -261,11 +263,9 @@ public sealed class CaptureTimeline
             return ObserveRestartedStream(packet, frames, durationMs, flagged);
         }
 
-        var placement = _clock == CaptureClock.Qpc
-            ? PlaceByQpc(packet)
-            : PlaceByDevicePosition(packet, frames);
-
-        return Place(durationMs, flagged, placement);
+        return _clock == CaptureClock.Qpc
+            ? PlaceByQpc(packet, flagged, restarted: false)
+            : Place(durationMs, flagged, PlaceByDevicePosition(packet, frames));
     }
 
     /// <summary>
@@ -305,7 +305,7 @@ public sealed class CaptureTimeline
 
         if (_clock == CaptureClock.Qpc)
         {
-            _nextExpectedQpcTicks = FramesToTicks(frames);
+            _nextExpectedQpcUnits = FramesToQpcUnits(frames);
         }
 
         return new PacketTiming(0, durationMs, 0, flagged, false);
@@ -323,36 +323,18 @@ public sealed class CaptureTimeline
         _pendingGapMs = 0;
         _pendingSegmentRestart = false;
 
+        if (_clock == CaptureClock.Qpc)
+            return PlaceByQpc(packet, flagged, restarted: true);
+
         // Audio stopped where the last placed buffer ended, and resumes where the new
         // stream is placed. Captured before _lastEndMs moves.
         var gapStartMs = _lastEndMs;
         var targetMs = gapStartMs + gap;
-        if (_clock == CaptureClock.Qpc)
-        {
-            // WASAPI QPC is system-wide, not relative to the reopened stream. Its
-            // first frame may arrive long after the endpoint was opened again.
-            var positionTicks = RequireQpcTicks(packet) - _originQpcTicks!.Value;
-            if (positionTicks < Math.Max(_nextExpectedQpcTicks, _lastEndMs * TicksPerMillisecond)
-                - QpcBackwardsToleranceTicks)
-                throw new CaptureFailedException("The restarted capture stream supplied a QPC timestamp " +
-                    "that moved backwards. Its system timing is unusable; reconnect the endpoint " +
-                    "or use an audio device with valid WASAPI timestamps.");
-            targetMs = Math.Max(gapStartMs, positionTicks / TicksPerMillisecond);
-            gap = targetMs - gapStartMs;
-        }
         var endMs = targetMs + durationMs;
         _lastEndMs = endMs;
 
-        if (_clock == CaptureClock.Qpc)
-        {
-            var qpcTicks = RequireQpcTicks(packet);
-            _nextExpectedQpcTicks = qpcTicks - _originQpcTicks!.Value + FramesToTicks(frames);
-        }
-        else
-        {
-            _originFrames = packet.DevicePositionFrames - _format.MillisecondsToFrames(targetMs);
-            _nextExpectedFrames = packet.DevicePositionFrames + frames;
-        }
+        _originFrames = packet.DevicePositionFrames - _format.MillisecondsToFrames(targetMs);
+        _nextExpectedFrames = packet.DevicePositionFrames + frames;
 
         var gapStart = GapIntervalStart(gap, gapStartMs);
 
@@ -389,34 +371,37 @@ public sealed class CaptureTimeline
         return new Placement(_lastEndMs, 0, true, null);
     }
 
-    private Placement PlaceByQpc(AudioPacket packet)
+    private PacketTiming PlaceByQpc(AudioPacket packet, bool flagged, bool restarted)
     {
         var positionTicks = RequireQpcTicks(packet) - _originQpcTicks!.Value;
-        var skippedTicks = positionTicks - _nextExpectedQpcTicks;
-        // A packet placed at the monotonic continuation still consumed its audio frames.
-        // Moving the expected end back to an early timestamp would count the next normal
-        // timestamp's correction as missing audio, repeatedly extending the timeline.
-        _nextExpectedQpcTicks = Math.Max(positionTicks, _nextExpectedQpcTicks)
-            + FramesToTicks(packet.FrameCount);
+        var positionUnits = (Int128)positionTicks * _format.SampleRate;
+        var skippedUnits = positionUnits - _nextExpectedQpcUnits;
+        var toleranceUnits = (Int128)QpcBackwardsToleranceTicks * _format.SampleRate;
+        if (restarted && skippedUnits < -toleranceUnits)
+            throw new CaptureFailedException("The restarted capture stream supplied a QPC timestamp " +
+                "that moved backwards. Its system timing is unusable; reconnect the endpoint " +
+                "or use an audio device with valid WASAPI timestamps.");
 
-        if (skippedTicks >= 0)
+        // Keep the high-water protection for early timestamps, but advance by exact
+        // frame units. Rounding each buffer's ticks or duration would accumulate error.
+        var startUnits = positionUnits > _nextExpectedQpcUnits ? positionUnits : _nextExpectedQpcUnits;
+        var startMs = QpcUnitsToMilliseconds(startUnits);
+        var previousEndMs = _lastEndMs;
+        var gap = skippedUnits >= (Int128)TicksPerMillisecond * _format.SampleRate
+            ? startMs - previousEndMs : 0;
+        _nextExpectedQpcUnits = startUnits + FramesToQpcUnits(packet.FrameCount);
+        _lastEndMs = QpcUnitsToMilliseconds(_nextExpectedQpcUnits);
+        if (gap > 0)
         {
-            var startMs = positionTicks / TicksPerMillisecond;
-            return skippedTicks > 0
-                // The stream produced no audio for this stretch of its own clock time, so
-                // the hole is real and is reported rather than absorbed.
-                ? new Placement(startMs, skippedTicks / TicksPerMillisecond, false, _lastEndMs)
-                : new Placement(startMs, 0, false, null);
+            GapTotalMs += gap;
+            GapCount++;
         }
-
-        if (skippedTicks >= -QpcBackwardsToleranceTicks)
+        return new PacketTiming(startMs, _lastEndMs, gap, flagged,
+            !restarted && skippedUnits < -toleranceUnits, SegmentRestart: restarted)
         {
-            // Within a millisecond of the expected continuation: the same stream, read a
-            // fraction early once the time is expressed in whole milliseconds.
-            return new Placement(_lastEndMs, 0, false, null);
-        }
-
-        return new Placement(_lastEndMs, 0, true, null);
+            GapStartMs = gap > 0 ? previousEndMs : null,
+            GapEndMs = gap > 0 ? startMs : null,
+        };
     }
 
     private PacketTiming Place(long durationMs, bool flagged, Placement placement)
@@ -468,28 +453,25 @@ public sealed class CaptureTimeline
     /// (docs/DATA_MODEL.md section 4.1).
     /// </para>
     /// <para>
-    /// QPC integer-tick rounding makes this reachable on ordinary hardware, because a buffer
-    /// length is rarely a whole number of ticks. At 3000 Hz a 1000-frame buffer is 3,333,333.33
-    /// ticks, and the rounded per-buffer expectation falls one tick behind the stream's own
-    /// reading by the third buffer — a forward step of a single tick, far below the millisecond
-    /// this timeline measures holes in.
+    /// Integer QPC readings can differ from exact frame time by fractional ticks. QPC placement
+    /// retains the rational frame continuation and reports only whole-ms gaps, so that source
+    /// quantisation cannot introduce an empty gap interval.
     /// </para>
     /// </remarks>
     private static long? GapIntervalStart(long gapMs, long? gapStartMs)
         => gapMs > 0 ? gapStartMs : null;
 
     /// <summary>
-    /// Frames as QPC ticks, rounded to the nearest tick.
+    /// Exact frame duration in QPC ticks scaled by sample rate.
     /// </summary>
     /// <remarks>
-    /// Rounding matters: a buffer length that is not a whole number of ticks (512 frames at
-    /// 48 kHz is 106666.67) would otherwise hand back a remainder on every buffer, and the
-    /// accumulated remainder would eventually be reported as a gap that never happened.
-    /// Comparing each buffer only against its immediate predecessor keeps the arithmetic
-    /// self-contained either way.
+    /// 512 frames at 48 kHz is 106666.67 ticks. Keeping its rational numerator rather than
+    /// rounding each buffer retains both the frame duration and its fractional tick remainder.
     /// </remarks>
-    private long FramesToTicks(long frames)
-        => ((frames * TicksPerSecond) + (_format.SampleRate / 2)) / _format.SampleRate;
+    private static Int128 FramesToQpcUnits(long frames) => (Int128)frames * TicksPerSecond;
+
+    private long QpcUnitsToMilliseconds(Int128 units)
+        => (long)(units / ((long)_format.SampleRate * TicksPerMillisecond));
 
     private static long RequireQpcTicks(AudioPacket packet)
     {

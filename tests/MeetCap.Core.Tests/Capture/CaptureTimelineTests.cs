@@ -460,6 +460,37 @@ public class CaptureTimelineTests
     }
 
     [Theory]
+    [InlineData(480, false)]
+    [InlineData(512, false)]
+    [InlineData(512, true)]
+    public void QpcClock_FractionalBuffersKeepCapturedDurationAndARealGap(int frames, bool early)
+    {
+        const int count = 3_000;
+        const long origin = 10_000_000;
+        var timeline = new CaptureTimeline(Mono48k, CaptureClock.Qpc);
+        for (var i = 0; i < count; i++)
+        {
+            var qpc = origin + i * (long)frames * 10_000_000 / Mono48k.SampleRate;
+            if (early && i > 0) qpc -= 5_000; // a half-ms early reading must retain fractional audio
+            var timing = timeline.Observe(Packet(0, frames, qpc));
+            Assert.Equal(i * (long)frames * 1_000 / Mono48k.SampleRate, timing.StartMs);
+            Assert.Equal((i + 1) * (long)frames * 1_000 / Mono48k.SampleRate, timing.EndMs);
+            Assert.False(timing.IsIrregular);
+        }
+        var capturedMs = count * (long)frames * 1_000 / Mono48k.SampleRate;
+        Assert.Equal(capturedMs, timeline.LastEndMs);
+        Assert.Equal(0, timeline.GapCount);
+        var resumed = timeline.Observe(Packet(0, frames,
+            origin + count * (long)frames * 10_000_000 / Mono48k.SampleRate + 80_000_000));
+        Assert.Equal(8_000, resumed.GapMs);
+        Assert.Equal(capturedMs, resumed.GapStartMs);
+        Assert.Equal(capturedMs + 8_000, resumed.GapEndMs);
+        Assert.Equal(resumed.GapMs, resumed.GapEndMs - resumed.GapStartMs);
+        Assert.Equal(8_000, timeline.GapTotalMs);
+        Assert.Equal(1, timeline.GapCount);
+    }
+
+    [Theory]
     [InlineData(CaptureClock.DevicePosition)]
     [InlineData(CaptureClock.Qpc)]
     public void StartupRecoveryBeforeOrigin_DoesNotInsertItsOutageIntoTheSecondPacket(CaptureClock clock)

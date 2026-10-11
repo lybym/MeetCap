@@ -10,6 +10,55 @@ public class BluetoothTimingDiagnosticsTests
 {
     private static readonly AudioFormat Format = TestAudio.Formats.Mono48kPcm;
 
+    [Theory]
+    [InlineData(480)]
+    [InlineData(512)]
+    public async Task FractionalQpcBuffers_DurableChunksAndRealGapAgreeWithCapturedFrames(int frames)
+    {
+        using var harness = new SessionHarness(chunkSeconds: 1, bufferSeconds: 60, mode: SessionModes.Online);
+        var mic = new FakeCaptureSource(Format, harness.Device);
+        var loop = new FakeCaptureSource(Format, harness.RenderDevice, AudioSource.Loopback) { Clock = CaptureClock.Qpc };
+        harness.Sources.Enqueue(mic);
+        harness.Sources.EnqueueLoopback(loop);
+        var session = harness.Service.PrepareSession("Fractional QPC durations");
+        var paths = new SessionPaths(harness.DataRoot, session.SessionId);
+        using var stop = new CancellationTokenSource();
+        var run = session.RunAsync(stop.Token);
+        Assert.True(await Wait.UntilAsync(() => loop.StartCount == 1));
+        const int count = 3_000;
+        const long origin = 10_000_000;
+        var sample = At(0, 0, frames);
+        for (var i = 0; i < count; i++)
+            loop.Emit(new AudioPacket(AudioSource.Loopback, Format, sample.Data, i * (long)frames,
+                origin + i * (long)frames * 10_000_000 / Format.SampleRate, DateTimeOffset.UnixEpoch));
+        var capturedMs = count * (long)frames * 1_000 / Format.SampleRate;
+        loop.Emit(new AudioPacket(AudioSource.Loopback, Format, sample.Data, count * (long)frames,
+            origin + count * (long)frames * 10_000_000 / Format.SampleRate + 80_000_000, DateTimeOffset.UnixEpoch));
+        stop.Cancel();
+        var outcome = await Wait.ForAsync(run, timeoutMs: 60_000, "fractional QPC recording");
+        Assert.Equal(8_000, outcome.GapTotalMs);
+        Assert.Equal(1, outcome.GapCount);
+        var chunks = harness.Database.Chunks.ListForSession(session.SessionId).Where(c => c.Source == AudioSource.Loopback).ToList();
+        var before = chunks.Take(chunks.Count - 1).ToList();
+        Assert.Equal(capturedMs, before.Last().EndMs);
+        Assert.Equal(count * (long)frames * Format.BlockAlign, before.Sum(c => c.ByteLength));
+        for (var i = 0; i < before.Count; i++)
+        {
+            Assert.Equal(i * 1_000, before[i].StartMs);
+            Assert.Equal((i + 1) * 1_000, before[i].EndMs);
+        }
+        Assert.Equal(capturedMs + 8_000, chunks.Last().StartMs);
+        Assert.Equal(capturedMs + 8_000 + frames * 1_000 / Format.SampleRate, chunks.Last().EndMs);
+        var gap = Assert.Single(ReadEvents(paths), e => e.GetProperty("event").GetString() == SessionEventNames.CaptureGap);
+        Assert.Equal(8_000, gap.GetProperty("gap_ms").GetInt64());
+        Assert.Equal(capturedMs, gap.GetProperty("gap_start_ms").GetInt64());
+        Assert.Equal(capturedMs + 8_000, gap.GetProperty("gap_end_ms").GetInt64());
+        var audited = Assert.Single(new SessionGapAuditor(harness.Database).Audit(session.SessionId).Gaps);
+        Assert.Equal(8_000, audited.GapMs);
+        Assert.True(SessionManifestStore.TryLoad(paths.ManifestPath, out var manifest, out var error), error);
+        Assert.Equal(0, manifest!.TrackHealth.Single(h => h.Source == AudioSources.Loopback).BufferHealth.DroppedPackets);
+    }
+
     [Fact]
     public async Task FailedReplacementStarts_AreBoundedAndReportTheCauseWithoutFalseRestore()
     {

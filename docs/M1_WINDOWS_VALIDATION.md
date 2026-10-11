@@ -1323,7 +1323,7 @@ and credentials are not committed. A hardware-only audit is `issue40-hardware-au
 | `preflight-fixed-data`, session `ses_20261011T040401Z_99d1b58c`, 16.29 s wall time, ASR disabled | Fresh Release build with the gap-boundary fix: 1,453 loopback anomalies represented by **4** aggregate events. Both tracks close 3 chunks with non-zero audio, 0 gaps, 0 dropped packets and 0 stalls. No positive skip occurred, so this is hardware regression evidence, **not a hardware proof of the corrected gap boundary**. |
 | `bluetooth3-data`, session `ses_20261011T040445Z_0740cd96`, gap-boundary-only Release build, physical disconnect/reconnect confirmed by the operator, ASR disabled | **Timing defect reproduced; restart/content present:** each track records one loss/restore without fatal loss. Mic gap 13,770–22,877 ms = 9,107 ms; loopback gap 13,519–22,693 ms = 9,174 ms. Both equal their reported counts, but loopback omits the additional wait until its first actual frame. Both resume closed WAVs with non-zero audio and monotonic intervals. 3,385 loopback position anomalies become 10 aggregate events; 0 drops/stalls. This run does **not** pass the corrected timing gate. |
 | `qpc-bluetooth-data`, session `ses_20261011T042213Z_3e138ae5`, first QPC iteration, physical disconnect/reconnect with playback deliberately restarted 10 s after both restore events, ASR disabled | **Timing defect reproduced:** original QPC anchor correctly places the first restored loopback frame at 33,587 ms, including the playback wait; both tracks restore and contain non-zero resumed audio. However early QPC/corrections generate **988 loopback gaps**, inflating its 29,649.25 ms of captured audio to a 57,849 ms end through 28,199 ms of reported gaps. This run exposed the continuation update defect and does **not** pass the final timing gate. |
-| `qpc-steady-preflight-data`, session `ses_20261011T043238Z_94203f4f`, QPC high-water build, normal microphone permissions, playback warmed up 2 s before recording and stopped after recording, ASR disabled | **PASS for steady timing/content:** mic records 18,860 ms, 4 chunks, 0 gaps, 244,060 non-zero samples. Loopback records 18,879.625 ms of audio, 4 chunks, end 19,550 ms, with **3 gaps / 669 ms**. Captured duration plus missing time agrees with its end within **2 ms**; the old repeating 4–5 ms drift is absent. 1,714 QPC-behind-continuation observations become **5** aggregate events including stop tail. Both tracks have 0 drops/stalls and no loss/restore or unusable timing. |
+| `qpc-steady-preflight-data`, session `ses_20261011T043238Z_94203f4f`, pre-review QPC high-water snapshot, normal microphone permissions, playback warmed up 2 s before recording and stopped after recording, ASR disabled | **PASS for this snapshot's steady timing/content:** mic records 18,860 ms, 4 chunks, 0 gaps, 244,060 non-zero samples. Loopback records 18,879.625 ms of audio, 4 chunks, end 19,550 ms, with **3 gaps / 669 ms**. Captured duration plus missing time agrees with its end within **2 ms**; the old repeating 4–5 ms drift is absent. 1,714 QPC-behind-continuation observations become **5** aggregate events including stop tail. Both tracks have 0 drops/stalls and no loss/restore or unusable timing. This is not hardware validation of the later fractional-buffer correction. |
 
 Source-clock evidence: the first preflight loopback anomaly has `device_position_frames = 320`,
 `qpc_position_ticks = 5575003799450`, `at_ms = 9`. The next aggregate at 5,009 ms carries position
@@ -1406,10 +1406,25 @@ the audio was clamped forwards, inventing repeated 4–5 ms gaps. The corrected 
 advances monotonically by the captured frames. A 500-buffer metadata-shaped regression proves
 no false gaps or accumulated drift, while preserving a subsequent actual 8 s hole. QPC anomalies
 use `qpc_position_backwards`, rather than incorrectly describing device frame positions.
-The regressions also pin live/audited gap interval equality,
-aggregate tail counts, independent microphone health and durable audio. Release build passed
-with zero warnings/errors; the complete local Release suite passed **873/873**, with no skips,
-including microphone, baseline system loopback, process QPC and device-recovery regressions.
+The regressions also pin live/audited gap interval equality, aggregate tail counts, independent
+microphone health and durable audio. At reviewed head `909b080`, Release build passed with zero
+warnings/errors and the complete local Release suite passed **873/873**, with no skips.
+
+Independent review then exposed a fractional-buffer defect: 3,000 continuous 512-frame packets
+at 48 kHz carry 32,000 ms of audio, but upward per-packet tick rounding plus truncated early
+placement ended at 30,000 ms. A real following 8 s hole was reported as 7,999 ms against a
+10,000 ms interval. The correction carries exact frame time as QPC ticks scaled by sample rate
+in an `Int128` numerator, through both continuation and restart, and rounds only reported
+millisecond boundaries. Gap counts use the same reported interval. `ChunkSpool` preserves the
+timeline's full-packet end and uses that end consistently for packet splits.
+
+New regressions cover 3,000 packets of both 480-frame controls and 512-frame payloads, accurate
+floor-rounded QPC and half-ms early readings, followed by a real 8,000 ms gap. Core placement
+and the durable one-second chunk index now end at the full captured duration, with identical
+live/audited gap counts and intervals. After this correction, **36 CaptureTimeline tests and
+97 pipeline/process/recovery/start/chunk-recovery tests passed**. The updated full build/suite
+and new CI are pending at the user-requested pause; the earlier 873 result is not claimed for
+the corrected head.
 
 Limitations: these short runs do not repeat the two-hour soak test or prove endpoint format
 changes. The historical rc.2 post-reconnect result in section 16.4 stays separately scoped to that
@@ -1419,8 +1434,10 @@ fix; deterministic regressions establish the corrected frame-clock interval. The
 high-water build's steady recording is scoped separately from the earlier real reconnect test:
 the latter proves first-frame recovery anchoring/content and exposed the drift now covered by
 metadata-shaped regressions. No new physical disconnect is claimed for the steady run.
-The steady recording uses the final QPC placement logic; subsequent changes only preserve start
+The steady recording uses the pre-review high-water placement logic; subsequent changes preserve start
 failure diagnostics, defer the restored event until successful `Start()`, and clear startup
 outages before the first captured packet defines an origin. The latter prevents an invented gap
 on the second buffer after a failed initial start. Those changes are covered by the final
-873-test suite, without claiming another hardware recording.
+873-test suite at the reviewed head, without claiming another hardware recording. The fractional
+buffer correction above changes the timing arithmetic after that snapshot and has synthetic
+regression coverage; no physical recording of the corrected arithmetic is claimed here.

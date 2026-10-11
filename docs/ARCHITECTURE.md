@@ -488,6 +488,11 @@ Both clocks produce session-relative positions and explicit gaps. A QPC reading 
 millisecond of the expected continuation is treated as the same stream continuing, to allow
 sample/tick quantisation. An early/clamped QPC packet still advances the expected continuation
 by its captured frames: a later timestamp correction cannot count those frames again as a gap.
+The QPC continuation stores exact frame time as ticks scaled by sample rate, using an `Int128`
+numerator. Neither individual frame durations nor the high-water end are rounded per packet.
+Only reported millisecond boundaries are truncated; a reportable gap uses those same start/end
+boundaries for its count. `ChunkSpool` uses the timeline's full-packet `EndMs`, and computes both
+sides of an interior chunk cut from that end, preserving fractional durations in durable indexes.
 WASAPI QPC uses the system performance counter, not a new origin per
 stream ([GetBuffer contract](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudiocaptureclient-getbuffer)).
 
