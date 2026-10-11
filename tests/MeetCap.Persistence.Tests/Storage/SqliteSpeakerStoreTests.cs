@@ -185,6 +185,40 @@ public class SqliteSpeakerStoreTests
     }
 
     [Fact]
+    public void AutomaticAssignment_CannotReplaceManualOrLockedRow()
+    {
+        using var ws = new TempWorkspace();
+        new SqliteMigrator().Migrate(ws.DatabasePath);
+        var store = new SqliteSpeakerStore(ws.DatabasePath);
+        var alice = Speaker("Alice");
+        var bob = Speaker("Bob");
+        store.CreateSpeaker(alice);
+        store.CreateSpeaker(bob);
+        var automatic = Assignment("ses_1", "speaker_0", alice.Id, "Alice") with
+        {
+            Source = SpeakerAssignmentSource.Voiceprint,
+            Locked = false,
+        };
+        Assert.True(store.TryUpsertAutomaticAssignment(automatic));
+
+        var manual = Assignment("ses_1", "speaker_0", bob.Id, "Bob");
+        store.UpsertAssignment(manual);
+        var unknown = automatic with
+        {
+            Source = SpeakerAssignmentSource.Unknown,
+            SpeakerId = null,
+            SpeakerName = null,
+        };
+        Assert.False(store.TryUpsertAutomaticAssignment(unknown));
+        Assert.False(store.TryUpsertAutomaticAssignment(automatic));
+
+        var loaded = store.GetAssignment("ses_1", "speaker_0")!;
+        Assert.Equal(bob.Id, loaded.SpeakerId);
+        Assert.Equal(SpeakerAssignmentSource.Manual, loaded.Source);
+        Assert.True(loaded.Locked);
+    }
+
+    [Fact]
     public void Assignment_GetUnknownLabel_ReturnsNull()
     {
         using var ws = new TempWorkspace();

@@ -845,8 +845,9 @@ artifact is the materialized view produced by `meetcap speakers attribute`, comb
 assignments and voiceprint candidates through the matching policy
 (`docs/ARCHITECTURE.md` section 17.3).
 Provider labels are anonymous within an ASR job; identical label text from separate jobs or
-tracks does not establish a shared voice. Since this table and artifact are scoped to a
-session label, attribution leaves such collisions unknown automatically and warns. A manual
+tracks does not establish a shared voice. Missing job provenance cannot establish a shared
+voice either. Since this table and artifact are scoped to a session label, attribution leaves
+such cases unknown automatically and warns. A manual
 assignment explicitly covers every segment bearing that label in the session.
 
 ## 11. SQLite minimum tables

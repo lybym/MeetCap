@@ -147,6 +147,20 @@ public sealed class SqliteSpeakerStore : ISpeakerStore
     // --- Assignments ---
 
     public void UpsertAssignment(SpeakerAssignment assignment)
+        => UpsertAssignmentCore(assignment, protectManual: false);
+
+    public bool TryUpsertAutomaticAssignment(SpeakerAssignment assignment)
+    {
+        ArgumentNullException.ThrowIfNull(assignment);
+        if (assignment.Locked || assignment.Source == SpeakerAssignmentSource.Manual)
+        {
+            throw new ArgumentException("An automatic assignment cannot be manual or locked.", nameof(assignment));
+        }
+
+        return UpsertAssignmentCore(assignment, protectManual: true);
+    }
+
+    private bool UpsertAssignmentCore(SpeakerAssignment assignment, bool protectManual)
     {
         ArgumentNullException.ThrowIfNull(assignment);
         using var conn = OpenWithForeignKeys();
@@ -165,11 +179,13 @@ public sealed class SqliteSpeakerStore : ISpeakerStore
                 source = excluded.source,
                 locked = excluded.locked,
                 updated_at = excluded.updated_at
-            """,
+            """ + (protectManual
+                ? " WHERE speaker_assignments.locked = 0 AND speaker_assignments.source <> 'manual'"
+                : string.Empty),
             conn);
 
         BindAssignment(cmd, assignment);
-        cmd.ExecuteNonQuery();
+        return cmd.ExecuteNonQuery() > 0;
     }
 
     public IReadOnlyList<SpeakerAssignment> ListAssignments(string sessionId)

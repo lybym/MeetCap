@@ -1333,7 +1333,8 @@ in another job of the session. The current attribution artifact and assignment s
 have one entry per `(session_id, speaker_label)`. If that label occurs on multiple
 source tracks or in multiple provider jobs, automatic matching must leave the whole
 session entry unknown and emit a warning; one sample cannot establish that all those
-segments belong to one person. An explicit manual assignment remains locked and applies
+segments belong to one person. Missing job provenance also leaves the label unknown
+automatically. An explicit manual assignment remains locked and applies
 to every segment with that label in the session, so the operator must verify that scope.
 
 Priority:

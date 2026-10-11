@@ -40,6 +40,7 @@ public class SpeakerAttributionServiceTests : IDisposable
     {
         SegmentId = $"seg_{label}_{start}", SessionId = "ses_1", Source = "mic",
         StartMs = start, EndMs = start + 5000, RawText = text, SpeakerLabel = label,
+        ProviderJobId = "job_1",
     };
 
     private async Task EnrollSpeaker(string name, float[] embedding)
@@ -101,6 +102,51 @@ public class SpeakerAttributionServiceTests : IDisposable
         Assert.Equal(SpeakerAssignmentSource.Unknown, Assert.Single(result.Artifact.Entries).Source);
         Assert.Contains(result.Warnings, w => w.Contains("multiple provider jobs", StringComparison.Ordinal));
         Assert.Null(_database.Speakers.GetAssignment("ses_1", "speaker_0"));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData(" ")]
+    public async Task MissingJobProvenance_RemainsUnknownWithoutEmbedding(string? missingJobId)
+    {
+        await EnrollSpeaker("Alice", [1, 0, 0, 0]);
+        var service = new SpeakerAttributionService(_database.Speakers, ProviderByLabel(), _policy, 5, 15);
+        var segments = new[]
+        {
+            Seg("speaker_0", "first", 0) with { ProviderJobId = missingJobId },
+            Seg("speaker_0", "second", 5000) with { ProviderJobId = missingJobId },
+        };
+
+        var result = await service.BuildAsync("ses_1", segments,
+            (_, _, _, _) => throw new Exception("missing job provenance must not reach extraction"));
+
+        Assert.All(result.AttributedSegments, s => Assert.Null(s.SpeakerId));
+        Assert.Contains(result.Warnings, w => w.Contains("missing provider job provenance", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task ManualAssignmentArrivingDuringIdentification_WinsAndStaysLocked()
+    {
+        await EnrollSpeaker("Alice", [1, 0, 0, 0]);
+        await EnrollSpeaker("Bob", [0, 1, 0, 0]);
+        var bob = _database.Speakers.ListSpeakers().Single(s => s.DisplayName == "Bob");
+        var registry = new SpeakerRegistry(_database.Speakers, ProviderByLabel());
+        var provider = new FakeSpeakerIdentityProvider(_ =>
+        {
+            registry.AssignManually("ses_1", "speaker_0", bob);
+            return [1, 0, 0, 0];
+        });
+        var service = new SpeakerAttributionService(_database.Speakers, provider, _policy, 5, 15);
+
+        var result = await service.BuildAsync("ses_1", [Seg("speaker_0", "first")], ExtractorReturningSamples);
+
+        Assert.Equal("Bob", Assert.Single(result.Artifact.Entries).SpeakerName);
+        Assert.True(Assert.Single(result.AttributedSegments).ManualSpeakerLock);
+        var assignment = _database.Speakers.GetAssignment("ses_1", "speaker_0")!;
+        Assert.Equal(SpeakerAssignmentSource.Manual, assignment.Source);
+        Assert.True(assignment.Locked);
+        Assert.Equal(bob.Id, assignment.SpeakerId);
     }
 
     [Fact]

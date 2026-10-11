@@ -448,7 +448,8 @@ default; see `SPEAKER_CALIBRATION.md` for selection, sample limits and evidence.
 `speakers attribute` reads imported audio through the durable `session.json` source mapping,
 preferring the normalized artifact. Live samples are read from the transcript's source track.
 Only the requested WAV frames are loaded. A label occurring on multiple tracks or in separate
-provider jobs remains unknown automatically, with a warning, because the current session-label
+provider jobs, or one lacking job provenance, remains unknown automatically, with a warning,
+because the current session-label
 assignment schema cannot represent distinct people sharing that label. Manual assignment still
 applies to every segment with that label in the session and remains locked.
 Embedding model name, version and dimension must match; equal dimensions alone do not imply

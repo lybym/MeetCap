@@ -95,12 +95,14 @@ public sealed class SpeakerAttributionService
                 .Distinct(StringComparer.Ordinal).Take(2).Count() > 1;
             var multipleJobs = labelSegments.Select(s => s.ProviderJobId)
                 .Distinct(StringComparer.Ordinal).Take(2).Count() > 1;
-            var ambiguous = multipleTracks || multipleJobs;
+            var missingJobProvenance = labelSegments.Any(s => string.IsNullOrWhiteSpace(s.ProviderJobId));
+            var ambiguous = multipleTracks || multipleJobs || missingJobProvenance;
             if (ambiguous)
             {
-                var scope = multipleTracks && multipleJobs ? "multiple tracks and provider jobs"
+                var scope = missingJobProvenance ? "missing provider job provenance"
+                    : multipleTracks && multipleJobs ? "multiple tracks and provider jobs"
                     : multipleTracks ? "multiple tracks" : "multiple provider jobs";
-                warnings.Add($"anonymous label {label} occurs in {scope}; automatic identity matching is skipped. " +
+                warnings.Add($"anonymous label {label} has {scope}; automatic identity matching is skipped. " +
                     "A manual assignment applies to every segment with this label in the session.");
             }
 
@@ -124,7 +126,21 @@ public sealed class SpeakerAttributionService
                 // Manual assignments are written only by the assign command.
                 if (resolution.Source != SpeakerAssignmentSource.Unknown || (ambiguous && manual is not null))
                 {
-                    PersistAutomaticAssignment(sessionId, resolution);
+                    var currentManual = PersistAutomaticAssignment(sessionId, resolution, warnings);
+                    if (currentManual is not null)
+                    {
+                        resolution = SpeakerMatchingPolicy.Resolve(label, currentManual, [], _policy);
+                    }
+                }
+                else
+                {
+                    // A manual assignment may have arrived while the provider was running,
+                    // even when no automatic result was eligible for persistence.
+                    var current = _store.GetAssignment(sessionId, label);
+                    if (current is { Locked: true } or { Source: SpeakerAssignmentSource.Manual })
+                    {
+                        resolution = SpeakerMatchingPolicy.Resolve(label, current, [], _policy);
+                    }
                 }
             }
 
@@ -237,12 +253,13 @@ public sealed class SpeakerAttributionService
         return [];
     }
 
-    private void PersistAutomaticAssignment(string sessionId, SpeakerResolution resolution)
+    private SpeakerAssignment? PersistAutomaticAssignment(
+        string sessionId, SpeakerResolution resolution, List<string> warnings)
     {
         try
         {
             var now = DateTimeOffset.UtcNow;
-            _store.UpsertAssignment(new SpeakerAssignment
+            var written = _store.TryUpsertAutomaticAssignment(new SpeakerAssignment
             {
                 Id = Ids.NewSpeakerAssignmentId(),
                 SessionId = sessionId,
@@ -255,11 +272,14 @@ public sealed class SpeakerAttributionService
                 CreatedAt = now,
                 UpdatedAt = now,
             });
+            return written ? null : _store.GetAssignment(sessionId, resolution.SpeakerLabel);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             // Persisting the assignment is best-effort; the attribution artifact is
             // still returned. A store failure does not compromise the transcript.
+            warnings.Add($"speaker assignment could not be persisted for {resolution.SpeakerLabel}: {ex.Message}");
+            return null;
         }
     }
 }
