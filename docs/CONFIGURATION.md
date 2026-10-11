@@ -440,6 +440,10 @@ The 2026-10-09 held-out base-model check ranked 18/18 known-person samples corre
 accepted 0/18 at the default 0.82 threshold; 10/10 unenrolled-person samples were rejected.
 These small, previously observed samples do not justify lowering the product default.
 Use separate calibration and test recordings before selecting a different threshold/margin.
+The 2026-10-11 exploratory, globally meeting-disjoint calibration selected 0.46 / 0.01
+using calibration only, then accepted 10/12 known test clips and falsely accepted 0/24
+unknown test clips. It is an evaluation profile for the tested base model, not a product
+default; see `SPEAKER_CALIBRATION.md` for selection, sample limits and evidence.
 
 `speakers attribute` reads imported audio through the durable `session.json` source mapping,
 preferring the normalized artifact. Live samples are read from the transcript's source track.

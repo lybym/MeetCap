@@ -54,8 +54,13 @@ Evidence is outside the repository at `C:\CODE\artifacts\meetcap-fixes-20261011`
   No recovery command ran. Authorization has been requested; local work continued.
 - Real provider validation of normalized live batches and continuously persisted dual-track
   transcripts remains required. Large-file TOS round-trip was not rerun.
-- The previous cross-meeting holdout had 0/18 accepted known samples at 0.82; independent
-  calibration/testing remains open. Default thresholds were not changed to fit those samples.
+- A new, globally meeting-disjoint 97-clip experiment completed initial calibration and a
+  frozen independent test; see `SPEAKER_CALIBRATION.md`. Candidate 0.46 / 0.01 accepted 10/12
+  known test clips with 0/24 unknown false accepts; default 0.82 / 0.08 accepted 0/12.
+  Real CLI attribution with a gallery-only registry reproduced these counts on all 36
+  manually constructed transcript fixtures, preserving raw/WAV hashes; no ASR was performed.
+  Only two known people appear in this test, labels were not independently relistened, and
+  broader product calibration remains open. Product defaults were not changed.
 - Sony Bluetooth backwards-clock behavior was not reproduced on this hardware. #40 remains
   open for endpoint metadata/reconnect verification; aggregation addresses log flooding only.
 - #1/#9 must remain open until their actual end-to-end gates pass. No stable release was made.
