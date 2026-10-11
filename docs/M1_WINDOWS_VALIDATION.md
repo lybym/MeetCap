@@ -1442,4 +1442,17 @@ outages before the first captured packet defines an origin. The latter prevents 
 on the second buffer after a failed initial start. Those changes are covered by the final
 873-test suite at the reviewed head, without claiming another hardware recording. The fractional
 buffer correction above changes the timing arithmetic after that snapshot and has synthetic
-regression coverage; no physical recording of the corrected arithmetic is claimed here.
+regression coverage; no new physical Sony reconnect of the corrected arithmetic is claimed here.
+
+A focused local smoke of the corrected fractional arithmetic used the current default Realtek
+microphone and speakers, with ASR disabled and no HTTP requests. Session
+`ses_20261011T121233Z_2c2ff46d` completed on an explicit stop. Microphone audio and its end both
+measure 17,890 ms across four durable chunks, with 278,384 non-zero samples and no gaps.
+Loopback records 17,970 ms across four durable chunks with 1,707,010 non-zero samples. Its one
+observed live gap is **1 ms, 8,221–8,222 ms**, and its end is 17,972 ms: recorded audio plus the
+reported gap differs from that end by 1 ms at integer reporting resolution. Four aggregate
+events retain the QPC-behind diagnostics; intermediate chunk starts differ from their packet
+QPC anchors by less than 2 ms, with no multi-second accumulated compression. Both tracks report
+zero drops/stalls and no device loss/restoration. The CLI returned its degraded-capture code
+because the observed gap remains reported. This is a timing/content smoke with an explicit
+gap, not a zero-gap health pass or a new reconnect/soak/format-change test.
