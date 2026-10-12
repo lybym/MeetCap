@@ -52,7 +52,8 @@ jobs:
         run: dotnet build MeetCap.slnx -c Release --no-restore -warnaserror
 
       - name: Test (Release, full suite)
-        run: dotnet test MeetCap.slnx -c Release --no-build --logger "console;verbosity=normal"
+        # Match CI/stable: serialize test projects without relaxing test deadlines.
+        run: dotnet test MeetCap.slnx -c Release --no-build -m:1 --logger "console;verbosity=normal"
 
       - name: Publish CLI (Release, framework-dependent)
         run: dotnet publish src/MeetCap.Cli/MeetCap.Cli.csproj -c Release -o publish/meetcap
