@@ -64,6 +64,14 @@ A feature is incomplete without:
 
 Audio-capture work requires real Windows validation, not only mocks.
 
+CI, stable-release and release-candidate run the complete Release suite with
+`dotnet test MeetCap.slnx -c Release --no-build -m:1`. One MSBuild worker executes
+the VSTest projects sequentially; each project's existing xUnit behavior stays
+in place. This avoids nine recording/filesystem/SQLite test hosts competing on a
+shared Windows runner. Build warnings-as-errors, individual test deadlines and
+workflow time limits remain enforced. Use the same command when reproducing a
+release gate locally; project serialization does not certify real hardware or ASR.
+
 ## 7. No fake success
 
 If audio hardware, Windows APIs, or real ASR credentials are unavailable in CI:

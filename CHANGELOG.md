@@ -40,6 +40,8 @@ outage evidence uses published 0.3.0, not a new soak of the final 0.3.1 binary.
   imported speaker extraction and compatible registry-vector filtering.
 - CLI recording tests isolate their synchronous orchestration to prevent ThreadPool
   starvation on small parallel runners without increasing startup deadlines.
+- CI, stable and RC test gates run projects sequentially to reduce shared-runner
+  contention, preserving the full suite and existing recording deadlines.
 - Stable workflow defaults to 0.3.1 and renders the real source SHA in release notes.
 
 No new cloud uploads, complete 82-job queue drain, general speaker-accuracy certification,
