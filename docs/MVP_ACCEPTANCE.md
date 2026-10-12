@@ -93,6 +93,10 @@ production batch builder/WAV/manifest writer with an in-memory audit job receive
   excluded with the explicit ambiguity diagnostic. Only the remaining
   5,668–19,550 ms span was queued. The exclusion counter was one; its reported
   affected timeline span was 5,668 ms, not a claim that the WAV held that much audio.
+  That legacy tail has 13,879.625 ms actual audio versus 13,882 ms span, so the
+  conservative worker guard would also refuse its 2.375 ms accumulated old timing
+  mismatch before billing. Queuing during this replay does not imply successful
+  normalization. In contrast, every WAV from the fresh capture smoke had zero error.
 
 This replay verifies real source timing and durable materialization; it is not a
 SQLite queue recovery or cloud transcription run. The independent SQLite regression
