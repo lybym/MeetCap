@@ -131,6 +131,8 @@ public class AsrJobProcessorTests : IDisposable
         var result = await processor.ProcessAsync(job);
         Assert.Equal(AsrJobOutcome.Failed, result.Outcome);
         Assert.Equal("asr.timeline_ambiguous", result.Job.ErrorCode);
+        Assert.Contains(job.InputArtifact, result.Message!, StringComparison.Ordinal);
+        Assert.Contains("intra-chunk timing ambiguity", result.Message!, StringComparison.Ordinal);
         Assert.Empty(_provider.Submissions);
         Assert.Empty(_provider.PolledRequestIds);
         Assert.True(File.Exists(path));
