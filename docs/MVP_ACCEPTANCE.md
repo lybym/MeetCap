@@ -54,3 +54,46 @@ resubmission, and their raw response is saved before normalization is refused.
 Original chunks, batches and prior successful transcripts stay intact. Recover speech
 by inspecting the gap events and importing explicitly selected contiguous spans;
 an import has a new timeline and does not restore old session placement automatically.
+
+## Focused verification on 2026-10-12
+
+The Release warnings-as-errors build passed with zero warnings/errors and the full
+automated suite passed 895 tests. Tests include actual SQLite restoration of the two
+contiguous-span jobs (pending and retry-wait), retained provider request ID/retry time,
+and idempotent orphan recovery. A dry render of the stable workflow's real release-note
+block includes the source SHA rather than a literal PowerShell environment variable.
+
+An isolated approximately 20-second real Windows online capture with continuous
+playback and ASR/speakers disabled used the local snapshot of capture code commit
+`71548a2795908366ab93169995de9a9a8b716231`. It completed with 19,360 ms microphone audio
+in four chunks and 19,470 ms loopback audio in six chunks. Initial offsets were mic
+189 ms and loopback 91 ms. The physical QPC difference was -97.9819 ms, the timeline
+difference -98 ms (0.0181 ms error). Both tracks contained nonzero samples, with no
+dropped packets, overflow, stalled consumers, unfinished parts or unusable-timeline
+events. Every WAV's timeline span matched its frame duration exactly.
+
+The session stayed truthfully degraded and the CLI returned 1: loopback observed two
+ordinary 2 ms gaps (4 ms total), microphone none. Those gaps sat between WAVs rather
+than being compressed inside a file. There were zero ASR jobs and zero API requests.
+This is a focused capture/timing smoke, not a new long-run soak or cloud speech test.
+The smoke binary was built before its source commit and reports informational version
+`0.3.1+3641f0a`; the capture code is unchanged in the subsequent exact-frame/SQLite-test
+commit `db4969b88025011be1c84216e2ccf40994cb220a`. The published stable binary must be
+rebuilt and have its own release provenance verified.
+
+The final local runtime also replayed previously saved real native chunks through the
+production batch builder/WAV/manifest writer with an in-memory audit job receiver and
+**zero HTTP**. Original WAV hashes were unchanged in every case:
+
+- The 45 s window created a job on the third 15 s chunk ending at 44,999 ms, followed
+  by the 25.420 s tail, rather than waiting for a fourth chunk.
+- The Bluetooth 9,174 ms hole produced separate jobs at 0–13,519 ms and
+  22,693–43,042 ms; no chunk was excluded in this case.
+- A legacy first chunk spanning 0–5,668 ms with 668 ms of internal missing time was
+  excluded with the explicit ambiguity diagnostic. Only the remaining
+  5,668–19,550 ms span was queued. The exclusion counter was one; its reported
+  affected timeline span was 5,668 ms, not a claim that the WAV held that much audio.
+
+This replay verifies real source timing and durable materialization; it is not a
+SQLite queue recovery or cloud transcription run. The independent SQLite regression
+above covers pending/retry persistence and idempotency.
