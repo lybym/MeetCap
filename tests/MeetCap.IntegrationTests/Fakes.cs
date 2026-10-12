@@ -84,6 +84,8 @@ internal sealed class FakeAsrProvider : IAsrProvider
 
     public int PollCount { get; private set; }
 
+    public List<string> PolledRequestIds { get; } = new();
+
     public Func<AsrFileRequest, AsrSubmission>? OnSubmit { get; set; }
 
     public void EnqueuePoll(params AsrPollResult[] results)
@@ -142,6 +144,7 @@ internal sealed class FakeAsrProvider : IAsrProvider
         CancellationToken cancellationToken = default)
     {
         PollCount++;
+        PolledRequestIds.Add(submission.ProviderRequestId);
         return Task.FromResult(_polls.Count > 0 ? _polls.Dequeue() : AsrPollResult.Pending());
     }
 }

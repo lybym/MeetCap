@@ -168,7 +168,9 @@ failed file-ASR job.
 Transient failure:
 
 ```text
-pending -> submit -> transient failure -> retry_wait -> submit
+pending -> submit -> transient failure -> retry_wait -> query same request
+submitted -> poll -> transient failure -> retry_wait -> query same request
+query -> confirmed task-not-found -> retry_wait -> guarded submit
 ```
 
 Permanent auth/configuration errors become `failed`.

@@ -29,6 +29,10 @@ outage evidence uses published 0.3.0, not a new soak of the final 0.3.1 binary.
 - Legacy intra-WAV holes are diagnosed instead of compressing transcript timestamps.
   Ambiguous pending jobs fail before billing; accepted jobs preserve their raw response.
   SQLite schema, job IDs, retries, original audio and prior successful transcripts remain intact.
+- Accepted or potentially accepted tasks continue polling after transient errors and
+  restart, preserving the raw completion response before refusing ambiguous normalization.
+  Only confirmed task-not-found permits another guarded submission; polling retries
+  consume the existing durable retry budget.
 - Includes previously merged #40 QPC loopback placement/recovery diagnostics and #9
   conservative provider-job/source speaker-label scoping, plus #41 native ASR normalization,
   imported speaker extraction and compatible registry-vector filtering.

@@ -34,6 +34,7 @@ public class AsrJobTransitionsTests
     [InlineData(AsrJobStatus.Polling, AsrJobStatus.Polling, true)]
     [InlineData(AsrJobStatus.Polling, AsrJobStatus.Succeeded, true)]
     [InlineData(AsrJobStatus.RetryWait, AsrJobStatus.Submitting, true)]
+    [InlineData(AsrJobStatus.RetryWait, AsrJobStatus.Polling, true)]
     [InlineData(AsrJobStatus.Pending, AsrJobStatus.Failed, true)]
     [InlineData(AsrJobStatus.Polling, AsrJobStatus.Cancelled, true)]
     [InlineData(AsrJobStatus.Pending, AsrJobStatus.Submitted, false)]
@@ -44,6 +45,19 @@ public class AsrJobTransitionsTests
     [InlineData(AsrJobStatus.RetryWait, AsrJobStatus.RetryWait, false)]
     public void CanTransition_MatchesTheDocumentedStateMachine(AsrJobStatus from, AsrJobStatus to, bool expected) =>
         Assert.Equal(expected, AsrJobTransitions.CanTransition(from, to));
+
+    [Fact]
+    public void BeginPolling_ConsumesDueRetryBudgetWithoutChangingRequestIdentity()
+    {
+        var retry = Job(AsrJobStatus.RetryWait, attempts: 1) with
+            { NextRetryAt = s_now, SubmittedAt = s_now.AddSeconds(-10) };
+        var resumed = AsrJobTransitions.BeginPolling(retry, s_now);
+        Assert.Equal(2, resumed.AttemptCount);
+        Assert.Equal(retry.ProviderRequestId, resumed.ProviderRequestId);
+        Assert.Equal(retry.SubmittedAt, resumed.SubmittedAt);
+        Assert.Null(resumed.NextRetryAt);
+        Assert.Equal(2, AsrJobTransitions.BeginPolling(resumed, s_now).AttemptCount);
+    }
 
     [Fact]
     public void BeginSubmit_CountsTheAttemptBeforeTheRequestIsSent()

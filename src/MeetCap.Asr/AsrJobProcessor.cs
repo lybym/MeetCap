@@ -308,6 +308,16 @@ public sealed class AsrJobProcessor
         var request = BuildRequest(job, paths);
         var submission = RehydrateSubmission(job);
 
+        // A retry can follow a poll failure or a submit whose response was lost.
+        // The original request may already be billed. Only an explicit task-not-found
+        // answer permits another submission (which must pass the timeline guard).
+        if (job.Status == AsrJobStatus.RetryWait && (job.AttemptCount > 0 || job.SubmittedAt is not null) &&
+            !string.Equals(job.ErrorCode, TaskNotFoundErrorCode, StringComparison.Ordinal))
+        {
+            job = AsrJobTransitions.BeginPolling(job, Now());
+            _jobs.Update(job);
+        }
+
         if (job.Status is AsrJobStatus.Pending or AsrJobStatus.RetryWait)
         {
             if (BatchTimelineGuard.Check(job, request.InputArtifactPath) is { } ambiguity)
