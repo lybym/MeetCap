@@ -82,7 +82,8 @@ public readonly record struct TerminalGap(long GapStartMs, long GapEndMs, long G
 /// shifting later timestamps.
 /// </para>
 /// <para>
-/// The first observed buffer defines the session origin. Everything after it is
+/// Online tracks share a pre-capture system QPC origin; single-track callers can
+/// retain the first observed buffer as origin. Everything after it is
 /// placed by the track's declared <see cref="CaptureClock"/>: the device position in
     /// frames for microphone capture (<see cref="CaptureClock.DevicePosition"/>), or the
     /// system QPC timestamp for loopback (<see cref="CaptureClock.Qpc"/>). Frame positions
@@ -120,6 +121,8 @@ public sealed class CaptureTimeline
 
     private readonly AudioFormat _format;
     private readonly CaptureClock _clock;
+    private readonly long? _sessionQpcOriginTicks;
+    private long _initialOffsetMs;
     private bool _hasOrigin;
     private long _originFrames;
     private long _nextExpectedFrames;
@@ -131,10 +134,12 @@ public sealed class CaptureTimeline
     private long _pendingGapMs;
     private bool _pendingSegmentRestart;
 
-    public CaptureTimeline(AudioFormat format, CaptureClock clock = CaptureClock.DevicePosition)
+    public CaptureTimeline(AudioFormat format, CaptureClock clock = CaptureClock.DevicePosition,
+        long? sessionQpcOriginTicks = null)
     {
         _format = format ?? throw new ArgumentNullException(nameof(format));
         _clock = clock;
+        _sessionQpcOriginTicks = sessionQpcOriginTicks;
     }
 
     /// <summary>True once at least one buffer has been placed.</summary>
@@ -290,7 +295,13 @@ public sealed class CaptureTimeline
         // A QPC track is validated before any state is claimed, so a stream that cannot be
         // placed at all leaves no origin behind: an origin would make every later call look
         // like a placed track (docs/RELIABILITY.md section 7).
-        var qpcTicks = _clock == CaptureClock.Qpc ? RequireQpcTicks(packet) : packet.QpcPositionTicks;
+        var qpcTicks = _clock == CaptureClock.Qpc || _sessionQpcOriginTicks is not null
+            ? RequireQpcTicks(packet) : packet.QpcPositionTicks;
+        var offsetTicks = _sessionQpcOriginTicks is { } origin ? qpcTicks!.Value - origin : 0;
+        if (offsetTicks < 0)
+            throw new CaptureFailedException("The first audio timestamp predates the shared session QPC origin; " +
+                "its timing cannot be aligned. Reconnect the endpoint or use valid WASAPI timestamps.");
+        _initialOffsetMs = offsetTicks / TicksPerMillisecond;
 
         // A device that failed before any audio was captured leaves no prior span to
         // lose. Its first successful packet defines the origin, so do not carry that
@@ -299,16 +310,17 @@ public sealed class CaptureTimeline
         _pendingSegmentRestart = false;
         _hasOrigin = true;
         _originFrames = packet.DevicePositionFrames;
-        _originQpcTicks = qpcTicks;
+        _originQpcTicks = _sessionQpcOriginTicks ?? qpcTicks;
         _nextExpectedFrames = packet.DevicePositionFrames + frames;
-        _lastEndMs = durationMs;
+        _lastEndMs = _initialOffsetMs + durationMs;
 
         if (_clock == CaptureClock.Qpc)
         {
-            _nextExpectedQpcUnits = FramesToQpcUnits(frames);
+            _nextExpectedQpcUnits = (Int128)offsetTicks * _format.SampleRate + FramesToQpcUnits(frames);
+            _lastEndMs = QpcUnitsToMilliseconds(_nextExpectedQpcUnits);
         }
 
-        return new PacketTiming(0, durationMs, 0, flagged, false);
+        return new PacketTiming(_initialOffsetMs, _lastEndMs, 0, flagged, false);
     }
 
     private PacketTiming ObserveRestartedStream(
@@ -333,7 +345,7 @@ public sealed class CaptureTimeline
         var endMs = targetMs + durationMs;
         _lastEndMs = endMs;
 
-        _originFrames = packet.DevicePositionFrames - _format.MillisecondsToFrames(targetMs);
+        _originFrames = packet.DevicePositionFrames - _format.MillisecondsToFrames(targetMs - _initialOffsetMs);
         _nextExpectedFrames = packet.DevicePositionFrames + frames;
 
         var gapStart = GapIntervalStart(gap, gapStartMs);
@@ -358,7 +370,7 @@ public sealed class CaptureTimeline
 
         if (skippedFrames >= 0)
         {
-            var startMs = _format.FramesToMilliseconds(packet.DevicePositionFrames - _originFrames);
+            var startMs = _initialOffsetMs + _format.FramesToMilliseconds(packet.DevicePositionFrames - _originFrames);
             return skippedFrames > 0
                 // The device skipped this span: audio is missing from where the last placed
                 // buffer ended up to where this one begins.

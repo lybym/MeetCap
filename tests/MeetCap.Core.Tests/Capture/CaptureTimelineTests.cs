@@ -16,6 +16,34 @@ public class CaptureTimelineTests
     private const int TenMs = 480;
 
     [Fact]
+    public void SharedQpcOriginPreservesInitialDualTrackOffsetAndFrameContinuation()
+    {
+        const long origin = 5_000_000_000;
+        var mic = new CaptureTimeline(Mono48k, CaptureClock.DevicePosition, origin);
+        var loop = new CaptureTimeline(Mono48k, CaptureClock.Qpc, origin);
+        var micFirst = mic.Observe(Packet(100, TenMs, origin + 6_641_249));
+        var loopFirst = loop.Observe(Packet(0, TenMs, origin));
+        Assert.Equal(664, micFirst.StartMs);
+        Assert.Equal(0, loopFirst.StartMs);
+        Assert.False(micFirst.HasGap);
+        // Callback time/QPC jitter cannot change the microphone's frame continuation.
+        Assert.Equal(674, mic.Observe(Packet(580, TenMs, origin + 99_999_999)).StartMs);
+        mic.RecordDeviceLoss(200);
+        Assert.Equal(884, mic.Observe(Packet(0, TenMs, origin + 8_840_000)).StartMs);
+        Assert.Equal(894, mic.Observe(Packet(TenMs, TenMs, origin + 8_940_000)).StartMs);
+        Assert.Equal(664, mic.QpcToSessionMs(origin + 6_641_249));
+    }
+
+    [Fact]
+    public void SharedOriginRejectsMissingOrEarlierInitialTimestampWithoutClaimingAudio()
+    {
+        var timeline = new CaptureTimeline(Mono48k, CaptureClock.DevicePosition, 1_000_000);
+        Assert.Throws<CaptureFailedException>(() => timeline.Observe(Packet(0, TenMs)));
+        Assert.Throws<CaptureFailedException>(() => timeline.Observe(Packet(0, TenMs, 999_999)));
+        Assert.False(timeline.HasOrigin);
+    }
+
+    [Fact]
     public void Observe_FirstPacket_DefinesTheSessionOrigin()
     {
         var timeline = new CaptureTimeline(Mono48k);

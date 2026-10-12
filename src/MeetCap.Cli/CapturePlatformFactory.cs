@@ -27,5 +27,7 @@ internal sealed class NAudioCapturePlatformFactory : ICapturePlatformFactory
         new NAudioDeviceEnumerator(),
         new NAudioCaptureSourceFactory(),
         new DriveInfoDiskSpaceProbe(),
-        SystemClock.Instance);
+        SystemClock.Instance,
+        () => (long)((Int128)System.Diagnostics.Stopwatch.GetTimestamp() * 10_000_000 /
+            System.Diagnostics.Stopwatch.Frequency));
 }

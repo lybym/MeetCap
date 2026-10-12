@@ -696,6 +696,11 @@ Do not introduce Python/PyTorch into the default Windows runtime merely to dupli
 
 The first MVP release requires M0 through M6.
 
+For 0.3.1 preparation, use the reconciled [MVP acceptance matrix](MVP_ACCEPTANCE.md).
+It records published 0.3.0 long-run hardware evidence and later focused speech/identity
+and timeline checks, with explicit limits. The 0.3.0 status paragraphs below are historical;
+they do not replace the current gate matrix or imply final 0.3.1 binary soaks.
+
 As of release 0.3.0, M0 through M6 are implemented and automatically covered. The
 real-hardware validation checklist in `docs/M1_WINDOWS_VALIDATION.md` (status: not yet run)
 gates end-to-end verification, not implementation; milestones are therefore described as

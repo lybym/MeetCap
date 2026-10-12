@@ -306,6 +306,19 @@ the prepared path. Polling does not read this derivative and a retry regenerates
 `at_ms` is the session-relative position on the capture timeline, never a wall-clock
 reading. Fields an event does not define are omitted rather than written as `null`.
 
+From 0.3.1, online tracks share a pre-capture system QPC origin. Their first chunks can
+start at different nonzero offsets. An ordinary reportable packet gap rotates the WAV,
+so each newly written capture chunk is a contiguous audio span. ASR windows count native
+frames rather than truncated timeline differences, and gaps split provider contexts.
+SQLite migrations and existing job IDs/retry states are unchanged. Existing chunks and
+batches are never rewritten during upgrade. Legacy intra-chunk timing mismatches cannot be
+unambiguously repaired from a WAV alone; the batch builder records the diagnostic, and
+pending legacy jobs fail before submission with `asr.timeline_ambiguous`. Already accepted
+jobs retain their provider response before refusing normalization. Recover speech by
+inspecting gap events and importing explicitly selected contiguous source spans; import
+creates a new timeline and does not restore the old session placement automatically.
+Already succeeded legacy transcripts are retained, not silently relabeled as corrected.
+
 `capture.gap` is written only for a gap the timeline measures as at least one whole
 millisecond, and it then carries all three of `gap_ms`, `gap_start_ms` and `gap_end_ms`.
 A forward step in the stream's own clock that rounds to zero milliseconds — a sub-millisecond

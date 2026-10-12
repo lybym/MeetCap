@@ -180,15 +180,21 @@ public sealed class AsrBatchBuilder
 
         if (!_pending.TryGetValue(chunk.Source, out var pending))
         {
-            pending = new PendingBatch(chunk.Format);
+            pending = new PendingBatch(chunk.Format, _options.BatchSeconds);
             _pending[chunk.Source] = pending;
         }
 
         pending.Chunks.Add(chunk);
 
-        return pending.DurationMs >= _options.BatchSeconds * 1000L
-            ? CompleteBatch(chunk.SessionId, chunk.Source, pending)
-            : null;
+        AsrBatch? completed = null;
+        while (pending.Chunks.Count > 0 &&
+            (pending.HasBoundary || pending.AudioFrames >= (long)_options.BatchSeconds * pending.Format.SampleRate))
+        {
+            var before = pending.Chunks.Count;
+            completed = CompleteBatch(chunk.SessionId, chunk.Source, pending) ?? completed;
+            if (pending.Chunks.Count >= before) break;
+        }
+        return completed;
     }
 
     /// <summary>
@@ -210,10 +216,12 @@ public sealed class AsrBatchBuilder
             // A window that cannot be built (an unreadable chunk, or a write failure) produces
             // no batch; the builder has already recorded why, and a stop is not the place to
             // turn a transcript gap into a failed recording.
-            var batch = CompleteBatch(pending.Chunks[0].SessionId, source, pending);
-            if (batch is not null)
+            while (pending.Chunks.Count > 0)
             {
-                flushed.Add(batch);
+                var before = pending.Chunks.Count;
+                var batch = CompleteBatch(pending.Chunks[0].SessionId, source, pending);
+                if (batch is not null) flushed.Add(batch);
+                if (pending.Chunks.Count >= before) break; // write failure keeps audio pending
             }
         }
 
@@ -430,6 +438,9 @@ public sealed class AsrBatchBuilder
 
         while (true)
         {
+            // Retry and unreadable-chunk removal can introduce a new hole. Recompute
+            // the contiguous prefix on every pass instead of concatenating across it.
+            var chunks = pending.ContiguousChunks;
             var number = NextBatchNumber(paths, source);
             var batchPath = BatchFilePath(paths, source, number);
             var relativePath = paths.ToRelative(batchPath);
@@ -438,7 +449,7 @@ public sealed class AsrBatchBuilder
             try
             {
                 // The audio artifact is durable before anything references it.
-                dataBytes = WavBatchConcatenator.Concatenate(batchPath, pending.Chunks, pending.Format);
+                dataBytes = WavBatchConcatenator.Concatenate(batchPath, chunks, pending.Format);
             }
             catch (AsrBatchMaterializationException ex)
             {
@@ -503,11 +514,11 @@ public sealed class AsrBatchBuilder
                 SessionId = sessionId,
                 Source = source,
                 Number = number,
-                Chunks = pending.Chunks.ToArray(),
+                Chunks = chunks,
                 FilePath = batchPath,
                 RelativePath = relativePath,
-                StartMs = pending.StartMs,
-                EndMs = pending.EndMs,
+                StartMs = chunks[0].StartMs,
+                EndMs = chunks[^1].EndMs,
                 DataBytes = dataBytes,
             };
 
@@ -539,7 +550,7 @@ public sealed class AsrBatchBuilder
             }
 
             ClearRetryNumber(source);
-            pending.Chunks.Clear();
+            pending.Chunks.RemoveRange(0, chunks.Count);
 
             return QueueJob(paths, batch);
         }
@@ -919,7 +930,12 @@ public sealed class AsrBatchBuilder
     /// <summary>Chunks buffered for one track while its batch window is still open.</summary>
     private sealed class PendingBatch
     {
-        public PendingBatch(AudioFormat format) => Format = format;
+        private readonly long _targetFrames;
+        public PendingBatch(AudioFormat format, int batchSeconds)
+        {
+            Format = format;
+            _targetFrames = (long)batchSeconds * format.SampleRate;
+        }
 
         public AudioFormat Format { get; }
 
@@ -930,6 +946,28 @@ public sealed class AsrBatchBuilder
         public long EndMs => Chunks.Count == 0 ? 0 : Chunks[^1].EndMs;
 
         public long DurationMs => EndMs - StartMs;
+
+        // Use each declaration for the threshold; mismatched formats are rejected by
+        // materialization, rather than stalling below the threshold indefinitely.
+        private decimal FramesInBatchFormat(ClosedAudioChunk chunk) =>
+            (decimal)chunk.DataBytes / chunk.Format.BlockAlign / chunk.Format.SampleRate * Format.SampleRate;
+
+        public decimal AudioFrames => Chunks.Sum(FramesInBatchFormat);
+
+        public IReadOnlyList<ClosedAudioChunk> ContiguousChunks
+        {
+            get
+            {
+                var count = 1;
+                var frames = FramesInBatchFormat(Chunks[0]);
+                while (count < Chunks.Count && frames < _targetFrames &&
+                    Chunks[count].StartMs == Chunks[count - 1].EndMs)
+                    frames += FramesInBatchFormat(Chunks[count++]);
+                return Chunks.Take(count).ToArray();
+            }
+        }
+
+        public bool HasBoundary => Chunks.Count > 0 && ContiguousChunks.Count < Chunks.Count;
 
         /// <summary>
         /// Drops the chunk with the given session-relative path from the open window.

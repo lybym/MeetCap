@@ -7,10 +7,10 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Stable version to publish (for example, 0.3.0)
+        description: Stable version to publish (for example, 0.3.1)
         required: true
         type: string
-        default: 0.3.0
+        default: 0.3.1
 
 permissions:
   contents: write
@@ -138,7 +138,7 @@ jobs:
           @"
           # MeetCap $env:VERSION
 
-          Stable release built from `main` commit `$env:SOURCE_SHA`.
+          Stable release built from main commit $env:SOURCE_SHA.
 
           The complete Release configuration build and test suite passed before this release was created.
 

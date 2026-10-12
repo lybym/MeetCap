@@ -340,6 +340,9 @@ public sealed class RecordingSession : IDisposable
     {
         var tracks = new List<CaptureTrack>(_trackSpecs.Count);
         var sources = new List<IAudioCaptureSource>(_trackSpecs.Count);
+        // Sample once before opening either endpoint: consumer/callback scheduling must
+        // never erase the real initial offset between microphone and loopback.
+        var sessionQpcOriginTicks = _trackSpecs.Count > 1 ? _platform.ReadQpcTicks?.Invoke() : null;
 
         try
         {
@@ -360,7 +363,8 @@ public sealed class RecordingSession : IDisposable
                     _afterPacketWritten,
                     AnnounceChunk,
                     RegisterStorageFailure,
-                    _beforeReopenAttempt);
+                    _beforeReopenAttempt,
+                    sessionQpcOriginTicks);
 
                 // Create the source and initialize the track's runtime from its native
                 // format before capture starts. A source that cannot be created aborts the

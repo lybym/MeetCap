@@ -1,6 +1,7 @@
 namespace MeetCap.Asr;
 
 using System.Text;
+using MeetCap.Asr.Batching;
 using MeetCap.Core.Asr;
 using MeetCap.Core.Sessions;
 using MeetCap.Core.Transcripts;
@@ -309,6 +310,8 @@ public sealed class AsrJobProcessor
 
         if (job.Status is AsrJobStatus.Pending or AsrJobStatus.RetryWait)
         {
+            if (BatchTimelineGuard.Check(job, request.InputArtifactPath) is { } ambiguity)
+                return await Fail(job, BatchTimelineGuard.ErrorCode, ambiguity, cancellationToken).ConfigureAwait(false);
             var submitResult = await SubmitAsync(job, paths, request, cancellationToken).ConfigureAwait(false);
             if (submitResult is not null)
             {
@@ -495,6 +498,8 @@ public sealed class AsrJobProcessor
         _jobs.Update(job);
 
         AsrNormalizationResult normalized;
+        if (BatchTimelineGuard.Check(job, paths.ResolveRelative(job.InputArtifact)) is { } ambiguity)
+            return await Fail(job, BatchTimelineGuard.ErrorCode, ambiguity, cancellationToken).ConfigureAwait(false);
         try
         {
             normalized = _normalizer.Normalize(

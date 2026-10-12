@@ -12,6 +12,7 @@ namespace MeetCap.Cli.Tests;
 /// Integration coverage for the M1 commands: <c>devices</c>, <c>start</c> and
 /// <c>stop</c>, driven through the real command tree.
 /// </summary>
+[Collection("Recording commands")]
 public class CaptureCommandTests
 {
     [Fact]

@@ -185,7 +185,15 @@ M0 through M6 are implemented and automatically covered. Code is added milestone
 milestone according to `docs/ROADMAP.md`; agents should not implement later milestones
 opportunistically.
 
-This is release **0.3.0**, which fixes three capture defects on top of 0.2.0: Windows process
+The current source prepares **0.3.1**, with frame-based file-ASR windows, contiguous capture
+and ASR spans across gaps, and a shared QPC origin for online tracks. Legacy ambiguous
+batches are diagnosed before billing or timestamp normalization; original audio and raw
+provider responses remain recoverable. The [MVP gate matrix](docs/MVP_ACCEPTANCE.md) records
+the real Windows evidence, its versions and limits. Long capture/outage runs used the
+published 0.3.0 binary; focused later checks cover speech, local identity and timing fixes.
+This does not claim new two-hour soaks on the final 0.3.1 release binary.
+
+Release **0.3.0** fixed three capture defects on top of 0.2.0: Windows process
 loopback is now placed by the QPC clock its stream actually reports instead of a device position it
 never provides, a capture track now recovers an endpoint that disappears and returns within a
 configurable window instead of a hard-coded three one-second retries, with an unrecovered outage
@@ -194,8 +202,6 @@ audio at all is no longer reported as a healthy, completed session — it is mar
 stated reason and the per-track content counters that exposed the defect. The published rc.2
 artifact passed the recorded process-loopback content/isolation and Bluetooth reconnect checks
 on 2026-09-29 (Windows 11 build 26200, one machine; software PnP disconnect/reconnect).
-No milestone becomes newly complete. The remaining hardware-dependent acceptance tests are
-still open and are tracked as a manual
-checklist in `docs/M1_WINDOWS_VALIDATION.md`; nothing here claims any milestone is verified end to
-end on real audio hardware yet. See `CHANGELOG.md` for the release notes and `docs/ROADMAP.md` for
-milestone status.
+The earlier detailed hardware checklist remains in `docs/M1_WINDOWS_VALIDATION.md` as
+historical and broader validation context. Current explicit MVP gates are reconciled in
+`docs/MVP_ACCEPTANCE.md`. See `CHANGELOG.md` for release changes and `docs/ROADMAP.md` for scope.

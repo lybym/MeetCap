@@ -114,6 +114,42 @@ public class AsrJobProcessorTests : IDisposable
         AsrPollResult.Completed(new AsrCompletion(body, "20000000"));
 
     [Fact]
+    public async Task LegacyGapBatchFailsBeforeBillingAndPollingStillRetainsRawResponse()
+    {
+        var imported = CreateJob();
+        var job = imported with { Source = "mic", InputArtifact = "asr/batches/mic/batch-000001.wav",
+            EndMs = 1_663, DurationMs = 1_663 };
+        _jobs.Update(job);
+        var path = Paths.ResolveRelative(job.InputArtifact);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        var format = new MeetCap.Core.Capture.AudioFormat(16_000, 1, 16, MeetCap.Core.Capture.AudioSampleFormat.Pcm);
+        File.WriteAllBytes(path, MeetCap.AudioPipeline.Wave.WavHeader.Build(format, 32_000)
+            .Concat(new byte[32_000]).ToArray());
+        File.WriteAllText(Path.ChangeExtension(path, ".json"),
+            "{\"chunks\":[{\"start_ms\":0,\"end_ms\":1663,\"data_bytes\":32000}]}");
+        var processor = CreateProcessor();
+        var result = await processor.ProcessAsync(job);
+        Assert.Equal(AsrJobOutcome.Failed, result.Outcome);
+        Assert.Equal("asr.timeline_ambiguous", result.Job.ErrorCode);
+        Assert.Empty(_provider.Submissions);
+        Assert.Empty(_provider.PolledRequestIds);
+        Assert.True(File.Exists(path));
+        Assert.Equal(AsrJobOutcome.NoWork, (await processor.ProcessAsync(result.Job)).Outcome);
+
+        // An already accepted legacy provider task is polled once, never submitted
+        // again, and the original response survives the timing refusal.
+        job = job with { Status = AsrJobStatus.Submitted, AttemptCount = 1 };
+        _jobs.Update(job);
+        _provider.EnqueuePoll(Completed());
+        var polled = await processor.ProcessAsync(job);
+        Assert.Equal("asr.timeline_ambiguous", polled.Job.ErrorCode);
+        Assert.Empty(_provider.Submissions);
+        Assert.Single(_provider.PolledRequestIds);
+        Assert.True(File.Exists(Paths.JobResponseJson(job.Id)));
+        Assert.False(File.Exists(Paths.JobNormalizedJsonl(job.Id)));
+    }
+
+    [Fact]
     public async Task SuccessPath_RetainsRawResponseAndWritesEveryTranscriptArtifact()
     {
         var job = CreateJob();

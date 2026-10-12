@@ -14,12 +14,14 @@ public sealed class CapturePlatform
         IAudioDeviceEnumerator devices,
         IAudioCaptureSourceFactory captureSources,
         IDiskSpaceProbe diskSpace,
-        IClock clock)
+        IClock clock,
+        Func<long>? readQpcTicks = null)
     {
         Devices = devices ?? throw new ArgumentNullException(nameof(devices));
         CaptureSources = captureSources ?? throw new ArgumentNullException(nameof(captureSources));
         DiskSpace = diskSpace ?? throw new ArgumentNullException(nameof(diskSpace));
         Clock = clock ?? throw new ArgumentNullException(nameof(clock));
+        ReadQpcTicks = readQpcTicks;
     }
 
     public IAudioDeviceEnumerator Devices { get; }
@@ -29,4 +31,7 @@ public sealed class CapturePlatform
     public IDiskSpaceProbe DiskSpace { get; }
 
     public IClock Clock { get; }
+
+    /// <summary>System QPC in WASAPI's 100-ns units, for a shared online session origin.</summary>
+    public Func<long>? ReadQpcTicks { get; }
 }
