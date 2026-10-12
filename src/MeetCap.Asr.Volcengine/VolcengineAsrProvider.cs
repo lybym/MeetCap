@@ -132,7 +132,20 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
                 "cannot be submitted. Re-import the recording.");
         }
 
-        var published = await _audioPublisher.PublishAsync(request, cancellationToken).ConfigureAwait(false);
+        AsrPublishedAudio published;
+        try
+        {
+            published = await _audioPublisher.PublishAsync(request, cancellationToken).ConfigureAwait(false);
+        }
+        catch (AsrTransientException ex)
+        {
+            // Staging failed before SendAsync: a remote transport copy is not an ASR task.
+            throw new AsrTransientException(ex.Code, Scrub(ex.Message), ex, requestNotSent: true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw new AsrTransientException("audio.unreadable", Scrub(ex.Message), ex, requestNotSent: true);
+        }
         var body = BuildRequestBody(request, published);
         var sanitized = BuildSanitizedRequestJson(request, published);
 
@@ -203,6 +216,9 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
             return AsrPollResult.Completed(new AsrCompletion(response.Body, status, response.LogId));
         }
 
+        // The verified Standard HTTP error table has no explicit task-absence signal.
+        // Invalid parameters/duplicate requests, internal errors, missing headers and
+        // generic HTTP errors must never be invented into TaskNotFound and rebilled.
         var error = Failure(status, response, published: null);
         return error is AsrTransientException transient
             ? AsrPollResult.Failed(new AsrProviderError(transient.Code, transient.Message, IsTransient: true))
@@ -278,10 +294,24 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
         AsrPublishedAudio? published,
         CancellationToken cancellationToken)
     {
+        var onlyNameResolutionFailures = true;
         try
         {
             return await _pipeline.ExecuteAsync(
-                async token => await SendOnceAsync(path, body, requestId, sequence, published, token).ConfigureAwait(false),
+                async token =>
+                {
+                    try
+                    {
+                        return await SendOnceAsync(path, body, requestId, sequence, published, token).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        // A later DNS failure cannot erase an earlier uncertain attempt.
+                        if (ex is not HttpRequestException { HttpRequestError: HttpRequestError.NameResolutionError })
+                            onlyNameResolutionFailures = false;
+                        throw;
+                    }
+                },
                 cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex) when (
@@ -300,7 +330,9 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
                     $"{_options.MaxTransientAttempts} attempt(s): {ex.Message} " +
                     "The job keeps its durable state and is retried when the provider is reachable.",
                     published),
-                ex);
+                ex,
+                requestNotSent: path == _options.SubmitEndpoint && onlyNameResolutionFailures &&
+                    ex is HttpRequestException { HttpRequestError: HttpRequestError.NameResolutionError });
         }
     }
 

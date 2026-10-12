@@ -1126,13 +1126,18 @@ submitting  -> submitted   # the provider request id was persisted before the re
                            # re-submitting (re-submitting would risk paying twice)
 polling     -> polling     # continue querying the same provider task
 retry_wait  -> polling     # attempted/accepted request: query the same task after durable backoff
-retry_wait  -> submitting  # only a fresh request or an explicitly confirmed task-not-found
+retry_wait  -> submitting  # fresh/proven-not-sent request or an explicitly confirmed task-not-found
 ```
 
 If the provider reports the task as unknown, the job falls back to `retry_wait` and may be
 submitted again only after the timeline guard passes. A transient polling failure or lost
 submit response does not authorize another upload: recovery queries the original request ID,
 saves a completed raw response, then checks legacy timeline ambiguity before normalization.
+Known local preparation/staging failures and DNS-only submit failures preserve positive no-submit
+evidence as `submit.not_sent.<error_code>` in the existing error column. These retries rerun
+preparation and the guarded submit after backoff. Generic errors and mixed transport failures
+remain uncertain; the current Volcengine contract has no verified explicit task-absence signal,
+so this adapter never invents `TaskNotFound` from such responses (see ASR_STRATEGY section 6).
 Each due polling retry consumes one attempt; ordinary successful polls do not. This retains
 the bounded persistent retry policy without using a submission to count a polling retry.
 `meetcap asr resume` is the restart entry point and processes every job whose

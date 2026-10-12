@@ -50,7 +50,10 @@ Before submission, the ASR worker uses the existing FFmpeg boundary to write a 1
 copy under `asr/jobs/<job_id>/normalized.wav` (about 9.6 MB). The copy is finalized through `.part`
 and revalidated before transport selection. Native batches/chunks, track separation, job identity
 and session offsets are preserved. Polling and TOS cleanup do not require FFmpeg; preparation
-failures become `audio.normalization` retries and never interrupt healthy capture.
+failures become retries and never interrupt healthy capture. A submit failure positively
+known to precede ASR submission is persisted as `submit.not_sent.<error_code>` (for example
+`submit.not_sent.audio.normalization`) in the existing error column. Repairing tooling or
+disk access then retries preparation and guarded submission; it does not query a nonexistent task.
 
 Authoritative interface reference:
 
@@ -170,8 +173,30 @@ Transient failure:
 ```text
 pending -> submit -> transient failure -> retry_wait -> query same request
 submitted -> poll -> transient failure -> retry_wait -> query same request
-query -> confirmed task-not-found -> retry_wait -> guarded submit
+prepare -> proven failure before ASR submit -> retry_wait -> guarded submit
+submit -> DNS-only failure -> retry_wait -> guarded submit
+query -> explicit verified task-not-found (provider abstraction) -> retry_wait -> guarded submit
 ```
+
+Acceptance uncertainty is conservative. The adapter marks preparation/staging failures and
+an HTTP attempt sequence consisting only of name-resolution failures as not sent. A connection
+reset, timeout, or a DNS failure after an uncertain earlier attempt does not establish that fact.
+These requests keep polling the original ID through the existing bounded retry policy.
+
+The [official Standard HTTP error table](https://docs.volcengine.com/docs/DoubaoVoice/LargemodelrecordingfilerecognitionstandardversionAPI?lang=zh)
+defines `45000001` as invalid parameters (including duplicate requests) and `550xxxx` as internal
+errors; the verified contract supplies no explicit task-absence signal. Consequently this
+Volcengine adapter does not emit `TaskNotFound` for generic status codes, 400/404, missing
+headers, malformed responses or an "unknown task" message. If a submit actually never arrived
+but its failure was uncertain, automatic re-upload is intentionally unavailable: queries fail
+visibly or exhaust the configured budget while retaining the source. Verify the request ID with
+provider support before explicitly re-importing selected contiguous audio as a new job; no
+retry/force flag silently authorizes another upload. The domain's `TaskNotFound` branch remains
+for providers with a verified explicit absence contract, not a claim about this adapter.
+
+For upgrade compatibility, a legacy first-attempt `audio.normalization` retry with no
+`submitted_at` is known to precede the inner provider. Later legacy attempts without a durable
+not-sent marker could hide an earlier lost submit response and continue on the conservative query path.
 
 Permanent auth/configuration errors become `failed`.
 

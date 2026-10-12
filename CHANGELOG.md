@@ -31,8 +31,10 @@ outage evidence uses published 0.3.0, not a new soak of the final 0.3.1 binary.
   SQLite schema, job IDs, retries, original audio and prior successful transcripts remain intact.
 - Accepted or potentially accepted tasks continue polling after transient errors and
   restart, preserving the raw completion response before refusing ambiguous normalization.
-  Only confirmed task-not-found permits another guarded submission; polling retries
-  consume the existing durable retry budget.
+  Positive no-submit evidence (preparation/staging or DNS-only failure) permits a guarded
+  retry after repair; generic provider errors never imply task absence. Polling retries
+  consume the existing durable retry budget. Real-adapter/SQLite regressions use in-process
+  HTTP to verify recovery without cloud uploads.
 - Includes previously merged #40 QPC loopback placement/recovery diagnostics and #9
   conservative provider-job/source speaker-label scoping, plus #41 native ASR normalization,
   imported speaker extraction and compatible registry-vector filtering.

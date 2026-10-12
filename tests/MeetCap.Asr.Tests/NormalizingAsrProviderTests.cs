@@ -60,6 +60,7 @@ public sealed class NormalizingAsrProviderTests : IDisposable
         var provider = new NormalizingAsrProvider(inner, () => media, _root);
         var ex = await Assert.ThrowsAsync<AsrTransientException>(() => provider.SubmitFileAsync(request));
         Assert.Equal("audio.normalization", ex.Code);
+        Assert.True(ex.RequestNotSent);
         Assert.Null(inner.Request);
         Assert.Equal("native audio remains authoritative", File.ReadAllText(request.InputArtifactPath));
     }

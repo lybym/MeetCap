@@ -635,8 +635,10 @@ Notes:
 - `attempt_count` is incremented when the job enters `submitting` or resumes a due
   `retry_wait` by polling the original request, so either failure path consumes the
   same bounded retry budget. Ordinary polling does not increment it. An attempted or
-  accepted request is queried before another upload; only `provider.task_not_found`
-  permits re-submission, after the legacy timeline guard passes. `submitted_at` and
+  accepted request is queried before another upload; only positive no-submit evidence
+  (`submit.not_sent.<error_code>`) or verified `provider.task_not_found` permits
+  re-submission, after the legacy timeline guard passes. The marker uses the existing
+  error column and requires no migration. `submitted_at` and
   the original request ID remain durable across transient poll errors and restart.
 - `next_retry_at` makes the backoff durable: a restart resumes the same schedule.
 - `request_metadata_path` points at `asr/jobs/<job-id>/request.json`, which is sanitized —
