@@ -113,6 +113,99 @@ public class AsrBatchBuilderTests : IDisposable
         => CreateChunk(SessionId, sequence, startMs, durationMs, fill, format, source);
 
     [Fact]
+    public void SeparateSpanJobsRetainSqliteRetryStateAndAreIdempotentAfterRestart()
+    {
+        var databasePath = Path.Combine(_dataRoot, "meetcap.db");
+        var database = new MeetCap.Persistence.Storage.MeetCapDatabase(databasePath);
+        database.EnsureMigrated();
+        database.Sessions.Insert(new SessionRecord { Id = SessionId, Title = "Gap recovery",
+            Mode = SessionModes.Offline, SourceType = "live", Status = SessionStatus.Completed,
+            CreatedAt = s_now, UpdatedAt = s_now });
+        var options = new AsrBatchBuilderOptions { DataRoot = _dataRoot, ProviderName = "volcengine", BatchSeconds = 45 };
+        var builder = new AsrBatchBuilder(database.AsrJobs, options);
+        builder.OnChunkClosed(CreateChunk(1, 0, 15_000));
+        builder.OnChunkClosed(CreateChunk(2, 24_174, 15_000));
+        builder.FlushPendingBatches();
+        var jobs = database.AsrJobs.ListBySession(SessionId).OrderBy(j => j.StartMs).ToArray();
+        Assert.Equal(2, jobs.Length);
+        var retry = AsrJobTransitions.ScheduleRetry(AsrJobTransitions.BeginSubmit(jobs[0], s_now),
+            s_now, "network.offline", "Scripted outage", AsrRetryPolicy.Default);
+        database.AsrJobs.Update(retry);
+        var restarted = new MeetCap.Persistence.Storage.MeetCapDatabase(databasePath).AsrJobs;
+        Assert.Empty(AsrBatchBuilder.RecoverFinalizedBatches(_dataRoot, SessionId, restarted, options, null));
+        var preserved = restarted.Get(retry.Id)!;
+        Assert.Equal(AsrJobStatus.RetryWait, preserved.Status);
+        Assert.Equal(retry.ProviderRequestId, preserved.ProviderRequestId);
+        Assert.Equal(retry.NextRetryAt, preserved.NextRetryAt);
+        Assert.Equal(AsrJobStatus.Pending, restarted.Get(jobs[1].Id)!.Status);
+        Assert.Equal(24_174, restarted.Get(jobs[1].Id)!.StartMs);
+        Assert.Equal(2, restarted.ListBySession(SessionId).Count);
+    }
+
+    [Fact]
+    public void UnreadableMiddleChunkNeverCompressesItsHoleDuringRetry()
+    {
+        var builder = CreateBuilder(300);
+        var first = CreateChunk(1, 0, 10_000);
+        var middle = CreateChunk(2, 10_000, 10_000);
+        var last = CreateChunk(3, 20_000, 10_000);
+        builder.OnChunkClosed(first);
+        builder.OnChunkClosed(middle);
+        builder.OnChunkClosed(last);
+        File.Delete(middle.FilePath);
+        var batches = builder.FlushPendingBatches();
+        Assert.Equal(2, batches.Count);
+        Assert.Equal(10_000, batches[0].EndMs);
+        Assert.Equal(20_000, batches[1].StartMs);
+        Assert.All(batches, b => Assert.Single(b.Chunks));
+        Assert.Equal(1, builder.UnreadableChunks);
+        Assert.Empty(builder.RecoverFinalizedBatches(SessionId));
+    }
+
+    [Fact]
+    public void FrameDurationClosesFortyFiveSecondsDespiteTruncatedTimeline()
+    {
+        var builder = CreateBuilder(45);
+        Assert.Null(builder.OnChunkClosed(CreateChunk(1, 0, 15_000) with { EndMs = 14_999 }));
+        Assert.Null(builder.OnChunkClosed(CreateChunk(2, 14_999, 15_000)));
+        var batch = builder.OnChunkClosed(CreateChunk(3, 29_999, 15_000));
+        Assert.NotNull(batch);
+        Assert.Equal(3, batch.Chunks.Count);
+        Assert.Equal(45_000 * 96L, batch.DataBytes);
+        Assert.Equal(44_999, batch.EndMs);
+    }
+
+    [Fact]
+    public void APhysicalHoleClosesTheContiguousPrefixAndKeepsTheLaterOffset()
+    {
+        var builder = CreateBuilder(300);
+        var before = CreateChunk(1, 0, 13_519);
+        var after = CreateChunk(2, 22_693, 20_350);
+        Assert.Null(builder.OnChunkClosed(before));
+        var first = builder.OnChunkClosed(after)!;
+        Assert.Single(first.Chunks);
+        Assert.Equal(13_519, first.EndMs);
+        var second = Assert.Single(builder.FlushPendingBatches());
+        Assert.Equal(22_693, second.StartMs);
+        Assert.Equal(after.DataBytes, second.DataBytes);
+        Assert.Empty(builder.RecoverFinalizedBatches(SessionId));
+        Assert.Equal(2, _jobs.ListBySession(SessionId).Count);
+    }
+
+    [Fact]
+    public void LegacyIntraChunkHoleIsDiagnosedAndOriginalIsPreserved()
+    {
+        var builder = CreateBuilder(1);
+        builder.AttachEventSink(_events);
+        var chunk = CreateChunk(1, 0, 1_000) with { EndMs = 1_663 };
+        var hash = System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(chunk.FilePath));
+        Assert.Null(builder.OnChunkClosed(chunk));
+        Assert.Empty(_jobs.ListBySession(SessionId));
+        Assert.Contains(_events.Events, e => e.Detail?.Contains("ambiguous timeline", StringComparison.Ordinal) == true);
+        Assert.Equal(hash, System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(chunk.FilePath)));
+    }
+
+    [Fact]
     public void BatchStaysOpenUntilTheConfiguredWindowIsCovered()
     {
         var builder = CreateBuilder(batchSeconds: 60);
@@ -693,7 +786,7 @@ public class AsrBatchBuilderTests : IDisposable
     }
 
     [Fact]
-    public void APersistentWriteFailureKeepsEveryChunkAndSpansTheWholeFailedStretch()
+    public void APersistentWriteFailureKeepsEveryChunkAndRetriesSeparateConfiguredWindows()
     {
         // The write-failure branch, which the unreadable-chunk test above does not reach: every
         // iteration there deletes a chunk, i.e. exercises `reason=chunk_unreadable`. Here the
@@ -702,8 +795,7 @@ public class AsrBatchBuilderTests : IDisposable
         //
         // This test pins what the branch actually does, and therefore what
         // docs/ARCHITECTURE.md section 10.2 has to say: nothing is lost or discarded, no
-        // exception leaves the builder, and the retained window spans the whole failed stretch,
-        // so recovering after a long failure submits that stretch as one request.
+        // exception leaves the builder. Recovery still respects configured windows.
         var builder = CreateBuilder(batchSeconds: 20);
         builder.AttachEventSink(_events);
 
@@ -750,28 +842,25 @@ public class AsrBatchBuilderTests : IDisposable
         Assert.Equal(0, builder.DroppedAudioMs);
         Assert.Empty(_jobs.ListBySession(SessionId));
 
-        // Every chunk is still retained: a write failure never drops audio. The window is retried
-        // at each later threshold crossing and absorbs the chunks that closed in the meantime —
-        // this is the consequence the docs name, and it is why recovering after a long outage
-        // submits the whole stretch as one request.
+        // Every chunk is still retained: a write failure never drops audio.
         Assert.Equal(2 * windows, builder.PendingChunkCount);
 
-        // Remove the obstruction and let the accumulated window through: it is submitted as one
-        // request covering the entire failed stretch, and nothing is missing from it.
+        // Remove the obstruction: materialize each original window without losing audio.
         Directory.Delete(obstruction);
 
         var recovered = builder.FlushPendingBatches();
 
-        var batch = Assert.Single(recovered);
-        Assert.Equal(2 * windows, batch.Chunks.Count);
+        Assert.Equal(windows, recovered.Count);
+        Assert.All(recovered, b => { Assert.Equal(2, b.Chunks.Count); Assert.Equal(20_000, b.DurationMs); });
+        var batch = recovered[0];
         Assert.Equal(0, batch.StartMs);
-        Assert.Equal(windows * 20_000, batch.EndMs);
-        Assert.Single(_jobs.ListBySession(SessionId));
+        Assert.Equal(windows * 20_000, recovered[^1].EndMs);
+        Assert.Equal(windows, _jobs.ListBySession(SessionId).Count);
         Assert.Equal(0, builder.PendingChunkCount);
         Assert.True(File.Exists(Path.ChangeExtension(batch.FilePath, ".json")));
 
         // The retry kept the failed window's own number instead of advancing past it: the session
-        // has one batch artifact, numbered 1, with no gap in the sequence.
+        // begins at artifact 1, with no gap in the sequence.
         Assert.Equal("asr/batches/mic/batch-000001.wav", batch.RelativePath);
     }
 
@@ -788,27 +877,26 @@ public class AsrBatchBuilderTests : IDisposable
     }
 
     [Fact]
-    public void ABatchClosesOnCapturedAudioTimeAndCarriesAHoleInTheSessionTimeline()
+    public void AGapCreatesSeparateProviderContextsWithTheirOriginalTimelineOffsets()
     {
         var builder = CreateBuilder(batchSeconds: 60);
 
         // A device outage at 30 s: the next chunk resumes 120 s later on the session timeline.
-        // The window closes on captured audio time, not on wall-clock span, so the batch still
-        // holds exactly 60 s of speech. The missing stretch cannot be represented inside one
-        // file, so the batch's own span is longer than its audio and the batch manifest is what
-        // states where each chunk really sits (docs/RELIABILITY.md section 7: gaps are never
-        // hidden by shifting timestamps).
+        // Each side is a separate provider context; no missing audio is fabricated.
         builder.OnChunkClosed(CreateChunk(1, 0, 30_000));
         var batch = builder.OnChunkClosed(CreateChunk(2, 150_000, 30_000));
 
         Assert.NotNull(batch);
         Assert.Equal(0, batch!.StartMs);
-        Assert.Equal(180_000, batch.EndMs);
-        Assert.Equal(60_000, batch.Chunks.Sum(c => c.DurationMs));
+        Assert.Equal(30_000, batch.EndMs);
+        Assert.Equal(30_000, Assert.Single(batch.Chunks).DurationMs);
 
         var manifestPath = Path.ChangeExtension(batch.FilePath, ".json");
         using var document = JsonDocument.Parse(File.ReadAllText(manifestPath));
         var chunks = document.RootElement.GetProperty("chunks").EnumerateArray().ToArray();
-        Assert.Equal(150_000, chunks[1].GetProperty("start_ms").GetInt64());
+        Assert.Single(chunks);
+        var later = Assert.Single(builder.FlushPendingBatches());
+        Assert.Equal(150_000, later.StartMs);
+        Assert.Equal(180_000, later.EndMs);
     }
 }

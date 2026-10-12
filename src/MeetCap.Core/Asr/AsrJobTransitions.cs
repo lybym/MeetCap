@@ -11,7 +11,7 @@ namespace MeetCap.Core.Asr;
 /// submitting  -> submitted  | retry_wait | failed | cancelled
 /// submitted   -> polling    | retry_wait | failed | cancelled
 /// polling     -> polling    | succeeded | retry_wait | failed | cancelled
-/// retry_wait  -> submitting | failed | cancelled
+/// retry_wait  -> submitting | polling | failed | cancelled
 /// succeeded / failed / cancelled -> (terminal)
 /// </code>
 /// Any non-terminal state may fail or be cancelled, so a configuration error detected
@@ -40,7 +40,7 @@ public static class AsrJobTransitions
         },
         [AsrJobStatus.RetryWait] = new[]
         {
-            AsrJobStatus.Submitting, AsrJobStatus.Failed, AsrJobStatus.Cancelled,
+            AsrJobStatus.Submitting, AsrJobStatus.Polling, AsrJobStatus.Failed, AsrJobStatus.Cancelled,
         },
         [AsrJobStatus.Succeeded] = Array.Empty<AsrJobStatus>(),
         [AsrJobStatus.Failed] = Array.Empty<AsrJobStatus>(),
@@ -146,7 +146,15 @@ public static class AsrJobTransitions
     {
         ArgumentNullException.ThrowIfNull(job);
         EnsureTransitionAllowed(job.Status, AsrJobStatus.Polling);
-        return job with { Status = AsrJobStatus.Polling, UpdatedAt = now };
+        return job with
+        {
+            Status = AsrJobStatus.Polling,
+            // A due retry consumes an attempt even when it queries the original task
+            // instead of submitting audio again. Ordinary polling does not.
+            AttemptCount = job.AttemptCount + (job.Status == AsrJobStatus.RetryWait ? 1 : 0),
+            NextRetryAt = null,
+            UpdatedAt = now,
+        };
     }
 
     /// <summary>Records the retained raw provider response path.</summary>

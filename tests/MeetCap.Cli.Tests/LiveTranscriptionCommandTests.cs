@@ -22,6 +22,7 @@ namespace MeetCap.Cli.Tests;
 /// (<c>docs/DEVELOPMENT.md</c> section 7). Audio comes from the scripted capture source, not
 /// from a microphone, so this is automated coverage and not real Windows audio validation.
 /// </remarks>
+[Collection("Recording commands")]
 public class LiveTranscriptionCommandTests
 {
     [Fact]

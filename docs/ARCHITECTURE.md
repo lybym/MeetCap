@@ -451,9 +451,12 @@ never guesses its clock from those values. See section 8.1.
 
 ### 8.1 Session timeline
 
-The first observed packet defines each track's origin. Later packets use the capture source's
-declared clock, so placement comes from device timing. The QPC timestamp and device position
-are retained on packets and diagnostics; QPC is also a per-chunk start anchor.
+Online recording samples one system QPC origin before opening either endpoint. The first frame's
+QPC places each track's initial offset against that origin, so independent consumer scheduling
+cannot reset both tracks to zero. Later microphone packets retain their device-position clock;
+loopback uses QPC. Offline recording retains its first-packet origin. A missing or earlier initial
+QPC in online mode fails that track explicitly rather than inventing alignment. Packet QPC and
+device position remain preserved; the durable chunk index stores each span's first anchor.
 
 The capture clock a track is placed by is one of:
 
@@ -888,7 +891,7 @@ nothing else; it has no ASR, HTTP, or provider dependency
 
 ```text
 closed chunk (durable, indexed)
-  -> grouped per source until its span covers asr.file_batch_seconds
+  -> grouped per source by actual captured frames until asr.file_batch_seconds, or a gap
   -> asr/batches/<source>/batch-NNNNNN.wav   (real WAV, header patched and validated)
   -> asr/batches/<source>/batch-NNNNNN.json  (batch/source timeline mapping)
   -> asr_jobs row (pending, provider_request_id already allocated)
@@ -902,10 +905,10 @@ Three properties of that ordering are deliberate:
   is missing (`docs/RELIABILITY.md` sections 5 and 6).
 - **The batch manifest is what preserves the source mapping.** It records the source, the batch
   number, the batch's own span on the session timeline, and every capture chunk it was built
-  from with that chunk's own `start_ms` / `end_ms`. A batch therefore spans a hole in the
-  timeline without hiding it: the window closes on captured audio time, not on wall-clock span,
-  so a device outage produces a batch whose declared span is longer than the audio inside it,
-  and the manifest states where each chunk really sits.
+  from with that chunk's own `start_ms` / `end_ms`. A batch contains only a contiguous
+  source span. A physical gap closes the preceding partial context; later audio starts a new
+  batch with its original session offset. Capture also rotates a WAV on every reportable gap,
+  including ordinary packet gaps without a device restart. No silence is fabricated.
 - **Recovery is idempotent.** The job id is derived from the batch artifact path and its session
   (`job_<session>_<source>_batch-NNNNNN`), so re-running recovery against a batch file that already
   has a job is a no-op. The session is part of the identity because batch numbering restarts at 1
@@ -976,12 +979,10 @@ difference is deliberate rather than an omission:
 The write-failure case is therefore *not* bounded by `file_batch_seconds`. Its bound is the number
 of chunks the recording produced: what accumulates is per-chunk metadata (a path, a sequence and
 two timestamps), never audio, so a two-hour recording at 60 s chunks holds about 120 records in the
-worst case. The operator-visible consequence is stated rather than hidden: when the write site
-recovers, that accumulated window is materialized and submitted as **one** request covering the
-whole failed stretch, which is the oversized-first-request shape
-`docs/ASR_STRATEGY.md` section 12 discusses for imports. Failure windows are also never assigned a
-new batch number, so a long outage leaves no gaps in the batch numbering and no half-written files
-behind.
+worst case. When the write site recovers, retained metadata is materialized as separate configured
+windows and contiguous source spans. The original failed artifact number is reused before advancing
+to later batches. An unreadable chunk removed during retry also forms a span boundary; surviving
+audio on either side is never concatenated across its missing time.
 
 Two smaller guarantees keep the loop honest:
 
@@ -1124,11 +1125,22 @@ submitting  -> submitted   # the provider request id was persisted before the re
                            # submission is treated as accepted and recovery polls instead of
                            # re-submitting (re-submitting would risk paying twice)
 polling     -> polling     # continue querying the same provider task
-retry_wait  -> submitting  # only once the durable next_retry_at has passed
+retry_wait  -> polling     # attempted/accepted request: query the same task after durable backoff
+retry_wait  -> submitting  # fresh/proven-not-sent request or an explicitly confirmed task-not-found
 ```
 
-If the provider reports the task as unknown, the job falls back to `retry_wait` and is
-submitted again. `meetcap asr resume` is the restart entry point and processes every job whose
+If the provider reports the task as unknown, the job falls back to `retry_wait` and may be
+submitted again only after the timeline guard passes. A transient polling failure or lost
+submit response does not authorize another upload: recovery queries the original request ID,
+saves a completed raw response, then checks legacy timeline ambiguity before normalization.
+Known local preparation/staging failures and DNS-only submit failures preserve positive no-submit
+evidence as `submit.not_sent.<error_code>` in the existing error column. These retries rerun
+preparation and the guarded submit after backoff. Generic errors and mixed transport failures
+remain uncertain; the current Volcengine contract has no verified explicit task-absence signal,
+so this adapter never invents `TaskNotFound` from such responses (see ASR_STRATEGY section 6).
+Each due polling retry consumes one attempt; ordinary successful polls do not. This retains
+the bounded persistent retry policy without using a submission to count a polling retry.
+`meetcap asr resume` is the restart entry point and processes every job whose
 durable state still needs work.
 
 Network unavailable:

@@ -43,9 +43,10 @@ public class AsrJobProcessorTests : IDisposable
     private AsrJobProcessor CreateProcessor(
         AsrRetryPolicy? retryPolicy = null,
         TimeSpan? pollTimeout = null,
-        bool writeMarkdown = true) =>
+        bool writeMarkdown = true,
+        IAsrJobStore? jobs = null) =>
         new(
-            _jobs,
+            jobs ?? _jobs,
             _provider,
             _normalizer,
             _transcripts,
@@ -112,6 +113,123 @@ public class AsrJobProcessorTests : IDisposable
 
     private static AsrPollResult Completed(string body = """{"result":{"utterances":[]}}""") =>
         AsrPollResult.Completed(new AsrCompletion(body, "20000000"));
+
+    [Fact]
+    public async Task ConfirmedMissingAmbiguousTaskCannotBeRebilled()
+    {
+        var job = WriteLegacyBatch(CreateJob(AsrJobStatus.Submitted, attempts: 1)) with { SubmittedAt = s_now };
+        _jobs.Update(job);
+        _provider.EnqueuePoll(AsrPollResult.TaskNotFound());
+        var processor = CreateProcessor();
+        var notFound = await processor.ProcessAsync(job);
+        Assert.Equal(AsrJobStatus.RetryWait, notFound.Job.Status);
+        Assert.Equal("provider.task_not_found", notFound.Job.ErrorCode);
+        var refused = await CreateProcessor().ProcessAsync(_jobs.Get(job.Id)!);
+        Assert.Equal("asr.timeline_ambiguous", refused.Job.ErrorCode);
+        Assert.Empty(_provider.Submissions);
+        Assert.Single(_provider.PolledRequestIds);
+        Assert.True(File.Exists(Paths.ResolveRelative(job.InputArtifact)));
+    }
+
+    [Theory]
+    [InlineData("gap", true)]
+    [InlineData("missing", true)]
+    [InlineData("unreadable", true)]
+    [InlineData("gap", false)]
+    [InlineData("missing", false)]
+    [InlineData("unreadable", false)]
+    public async Task AcceptedOrUncertainRetrySurvivesSqliteRestartAndRetainsRawResponse(
+        string mapping, bool knownAccepted)
+    {
+        var original = CreateJob(knownAccepted ? AsrJobStatus.Submitted : AsrJobStatus.Submitting, attempts: 1);
+        var job = WriteLegacyBatch(original) with { SubmittedAt = knownAccepted ? s_now : null };
+        var inputPath = Paths.ResolveRelative(job.InputArtifact);
+        var manifest = Path.ChangeExtension(inputPath, ".json");
+        if (mapping != "gap") File.Delete(manifest);
+        if (mapping == "unreadable") Directory.CreateDirectory(manifest);
+        var originalHash = System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(inputPath));
+
+        var dbPath = Path.Combine(_dataRoot, "retry.db");
+        var database = new MeetCap.Persistence.Storage.MeetCapDatabase(dbPath);
+        database.EnsureMigrated();
+        database.Sessions.Insert(new SessionRecord { Id = job.SessionId, Title = "Accepted retry",
+            Mode = SessionModes.Offline, SourceType = "live", Status = SessionStatus.Processing,
+            CreatedAt = s_now, UpdatedAt = s_now });
+        database.AsrJobs.Create(job);
+        _provider.OnPoll = _ => throw new AsrTransientException("http.transport", "Scripted poll outage");
+        var first = await CreateProcessor(jobs: database.AsrJobs).ProcessAsync(job);
+        Assert.Equal(AsrJobStatus.RetryWait, first.Job.Status);
+        Assert.Equal(job.SubmittedAt, first.Job.SubmittedAt);
+        Assert.Equal(job.ProviderRequestId, first.Job.ProviderRequestId);
+
+        // New facade and processor read the stored retry, rather than the first
+        // invocation's local state. No provider or HTTP adapter is composed.
+        var restarted = new MeetCap.Persistence.Storage.MeetCapDatabase(dbPath).AsrJobs;
+        const string raw = "{\"result\":{\"utterances\":[]},\"retained\":\"completed-after-retry\"}";
+        _provider.OnPoll = _ => Completed(raw);
+        var second = await CreateProcessor(jobs: restarted).ProcessAsync(restarted.Get(job.Id)!);
+        Assert.Equal(AsrJobOutcome.Failed, second.Outcome);
+        Assert.Equal("asr.timeline_ambiguous", restarted.Get(job.Id)!.ErrorCode);
+        Assert.Equal(2, second.Job.AttemptCount);
+        Assert.Empty(_provider.Submissions);
+        Assert.Equal(new[] { job.ProviderRequestId, job.ProviderRequestId }, _provider.PolledRequestIds);
+        Assert.Equal(raw, File.ReadAllText(Paths.JobResponseJson(job.Id)));
+        Assert.Equal(Paths.JobResponseJson(job.Id), restarted.Get(job.Id)!.RawResponsePath);
+        Assert.False(File.Exists(Paths.JobNormalizedJsonl(job.Id)));
+        Assert.Equal(originalHash, System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(inputPath)));
+    }
+
+    private AsrJob WriteLegacyBatch(AsrJob job)
+    {
+        job = job with { Source = "mic", InputArtifact = "asr/batches/mic/batch-000001.wav",
+            EndMs = 1_663, DurationMs = 1_663 };
+        var path = Paths.ResolveRelative(job.InputArtifact);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        var format = new MeetCap.Core.Capture.AudioFormat(16_000, 1, 16, MeetCap.Core.Capture.AudioSampleFormat.Pcm);
+        File.WriteAllBytes(path, MeetCap.AudioPipeline.Wave.WavHeader.Build(format, 32_000)
+            .Concat(new byte[32_000]).ToArray());
+        File.WriteAllText(Path.ChangeExtension(path, ".json"),
+            "{\"chunks\":[{\"start_ms\":0,\"end_ms\":1663,\"data_bytes\":32000}]}");
+        return job;
+    }
+
+    [Fact]
+    public async Task LegacyGapBatchFailsBeforeBillingAndPollingStillRetainsRawResponse()
+    {
+        var imported = CreateJob();
+        var job = imported with { Source = "mic", InputArtifact = "asr/batches/mic/batch-000001.wav",
+            EndMs = 1_663, DurationMs = 1_663 };
+        _jobs.Update(job);
+        var path = Paths.ResolveRelative(job.InputArtifact);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        var format = new MeetCap.Core.Capture.AudioFormat(16_000, 1, 16, MeetCap.Core.Capture.AudioSampleFormat.Pcm);
+        File.WriteAllBytes(path, MeetCap.AudioPipeline.Wave.WavHeader.Build(format, 32_000)
+            .Concat(new byte[32_000]).ToArray());
+        File.WriteAllText(Path.ChangeExtension(path, ".json"),
+            "{\"chunks\":[{\"start_ms\":0,\"end_ms\":1663,\"data_bytes\":32000}]}");
+        var processor = CreateProcessor();
+        var result = await processor.ProcessAsync(job);
+        Assert.Equal(AsrJobOutcome.Failed, result.Outcome);
+        Assert.Equal("asr.timeline_ambiguous", result.Job.ErrorCode);
+        Assert.Contains(job.InputArtifact, result.Message!, StringComparison.Ordinal);
+        Assert.Contains("intra-chunk timing ambiguity", result.Message!, StringComparison.Ordinal);
+        Assert.Empty(_provider.Submissions);
+        Assert.Empty(_provider.PolledRequestIds);
+        Assert.True(File.Exists(path));
+        Assert.Equal(AsrJobOutcome.NoWork, (await processor.ProcessAsync(result.Job)).Outcome);
+
+        // An already accepted legacy provider task is polled once, never submitted
+        // again, and the original response survives the timing refusal.
+        job = job with { Status = AsrJobStatus.Submitted, AttemptCount = 1 };
+        _jobs.Update(job);
+        _provider.EnqueuePoll(Completed());
+        var polled = await processor.ProcessAsync(job);
+        Assert.Equal("asr.timeline_ambiguous", polled.Job.ErrorCode);
+        Assert.Empty(_provider.Submissions);
+        Assert.Single(_provider.PolledRequestIds);
+        Assert.True(File.Exists(Paths.JobResponseJson(job.Id)));
+        Assert.False(File.Exists(Paths.JobNormalizedJsonl(job.Id)));
+    }
 
     [Fact]
     public async Task SuccessPath_RetainsRawResponseAndWritesEveryTranscriptArtifact()
@@ -237,7 +355,9 @@ public class AsrJobProcessorTests : IDisposable
         var resumed = Assert.Single(results);
         Assert.Equal(AsrJobOutcome.Succeeded, resumed.Outcome);
         Assert.Equal(2, resumed.Job.AttemptCount);
-        Assert.Equal(2, _provider.Submissions.Count);
+        // A failed submit response may still hide an accepted task: query that
+        // identity before submitting more audio.
+        Assert.Single(_provider.Submissions);
     }
 
     [Fact]
@@ -273,9 +393,11 @@ public class AsrJobProcessorTests : IDisposable
     }
 
     [Fact]
-    public async Task RestartWithADueRetry_ResubmitsWithTheSameProviderRequestId()
+    public async Task RestartWithAConfirmedMissingTask_ResubmitsWithTheSameProviderRequestId()
     {
         var job = CreateJob(AsrJobStatus.RetryWait, attempts: 1, nextRetryAt: s_now.AddMinutes(-1));
+        job = job with { ErrorCode = "provider.task_not_found" };
+        _jobs.Update(job);
         _provider.EnqueuePoll(Completed());
 
         var result = await CreateProcessor().ProcessAsync(job);
@@ -437,7 +559,8 @@ public class AsrJobProcessorTests : IDisposable
 
         Assert.Equal(expectedCount, results.Count);
         Assert.Equal(originals.Take(expectedCount).Select(job => job.Id), results.Select(result => result.Job.Id));
-        Assert.Equal(expectedCount, _provider.Submissions.Count);
+        Assert.Equal(Math.Min(expectedCount, 2), _provider.Submissions.Count);
+        Assert.Equal(originals.Take(expectedCount).Select(job => job.ProviderRequestId), _provider.PolledRequestIds);
         Assert.All(results, result => Assert.Equal(AsrJobOutcome.Succeeded, result.Outcome));
         foreach (var unselected in originals.Skip(expectedCount))
         {

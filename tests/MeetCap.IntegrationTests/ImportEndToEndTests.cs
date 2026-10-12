@@ -269,8 +269,10 @@ public class ImportEndToEndTests : IDisposable
         Assert.EndsWith("meeting.wav", Assert.Single(provider.Submissions).InputArtifactPath, StringComparison.Ordinal);
     }
 
-    [Fact]
-    public async Task TransientFailure_IsResumedAfterARestartAndStillProducesTheTranscript()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task UncertainSubmit_IsQueriedAfterRestartAndResubmittedOnlyIfConfirmedMissing(bool taskMissing)
     {
         Migrate();
         var (failing, _, provider, _) = CreateService();
@@ -287,26 +289,57 @@ public class ImportEndToEndTests : IDisposable
         Assert.False(first.Succeeded);
         Assert.Equal(AsrJobStatus.RetryWait, first.JobStatus);
         Assert.Empty(new FileTranscriptStore().ReadJsonl(first.RawTranscriptPath));
+        Assert.Equal("req-test", Assert.Single(provider.Submissions).ProviderRequestId);
+        Assert.Empty(provider.PolledRequestIds);
 
         // Everything about the pending work is durable, so a brand-new process (new store
         // instances over the same database) can pick it up.
         SqliteConnection.ClearAllPools();
-        var (resumed, resumedProcessor, resumedProvider, resumedDatabase) = CreateService();
+        var (_, resumedProcessor, resumedProvider, resumedDatabase) = CreateService();
+        if (taskMissing)
+        {
+            resumedProvider.EnqueuePoll(AsrPollResult.TaskNotFound());
+        }
         resumedProvider.EnqueuePoll(AsrPollResult.Completed(new AsrCompletion(ProviderJson, "20000000")));
 
         var due = resumedDatabase.AsrJobs.Get("job_test")!;
         resumedDatabase.AsrJobs.Update(due with { NextRetryAt = DateTimeOffset.UtcNow.AddMinutes(-1) });
 
         var results = await resumedProcessor.RunDueAsync(10);
+        if (taskMissing)
+        {
+            var missing = Assert.Single(results);
+            Assert.Equal(AsrJobOutcome.AwaitingRetry, missing.Outcome);
+            Assert.Equal("provider.task_not_found", missing.Job.ErrorCode);
+            Assert.Equal(2, missing.Job.AttemptCount);
+            Assert.Empty(resumedProvider.Submissions);
+            Assert.Equal(new[] { "req-test" }, resumedProvider.PolledRequestIds);
+            Assert.Empty(new FileTranscriptStore().ReadJsonl(first.RawTranscriptPath));
+
+            var retry = resumedDatabase.AsrJobs.Get("job_test")!;
+            resumedDatabase.AsrJobs.Update(retry with { NextRetryAt = DateTimeOffset.UtcNow.AddMinutes(-1) });
+            results = await resumedProcessor.RunDueAsync(10);
+        }
 
         var outcome = Assert.Single(results);
         Assert.Equal(AsrJobOutcome.Succeeded, outcome.Outcome);
 
-        // The retry reused the persisted provider task id instead of inventing a new one.
-        Assert.Equal("req-test", Assert.Single(resumedProvider.Submissions).ProviderRequestId);
-        Assert.Equal(2, outcome.Job.AttemptCount);
+        // A lost submit response can hide an accepted task. Reuse its durable identity
+        // for the query; upload again only after the provider explicitly says it is missing.
+        Assert.Equal("req-test", outcome.Job.ProviderRequestId);
+        Assert.Equal(taskMissing ? 3 : 2, outcome.Job.AttemptCount);
+        Assert.Equal(Enumerable.Repeat("req-test", taskMissing ? 2 : 1), resumedProvider.PolledRequestIds);
+        if (taskMissing)
+        {
+            Assert.Equal("req-test", Assert.Single(resumedProvider.Submissions).ProviderRequestId);
+        }
+        else
+        {
+            Assert.Empty(resumedProvider.Submissions);
+        }
 
         var paths = new SessionArtifactPaths(_dataRoot, "ses_test");
+        Assert.Equal(ProviderJson, File.ReadAllText(paths.JobResponseJson("job_test")));
         Assert.Equal(2, new FileTranscriptStore().ReadJsonl(paths.RawTranscriptJsonl).Count);
         Assert.Equal(SessionStatus.Completed, resumedDatabase.Sessions.Get("ses_test")!.Status);
     }

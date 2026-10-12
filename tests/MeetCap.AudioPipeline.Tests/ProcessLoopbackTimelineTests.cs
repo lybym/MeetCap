@@ -28,6 +28,32 @@ namespace MeetCap.AudioPipeline.Tests;
 /// </remarks>
 public class ProcessLoopbackTimelineTests
 {
+    [Fact]
+    public async Task OnlineRecordingSharesQpcOriginAcrossIndependentConsumers()
+    {
+        const long origin = 5_000_000_000;
+        var reads = 0;
+        using var harness = new SessionHarness(mode: SessionModes.Online, loopbackMode: "process",
+            readQpcTicks: () => { reads++; return origin; });
+        var mic = MicSource(harness);
+        var loop = ProcessLoopbackSource(harness);
+        using var session = harness.Service.PrepareSession("Shared initial origin");
+        using var cancellation = new CancellationTokenSource();
+        var run = session.RunAsync(cancellation.Token);
+        Assert.True(await Wait.UntilAsync(() => mic.StartCount == 1 && loop.StartCount == 1));
+        // Deliver later physical audio first, proving scheduling does not define the origin.
+        mic.Emit(new AudioPacket(AudioSource.Mic, Format, new byte[Format.SampleRate * Format.BlockAlign],
+            0, origin + 6_641_249, harness.Clock.UtcNow));
+        loop.Emit(new AudioPacket(AudioSource.Loopback, Format, new byte[Format.SampleRate * Format.BlockAlign],
+            0, origin, harness.Clock.UtcNow));
+        cancellation.Cancel();
+        await Finish(run);
+        Assert.Equal(1, reads);
+        var chunks = harness.Database.Chunks.ListForSession(session.SessionId);
+        Assert.Equal(664, Assert.Single(chunks, c => c.Source == AudioSource.Mic).StartMs);
+        Assert.Equal(0, Assert.Single(chunks, c => c.Source == AudioSource.Loopback).StartMs);
+    }
+
     private static readonly AudioFormat Format = TestAudio.Formats.Mono48kPcm;
 
     [Fact]
@@ -143,6 +169,12 @@ public class ProcessLoopbackTimelineTests
         Assert.Equal(1_000L, gap.GapMs);
         Assert.Equal(10_000L, gap.GapStartMs);
         Assert.Equal(11_000L, gap.GapEndMs);
+
+        var spans = harness.Database.Chunks.ListForSession(session.SessionId)
+            .Where(chunk => chunk.Source == AudioSource.Loopback).ToArray();
+        Assert.Equal(2, spans.Length);
+        Assert.Equal(10_000, spans[0].EndMs);
+        Assert.Equal(11_000, spans[1].StartMs);
 
         // The hole is a gap, not a discontinuity: one event, named for what actually happened.
         Assert.Empty(EventsNamed(paths, SessionEventNames.CaptureDiscontinuity, AudioSources.Loopback));

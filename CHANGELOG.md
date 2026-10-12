@@ -12,6 +12,39 @@ manual checklist in `docs/M1_WINDOWS_VALIDATION.md` has been run on real hardwar
 milestones are described as the former, never the latter
 (`docs/DEVELOPMENT.md` section 7).
 
+## [0.3.1] - 2026-10-12
+
+Patch preparation for the M0–M6 MVP gate in [#1](https://github.com/lybym/MeetCap/issues/1).
+Real Windows gate evidence and its limitations are reconciled in
+[`docs/MVP_ACCEPTANCE.md`](docs/MVP_ACCEPTANCE.md); the two-hour capture and 30-minute
+outage evidence uses published 0.3.0, not a new soak of the final 0.3.1 binary.
+
+- File-ASR windows count actual captured frames: three 15-second chunks complete a
+  configured 45-second window even when their timeline ends at 44,999 ms.
+- Every reportable packet gap rotates capture WAVs; ASR batches separate contiguous
+  spans, including gaps introduced by unreadable-chunk removal. Retried write-failure
+  windows retain their configured sizes and originals.
+- Online tracks share one pre-capture system QPC origin. The initial mic/loopback
+  physical offset survives, while subsequent microphone placement retains its frame clock.
+- Legacy intra-WAV holes are diagnosed instead of compressing transcript timestamps.
+  Ambiguous pending jobs fail before billing; accepted jobs preserve their raw response.
+  SQLite schema, job IDs, retries, original audio and prior successful transcripts remain intact.
+- Accepted or potentially accepted tasks continue polling after transient errors and
+  restart, preserving the raw completion response before refusing ambiguous normalization.
+  Positive no-submit evidence (preparation/staging or DNS-only failure) permits a guarded
+  retry after repair; generic provider errors never imply task absence. Polling retries
+  consume the existing durable retry budget. Real-adapter/SQLite regressions use in-process
+  HTTP to verify recovery without cloud uploads.
+- Includes previously merged #40 QPC loopback placement/recovery diagnostics and #9
+  conservative provider-job/source speaker-label scoping, plus #41 native ASR normalization,
+  imported speaker extraction and compatible registry-vector filtering.
+- CLI recording tests isolate their synchronous orchestration to prevent ThreadPool
+  starvation on small parallel runners without increasing startup deadlines.
+- Stable workflow defaults to 0.3.1 and renders the real source SHA in release notes.
+
+No new cloud uploads, complete 82-job queue drain, general speaker-accuracy certification,
+or optional large-file TOS round trip are implied by these fixes.
+
 ## [0.3.0] - 2026-10-08
 
 The third MVP-track release. It fixes three capture defects on top of 0.2.0: Windows process

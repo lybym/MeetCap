@@ -133,6 +133,7 @@ internal sealed class CaptureTrack : IDisposable
     private readonly MeetCapDatabase _database;
     private readonly ISessionEventSink _events;
     private readonly IClock _clock;
+    private readonly long? _sessionQpcOriginTicks;
     private readonly AudioSource _source;
     private readonly CaptureDeviceInfo _device;
     private readonly Func<CaptureDeviceInfo, IAudioCaptureSource> _createSource;
@@ -216,7 +217,8 @@ internal sealed class CaptureTrack : IDisposable
         Action? afterPacketWritten,
         Action<ClosedAudioChunk> onChunkClosed,
         Action<Exception> onStorageFailure,
-        Func<AudioSource, Func<CancellationToken, Task>>? beforeReopenAttempt = null)
+        Func<AudioSource, Func<CancellationToken, Task>>? beforeReopenAttempt = null,
+        long? sessionQpcOriginTicks = null)
     {
         _paths = paths ?? throw new ArgumentNullException(nameof(paths));
         _settings = settings ?? throw new ArgumentNullException(nameof(settings));
@@ -236,6 +238,7 @@ internal sealed class CaptureTrack : IDisposable
         // The seam is built for this track's own source, so a dual-track test can hold each
         // track's first recovery attempt independently (docs/DEVELOPMENT.md section 6).
         _beforeReopenAttempt = beforeReopenAttempt?.Invoke(source);
+        _sessionQpcOriginTicks = sessionQpcOriginTicks;
     }
 
     public AudioSource Source => _source;
@@ -332,7 +335,7 @@ internal sealed class CaptureTrack : IDisposable
         // placed by timing this stream actually reports rather than by a value inferred
         // from the buffers (docs/ARCHITECTURE.md section 8.1).
         _captureClock = source.Clock;
-        _timeline = new CaptureTimeline(format, _captureClock);
+        _timeline = new CaptureTimeline(format, _captureClock, _sessionQpcOriginTicks);
         _spool = new ChunkSpool(
             _paths,
             _source,
@@ -1155,11 +1158,11 @@ internal sealed class CaptureTrack : IDisposable
             return;
         }
 
-        if (timing.IsNewSegment)
+        if (timing.IsNewSegment || timing.HasGap)
         {
             _positionAnomalies.Flush(_events);
-            // Capture restarted on a fresh device stream: close what was captured before
-            // the outage so it is durable without waiting for the chunk boundary.
+            // Every WAV is a contiguous span. A gap inside one WAV would compress its
+            // downstream provider timestamps even when the gap event was preserved.
             CloseActiveChunk();
         }
 

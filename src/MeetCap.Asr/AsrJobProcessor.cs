@@ -1,6 +1,7 @@
 namespace MeetCap.Asr;
 
 using System.Text;
+using MeetCap.Asr.Batching;
 using MeetCap.Core.Asr;
 using MeetCap.Core.Sessions;
 using MeetCap.Core.Transcripts;
@@ -83,6 +84,7 @@ public sealed class AsrJobProcessor
     private const string ConfigurationErrorCode = "asr.configuration";
     private const string NormalizationErrorCode = "asr.normalization_failed";
     private const string TaskNotFoundErrorCode = "provider.task_not_found";
+    private const string SubmitNotSentPrefix = "submit.not_sent.";
 
     /// <summary>
     /// Upper bound on the submit/poll passes one drain performs for a single job. Reaching it
@@ -270,6 +272,11 @@ public sealed class AsrJobProcessor
             return false;
         }
 
+        if (errorCode.StartsWith(SubmitNotSentPrefix, StringComparison.Ordinal))
+        {
+            errorCode = errorCode[SubmitNotSentPrefix.Length..];
+        }
+
         if (string.Equals(errorCode, TaskNotFoundErrorCode, StringComparison.Ordinal))
         {
             // The provider answered, so it is reachable; the task itself is what is missing.
@@ -307,8 +314,20 @@ public sealed class AsrJobProcessor
         var request = BuildRequest(job, paths);
         var submission = RehydrateSubmission(job);
 
+        // A retry can follow a poll failure or a submit whose response was lost.
+        // The original request may already be billed. Only proof that no submit was
+        // sent, or an explicit task-not-found, permits another guarded submission.
+        if (job.Status == AsrJobStatus.RetryWait && (job.AttemptCount > 0 || job.SubmittedAt is not null) &&
+            !CanRetrySubmission(job))
+        {
+            job = AsrJobTransitions.BeginPolling(job, Now());
+            _jobs.Update(job);
+        }
+
         if (job.Status is AsrJobStatus.Pending or AsrJobStatus.RetryWait)
         {
+            if (BatchTimelineGuard.Check(job, request.InputArtifactPath) is { } ambiguity)
+                return await Fail(job, BatchTimelineGuard.ErrorCode, ambiguity, cancellationToken).ConfigureAwait(false);
             var submitResult = await SubmitAsync(job, paths, request, cancellationToken).ConfigureAwait(false);
             if (submitResult is not null)
             {
@@ -328,6 +347,15 @@ public sealed class AsrJobProcessor
         return await PollAsync(current, paths, request, submission, cancellationToken).ConfigureAwait(false);
     }
 
+    private static bool CanRetrySubmission(AsrJob job) =>
+        string.Equals(job.ErrorCode, TaskNotFoundErrorCode, StringComparison.Ordinal) ||
+        (job.ErrorCode?.StartsWith(SubmitNotSentPrefix, StringComparison.Ordinal) ?? false) ||
+        // Upgrade compatibility: on its first attempt this legacy code proves the
+        // inner provider was never invoked. Later old attempts could hide an earlier
+        // lost submit response, so those and accepted rows remain conservative.
+        (job.SubmittedAt is null && job.AttemptCount <= 1 &&
+            string.Equals(job.ErrorCode, "audio.normalization", StringComparison.Ordinal));
+
     private async Task<AsrJobProcessResult?> SubmitAsync(
         AsrJob job,
         SessionArtifactPaths paths,
@@ -346,7 +374,9 @@ public sealed class AsrJobProcessor
         }
         catch (AsrTransientException ex)
         {
-            return await HandleTransient(job, ex.Code, ex.Message, cancellationToken).ConfigureAwait(false);
+            // The existing error-code column persists the no-submit evidence across restart.
+            var code = ex.RequestNotSent ? SubmitNotSentPrefix + ex.Code : ex.Code;
+            return await HandleTransient(job, code, ex.Message, cancellationToken).ConfigureAwait(false);
         }
         catch (AsrPermanentException ex)
         {
@@ -495,6 +525,8 @@ public sealed class AsrJobProcessor
         _jobs.Update(job);
 
         AsrNormalizationResult normalized;
+        if (BatchTimelineGuard.Check(job, paths.ResolveRelative(job.InputArtifact)) is { } ambiguity)
+            return await Fail(job, BatchTimelineGuard.ErrorCode, ambiguity, cancellationToken).ConfigureAwait(false);
         try
         {
             normalized = _normalizer.Normalize(

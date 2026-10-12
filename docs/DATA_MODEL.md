@@ -306,6 +306,19 @@ the prepared path. Polling does not read this derivative and a retry regenerates
 `at_ms` is the session-relative position on the capture timeline, never a wall-clock
 reading. Fields an event does not define are omitted rather than written as `null`.
 
+From 0.3.1, online tracks share a pre-capture system QPC origin. Their first chunks can
+start at different nonzero offsets. An ordinary reportable packet gap rotates the WAV,
+so each newly written capture chunk is a contiguous audio span. ASR windows count native
+frames rather than truncated timeline differences, and gaps split provider contexts.
+SQLite migrations and existing job IDs/retry states are unchanged. Existing chunks and
+batches are never rewritten during upgrade. Legacy intra-chunk timing mismatches cannot be
+unambiguously repaired from a WAV alone; the batch builder records the diagnostic, and
+pending legacy jobs fail before submission with `asr.timeline_ambiguous`. Already accepted
+jobs retain their provider response before refusing normalization. Recover speech by
+inspecting gap events and importing explicitly selected contiguous source spans; import
+creates a new timeline and does not restore the old session placement automatically.
+Already succeeded legacy transcripts are retained, not silently relabeled as corrected.
+
 `capture.gap` is written only for a gap the timeline measures as at least one whole
 millisecond, and it then carries all three of `gap_ms`, `gap_start_ms` and `gap_end_ms`.
 A forward step in the stream's own clock that rounds to zero milliseconds — a sub-millisecond
@@ -619,8 +632,14 @@ Notes:
   domain type declares the id non-nullable, so no MeetCap code path can produce an unset one.
 - `input_artifact` is stored session-relative (for example `audio/import/normalized.wav`) so
   the artifact contract survives moving the data root.
-- `attempt_count` is incremented when the job enters `submitting`, so a submit that never
-  returns still consumes an attempt and cannot retry forever.
+- `attempt_count` is incremented when the job enters `submitting` or resumes a due
+  `retry_wait` by polling the original request, so either failure path consumes the
+  same bounded retry budget. Ordinary polling does not increment it. An attempted or
+  accepted request is queried before another upload; only positive no-submit evidence
+  (`submit.not_sent.<error_code>`) or verified `provider.task_not_found` permits
+  re-submission, after the legacy timeline guard passes. The marker uses the existing
+  error column and requires no migration. `submitted_at` and
+  the original request ID remain durable across transient poll errors and restart.
 - `next_retry_at` makes the backoff durable: a restart resumes the same schedule.
 - `request_metadata_path` points at `asr/jobs/<job-id>/request.json`, which is sanitized —
   credentials and authorization headers never appear in it, and the inline audio payload is

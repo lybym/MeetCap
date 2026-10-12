@@ -168,6 +168,13 @@ public class RecordingSessionTests
 
         // `at_ms` stays the resume position, which is what the timeline places the event at.
         Assert.Equal(3_000, gap.GetProperty("at_ms").GetInt64());
+
+        var chunks = harness.Database.Chunks.ListForSession(session.SessionId);
+        Assert.Equal(2, chunks.Count);
+        Assert.Equal(1_000, chunks[0].EndMs);
+        Assert.Equal(3_000, chunks[1].StartMs);
+        Assert.Equal(Format.FramesToBytes(Format.SampleRate), chunks[0].ByteLength);
+        Assert.Equal(Format.FramesToBytes(Format.SampleRate), chunks[1].ByteLength);
     }
 
     [Fact]

@@ -73,7 +73,11 @@ Each batch contained 45 seconds (180 seconds total). No other batch was submitte
   and the full Release suite passed 854 tests with zero failures.
   This caps distinct jobs, not polling requests or provider transport retries.
 
-## Remaining release gates
+## Remaining release gates at this historical checkpoint
+
+The items below describe the earlier checkpoint, before later #40/#9 fixes and real
+live speech/identity audits. Use [MVP_ACCEPTANCE.md](MVP_ACCEPTANCE.md) for the reconciled
+0.3.1 preparation matrix; historical unrun statements below are not the current verdict.
 
 - Full 82-job outage recovery was intentionally not attempted after the user's sampling request.
   The sampled real provider transport passed; continuously persisted dual-track transcripts

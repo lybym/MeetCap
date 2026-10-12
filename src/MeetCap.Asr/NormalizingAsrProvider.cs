@@ -41,7 +41,8 @@ public sealed class NormalizingAsrProvider(IAsrProvider inner, Func<IMediaPipeli
             {
                 throw new AsrTransientException("audio.normalization",
                     "Live ASR audio normalization failed; native recording is intact. " +
-                    "Check media.ffmpeg_binary_folder and disk access, then run 'meetcap asr resume': " + ex.Message, ex);
+                    "Check media.ffmpeg_binary_folder and disk access, then run 'meetcap asr resume': " + ex.Message, ex,
+                    requestNotSent: true);
             }
         }
 

@@ -191,13 +191,22 @@ public interface IAsrProvider
 /// <summary>Thrown when the provider request failed for a reason that may succeed later.</summary>
 public sealed class AsrTransientException : Exception
 {
-    public AsrTransientException(string code, string message, Exception? innerException = null)
+    public AsrTransientException(string code, string message, Exception? innerException = null,
+        bool requestNotSent = false)
         : base(message, innerException)
     {
         Code = code;
+        RequestNotSent = requestNotSent;
     }
 
     public string Code { get; }
+
+    /// <summary>
+    /// Positive evidence that no ASR submit reached the provider. Defaults to false:
+    /// a timeout, connection reset or generic provider error leaves acceptance uncertain.
+    /// Only the submit path uses this fact to authorize a durable submission retry.
+    /// </summary>
+    public bool RequestNotSent { get; }
 }
 
 /// <summary>Thrown when the provider request failed permanently (auth, quota, bad request).</summary>

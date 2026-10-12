@@ -23,7 +23,8 @@ internal sealed class SessionHarness : IDisposable
         string? renderDeviceId = null,
         string? loopbackMode = null,
         string? loopbackProcessName = null,
-        Func<AudioSource, Func<CancellationToken, Task>>? beforeReopenAttempt = null)
+        Func<AudioSource, Func<CancellationToken, Task>>? beforeReopenAttempt = null,
+        Func<long>? readQpcTicks = null)
     {
         _workspace = workspace ?? new TempWorkspace();
         OwnsWorkspace = workspace is null;
@@ -60,7 +61,7 @@ internal sealed class SessionHarness : IDisposable
             online: online,
             deviceRecoverySeconds: deviceRecoverySeconds);
 
-        Platform = new CapturePlatform(Devices, Sources, Disk, Clock);
+        Platform = new CapturePlatform(Devices, Sources, Disk, Clock, readQpcTicks);
         Database = _workspace.Database;
 
         // The service derives its retry budget from the settings, exactly as production does,

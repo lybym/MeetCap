@@ -181,6 +181,16 @@ public static class WavBatchConcatenator
                 $"'{writer.Format}'. Mixing formats in one batch would change how the audio is decoded.");
         }
 
+        if (source.DataBytes != parsed.DeclaredDataBytes || source.DataBytes != stream.Length - WavHeader.Size)
+            throw new AsrBatchMaterializationException(source.RelativePath,
+                $"Capture chunk '{source.RelativePath}' has inconsistent declared and actual audio lengths.");
+        var audioMs = (double)source.DataBytes / parsed.Format.BlockAlign * 1000 / parsed.Format.SampleRate;
+        if (Math.Abs(source.DurationMs - audioMs) > 2)
+            throw new AsrBatchMaterializationException(source.RelativePath,
+                $"Capture chunk '{source.RelativePath}' has an ambiguous timeline: its span is " +
+                $"{source.DurationMs} ms but its audio is {audioMs:F3} ms. The original is preserved; " +
+                "inspect its gap events and import contiguous source spans explicitly before retrying ASR.");
+
         var buffer = new byte[64 * 1024];
         int read;
         while (true)
