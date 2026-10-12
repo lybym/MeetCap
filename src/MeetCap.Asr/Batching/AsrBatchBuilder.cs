@@ -950,7 +950,9 @@ public sealed class AsrBatchBuilder
         // Use each declaration for the threshold; mismatched formats are rejected by
         // materialization, rather than stalling below the threshold indefinitely.
         private decimal FramesInBatchFormat(ClosedAudioChunk chunk) =>
-            (decimal)chunk.DataBytes / chunk.Format.BlockAlign / chunk.Format.SampleRate * Format.SampleRate;
+            chunk.Format.SampleRate == Format.SampleRate
+                ? chunk.DataBytes / chunk.Format.BlockAlign
+                : (decimal)chunk.DataBytes / chunk.Format.BlockAlign / chunk.Format.SampleRate * Format.SampleRate;
 
         public decimal AudioFrames => Chunks.Sum(FramesInBatchFormat);
 

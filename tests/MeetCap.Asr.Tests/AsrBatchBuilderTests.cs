@@ -113,6 +113,36 @@ public class AsrBatchBuilderTests : IDisposable
         => CreateChunk(SessionId, sequence, startMs, durationMs, fill, format, source);
 
     [Fact]
+    public void SeparateSpanJobsRetainSqliteRetryStateAndAreIdempotentAfterRestart()
+    {
+        var databasePath = Path.Combine(_dataRoot, "meetcap.db");
+        var database = new MeetCap.Persistence.Storage.MeetCapDatabase(databasePath);
+        database.EnsureMigrated();
+        database.Sessions.Insert(new SessionRecord { Id = SessionId, Title = "Gap recovery",
+            Mode = SessionModes.Offline, SourceType = "live", Status = SessionStatus.Completed,
+            CreatedAt = s_now, UpdatedAt = s_now });
+        var options = new AsrBatchBuilderOptions { DataRoot = _dataRoot, ProviderName = "volcengine", BatchSeconds = 45 };
+        var builder = new AsrBatchBuilder(database.AsrJobs, options);
+        builder.OnChunkClosed(CreateChunk(1, 0, 15_000));
+        builder.OnChunkClosed(CreateChunk(2, 24_174, 15_000));
+        builder.FlushPendingBatches();
+        var jobs = database.AsrJobs.ListBySession(SessionId).OrderBy(j => j.StartMs).ToArray();
+        Assert.Equal(2, jobs.Length);
+        var retry = AsrJobTransitions.ScheduleRetry(AsrJobTransitions.BeginSubmit(jobs[0], s_now),
+            s_now, "network.offline", "Scripted outage", AsrRetryPolicy.Default);
+        database.AsrJobs.Update(retry);
+        var restarted = new MeetCap.Persistence.Storage.MeetCapDatabase(databasePath).AsrJobs;
+        Assert.Empty(AsrBatchBuilder.RecoverFinalizedBatches(_dataRoot, SessionId, restarted, options, null));
+        var preserved = restarted.Get(retry.Id)!;
+        Assert.Equal(AsrJobStatus.RetryWait, preserved.Status);
+        Assert.Equal(retry.ProviderRequestId, preserved.ProviderRequestId);
+        Assert.Equal(retry.NextRetryAt, preserved.NextRetryAt);
+        Assert.Equal(AsrJobStatus.Pending, restarted.Get(jobs[1].Id)!.Status);
+        Assert.Equal(24_174, restarted.Get(jobs[1].Id)!.StartMs);
+        Assert.Equal(2, restarted.ListBySession(SessionId).Count);
+    }
+
+    [Fact]
     public void UnreadableMiddleChunkNeverCompressesItsHoleDuringRetry()
     {
         var builder = CreateBuilder(300);
