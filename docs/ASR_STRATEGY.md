@@ -435,6 +435,18 @@ process memory — is what a restart recovers the object's identity from. Cleanu
 same row: a terminal job attempts an idempotent `DeleteObject`, and a failed delete leaves
 `tos_cleanup_pending = 1` for a later `meetcap asr resume` to retry rather than failing the job.
 
+TOS SDK upload and signing errors are translated into the durable job error model:
+HTTP 401/403 errors are `tos.auth_failed` (terminal job failure with an
+operator-facing credential/permission hint), other unrecoverable 4xx become
+`tos.request_rejected`, and 408/429/5xx or network errors become
+`tos.transport_failed` (retry_wait). Because TOS staging precedes any ASR
+submit, its transient errors are marked as positive *no-submit* evidence.
+Only HTTP status, SDK code and TOS request ID are reported: neither raw SDK
+messages nor signed URLs are persisted. A failed job retains its imported
+recording and remains visible in the queue; the session stays PROCESSING by
+existing recoverability semantics rather than receiving a new terminal status.
+Cleanup errors of all classes remain recorded debt, never a failed transcript.
+
 The first implementation uses ordinary SDK upload, not multipart upload: the TOS .NET SDK
 supports stream upload and its simple-upload ceiling is well above the Seed-ASR file range.
 TOS credentials use the existing secret resolver and never enter request artifacts or logs.
