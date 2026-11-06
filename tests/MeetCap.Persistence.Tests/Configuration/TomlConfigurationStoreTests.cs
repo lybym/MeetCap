@@ -62,6 +62,34 @@ public class TomlConfigurationStoreTests
     }
 
     [Fact]
+    public void InlineHotwords_TomlArrayAndFilePath_RoundTripWithoutUnknownKeys()
+    {
+        var dir = NewDir();
+        try
+        {
+            var store = new TomlConfigurationStore(dir);
+            var config = ConfigurationDefaults.Default();
+            config.Asr.Volcengine.Hotwords = new[] { "海康大华|9", "结对子|6" };
+            config.Asr.Volcengine.HotwordsFile = Path.Combine(dir, "hotwords.txt");
+            var toml = store.ToToml(config);
+            Assert.Contains("hotwords = [", toml, StringComparison.Ordinal);
+            Assert.Contains("hotwords_file =", toml, StringComparison.Ordinal);
+
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(store.ConfigFilePath, toml);
+            var loaded = store.Load();
+            Assert.Null(loaded.LoadError);
+            Assert.Empty(loaded.UnknownKeys);
+            Assert.Equal(config.Asr.Volcengine.Hotwords, loaded.Configuration.Asr.Volcengine.Hotwords);
+            Assert.Equal(config.Asr.Volcengine.HotwordsFile, loaded.Configuration.Asr.Volcengine.HotwordsFile);
+        }
+        finally
+        {
+            Cleanup(dir);
+        }
+    }
+
+    [Fact]
     public void Load_MissingFile_ReturnsDefaultsAndLoadError()
     {
         var store = new TomlConfigurationStore(NewDir());

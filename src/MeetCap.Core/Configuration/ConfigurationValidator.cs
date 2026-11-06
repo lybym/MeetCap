@@ -205,6 +205,34 @@ public static class ConfigurationValidator
         }
 
         var volcengine = asr.Volcengine;
+        if (!string.IsNullOrWhiteSpace(volcengine.HotwordsFile)
+            && !Path.IsPathFullyQualified(volcengine.HotwordsFile))
+        {
+            result.AddError(
+                "asr.volcengine.hotwords_file must be an absolute path. " +
+                "Relative paths depend on the working directory of the CLI/background worker.");
+        }
+
+        if (volcengine.Hotwords is null)
+        {
+            result.AddError("asr.volcengine.hotwords must be an array (use [] when unset).");
+        }
+
+        // The 5,000-word cap is enforced on the merged distinct list (inline + file) when
+        // the provider is built: VolcengineHotwords.Resolve truncates to the first 5,000 by
+        // input order and records a warning in the sanitized request.json. The validator
+        // cannot count the merged list or the console table here, so it does not pre-judge
+        // the raw array length; the coexistence warning below covers the shared cap.
+
+        if (!string.IsNullOrWhiteSpace(volcengine.HotwordTableId)
+            && ((volcengine.Hotwords?.Length ?? 0) > 0 || !string.IsNullOrWhiteSpace(volcengine.HotwordsFile)))
+        {
+            result.AddWarning(
+                "asr.volcengine.hotword_table_id and inline hotwords are both configured. " +
+                "The provider enforces a combined 5000-word cap, but MeetCap cannot count " +
+                "the console table entries locally. Keep the total below the cap.");
+        }
+
         if (volcengine.CostPerHourCny < 0)
         {
             result.AddError(
