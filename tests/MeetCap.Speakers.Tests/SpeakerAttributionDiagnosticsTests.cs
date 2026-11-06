@@ -365,9 +365,8 @@ public class SpeakerAttributionDiagnosticsTests : IDisposable
         var result = await service.BuildAsync("ses_1", segments, ExtractorReturningSamples, CancellationToken.None);
 
         // raw_text is never modified (PRD section 2.3, DATA_MODEL.md section 7).
-        var attributedByLabel = result.AttributedSegments.ToDictionary(s => s.SpeakerLabel);
-        Assert.Equal(originalText, attributedByLabel["speaker_0"].RawText);
-        Assert.Equal("another", attributedByLabel["speaker_1"].RawText);
+        Assert.Equal(originalText, result.AttributedSegments.Single(s => s.SpeakerLabel == "speaker_0").RawText);
+        Assert.Equal("another", result.AttributedSegments.Single(s => s.SpeakerLabel == "speaker_1").RawText);
 
         // Every entry carries the diagnostics block.
         Assert.All(result.Artifact.Entries, e => Assert.NotNull(e.Diagnostics));
