@@ -55,6 +55,7 @@ built-in defaults
 [transcript]
 [logging]
 [retention]
+[watch]
 ```
 
 ## 4. Session mode
@@ -658,3 +659,96 @@ fall back to the current identity defaults. Remove `speakers.provider` and expli
 `[speakers.identity] provider = "sherpa_onnx_3dspeaker"` after confirming it is appropriate
 for the deployment. Move the two numeric values into `[speakers.identity]` as
 `match_threshold` and `match_margin`, respectively.
+
+## 14. Process-lifecycle auto-capture (`meetcap watch`)
+
+Issue #52 adds an opt-in daemon that starts a recording when a configured meeting-app
+**main process** launches and stops it when the whole watched cohort exits.
+
+> **This is process-lifecycle auto-capture, not meeting-state detection.** A watched app
+> (e.g. `WeMeetApp`, `CloudVideo`) may stay open outside a meeting, so process presence
+> only proves the process is running — never that a meeting is in progress. Enabling
+> `meetcap watch` can therefore record non-meeting audio. It is **off by default**; opt in
+> only when that trade-off is acceptable, and review recorded sessions before attributing
+> speakers or transcribing.
+
+```toml
+[watch]
+enabled = false
+processes = ["WeMeetApp", "CloudVideo"]   # main process names, no .exe
+poll_interval_seconds = 5
+capture_mode = "online"                    # reuses the existing dual-track semantics
+auto_asr = false                           # recording-only unless explicitly opted in
+exit_debounce_seconds = 10                 # absorb brief relaunch/helper churn
+title_template = "{app} {start:yyyy-MM-dd HH-mm-ss}"
+```
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `enabled` | `false` | Opt-in gate. `meetcap watch` refuses to run while `false`. |
+| `processes` | `["WeMeetApp", "CloudVideo"]` | Main process names to watch, without `.exe`. Helper/child processes (`CloudVideoNet`, `crashpad_handler`, `sdk_transcode_*`, `PageMonitorMgr`) are never configured here and therefore never trigger or extend a recording. A stray `.exe` suffix is stripped and warned about. |
+| `poll_interval_seconds` | `5` | How often the watcher polls `Process.GetProcessesByName`. Adds at most one interval of missed audio at the start, which the durable chunk timeline tolerates. |
+| `capture_mode` | `"online"` | `offline` or `online`; the session uses the same capture stack as `meetcap start --mode`. |
+| `auto_asr` | `false` | When `false`, no ASR host is built and **no provider network request is made** during watched recordings (local privacy, no billing). When `true`, each watched session runs live file-first transcription like `meetcap start`. |
+| `exit_debounce_seconds` | `10` | When every watched process is gone, wait this long before finalizing, so a brief relaunch or helper churn keeps one cohort/session alive instead of producing a gap. |
+| `title_template` | `"{app} {start:yyyy-MM-dd HH-mm-ss}"` | `{app}` = triggering process name; `{start:format}` = trigger observation time (local, .NET date format). |
+
+### State machine
+
+```text
+idle ──(any NEW watched main process launch)──> recording ──(ALL watched processes gone, after exit debounce)──> finalize
+```
+
+- **One active watched-process cohort = one session** spanning the union of overlapping
+  watched apps, not one session per app run.
+- **Start** fires on the first validated main-process observation that is a genuine new
+  launch (bounded by the poll interval). A process fingerprinted by **PID + start time**
+  that was already running when the watcher started does **not** trigger.
+- **On watcher restart, already-running processes do NOT trigger capture — only new
+  launches do.** A relaunch (new PID or new start time) is a new launch.
+- **Exit debounce** absorbs brief helper/relaunch churn; app exit and app crash are the
+  same signal (the process disappears from the poll).
+- While recording, new watched-process launches are noted but do not start a second
+  recording. A different watched app launching mid-session is part of the cohort and is
+  included when the "all gone" check runs.
+- The watcher owns the recording **in-process** (no spawned child). If the watcher dies,
+  the recorder dies with it and the existing crash-recovery scan handles the session —
+  the same guarantee as manual mode. On clean shutdown (Ctrl+C) the watcher performs a
+  **fail-safe stop** of any active recording.
+- The cross-process recording ownership guard (`meetcap start`/`meetcap stop`'s active
+  session) keeps `meetcap watch` from double-recording alongside a manual `start` or
+  another watcher; the watcher defers until that recording finishes.
+
+### Trigger metadata
+
+Each watched session carries a `watch.meta.json` sidecar in its session directory with the
+trigger provenance (process name, PID, start time, observation time) and, after
+finalization, the stop reason (`all_watched_processes_exited`, `watcher_stopped`, or
+`recording_crashed`). This is an additive artifact — no SQLite table or migration is
+added (issue #52 adds no persisted schema, only the sessions the watcher creates). The
+session's start/end timestamps represent **capture** time, not verified meeting time.
+
+### Local privacy and storage cost
+
+With `auto_asr = false` (the default), audio never leaves the machine during a watched
+recording. Watched sessions are written under the same `storage.data_root` as manual ones
+and are subject to the same retention policy; a long-lived idle app that is mistakenly
+watched can accumulate non-meeting audio, which is another reason the feature is opt-in
+and the process list should name only real meeting-app main processes.
+
+### Windows autostart recipe (opt-in, not installed automatically)
+
+`meetcap watch` is a foreground daemon and is **never** installed as a scheduled task or
+startup shortcut by MeetCap. To run it at login, do so explicitly, for example with a
+Scheduled Task that starts `meetcap watch` hidden at logon (configure `[watch] enabled =
+true` first):
+
+```powershell
+$action    = New-ScheduledTaskAction -Execute "meetcap" -Argument "watch"
+$trigger   = New-ScheduledTaskTrigger -AtLogOn
+$settings  = New-ScheduledTaskSettingsSet -Hidden -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName "MeetCap Watch" -Action $action -Trigger $trigger -Settings $settings
+```
+
+This is an operator decision: MeetCap does not register it, and removing the task is the
+operator's responsibility (`Unregister-ScheduledTask -TaskName "MeetCap Watch"`).

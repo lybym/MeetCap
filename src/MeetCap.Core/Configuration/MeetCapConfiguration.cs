@@ -31,4 +31,6 @@ public sealed class MeetCapConfiguration
     public LoggingSection Logging { get; set; } = new();
 
     public RetentionSection Retention { get; set; } = new();
+
+    public WatchSection Watch { get; set; } = new();
 }

@@ -106,3 +106,21 @@ session_log = true
 
 [retention]
 automatic_delete = false
+
+# Issue #52: process-lifecycle auto-capture (meetcap watch). Opt-in: a watched meeting
+# app may stay open outside a meeting, so process presence is NOT a verified in-meeting
+# signal. This records whenever a watched main process is running, which can capture
+# non-meeting audio. Disabled by default. One active watched-process cohort = one
+# session spanning the union of overlapping watched apps. auto_asr = false keeps
+# watched recordings entirely local (no provider request, no billing).
+[watch]
+enabled = false
+processes = ["WeMeetApp", "CloudVideo"]
+poll_interval_seconds = 5
+capture_mode = "online"
+auto_asr = false
+# When every watched process is gone, wait this long before finalizing so brief helper
+# churn or an app relaunch keeps one cohort/session alive instead of producing a gap.
+exit_debounce_seconds = 10
+# {app} = triggering process name; {start:format} = trigger time with a .NET date format.
+title_template = "{app} {start:yyyy-MM-dd HH-mm-ss}"
