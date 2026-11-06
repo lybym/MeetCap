@@ -856,6 +856,90 @@ Per-session artifact (`speakers/attribution.json`, `docs/ARCHITECTURE.md` sectio
 
 Possible source: `manual`, `voiceprint`, `owner_assumption`, `unknown`.
 
+### 10.1 Per-label diagnostics (issue #50)
+
+Each entry in `attribution.json` carries an **additive** `diagnostics` block, present for
+every label — resolved or not — so an operator can tell apart "genuinely not enrolled",
+"no clean speech range found", "audio unreadable for the sampled range", and "candidates
+existed but scored below the threshold". The pre-issue-#50 top-level fields
+(`speaker_label`, `speaker_id`, `speaker_name`, `confidence`, `source`, `locked`) are
+untouched; `diagnostics` is nullable, so an older `attribution.json` written without it
+still deserializes and existing consumers are unaffected.
+
+```json
+{
+  "speaker_label": "speaker_2",
+  "speaker_id": null,
+  "speaker_name": null,
+  "confidence": null,
+  "source": 3,
+  "locked": false,
+  "diagnostics": {
+    "resolution_reason": "below_threshold",
+    "ranges_considered": [ { "start_ms": 0, "end_ms": 8000 } ],
+    "sample_outcome": "extracted",
+    "candidates": [ { "speaker_name": "杨陆堂", "similarity": 0.5707 } ],
+    "threshold": 0.82,
+    "margin": 0.08,
+    "enrolled_speakers": 8,
+    "enrolled_embeddings": 24,
+    "provider_job": "job_01"
+  }
+}
+```
+
+`source` remains the `SpeakerAssignmentSource` enum serialized as its integer
+(`manual=0`, `voiceprint=1`, `owner_assumption=2`, `unknown=3`); this is unchanged.
+
+`resolution_reason` is an explicit string (one per label):
+
+```text
+registry_empty       no speakers are enrolled, so no candidate can exist
+no_clean_ranges      the label had speech, but no eligible clean sample range was found
+audio_unavailable    clean ranges were selected, but audio was unavailable for all of them
+provider_failed      the identity provider threw while extracting or identifying
+below_threshold      candidates existed, but the best score was below the threshold
+margin_too_small     the best candidate cleared the threshold but led the runner-up by less
+                     than the margin
+ambiguous_label      the label is reused across provider jobs/tracks (or lacks job
+                     provenance), so it is never voiceprint-scored (issue #45 invariant);
+                     it stays unknown unless a manual assignment covers it
+manual_locked        a manual assignment won and is locked against automatic rematching
+matched              a voiceprint candidate cleared both the threshold and the margin
+```
+
+`sample_outcome` describes what happened to the audio sample, distinct from the resolution
+reason: `extracted` (a sample was extracted and the provider returned ranked candidates),
+`no_ranges` (no clean range was selected — registry empty, no eligible speech, or no
+attempt made for a manual/ambiguous label), `no_audio` (ranges were selected but audio was
+unavailable for all of them), `provider_failed` (the provider failed while extracting or
+identifying).
+
+`candidates` holds the top-N (3) ranked identity candidates with their display name and
+similarity, for every label where the provider was scored — including a matched label. A
+colliding (`ambiguous_label`) or manually-locked label records no candidates, because the
+voiceprint provider was never handed a sample to score (issue #45 invariant). `threshold`
+and `margin` are the configured `match_threshold` / `match_margin` in effect at attribution
+time; `enrolled_speakers` and `enrolled_embeddings` are the registry size at attribution
+time. `provider_job` is the single provider job id the label is scoped to, when the label is
+unambiguous; it is null when the label spans multiple jobs or lacks job provenance.
+
+Speaker names plus ranked similarities and timestamps are **sensitive identity metadata**
+even though they are not credentials. The detailed candidates live only in this local
+artifact under the existing data-root permissions; they are not printed to ordinary logs by
+default. `meetcap speakers attribute --diagnostics` opts in to one summary line per
+unresolved label on stderr (the best similarity, threshold and reason — no candidate names);
+see `docs/CONFIGURATION.md` section 9.2.
+
+The previously-silent non-match paths now emit **one bounded per-label warning** (not one
+per failed sample attempt) through the existing `warnings` channel: a label with no eligible
+clean range names the label and the segment count; a label whose audio is unavailable for a
+sampled range names the source and the range. Provider failures keep their single
+per-label warning. Below-threshold and margin failures are normal non-matches surfaced only
+through the diagnostics artifact and the opt-in CLI summary. The match threshold is
+unchanged by this diagnostic-only PR; the diagnostics surface is what makes issue #49's
+calibration procedure usable.
+
 The `speaker_assignments` SQLite table (migration `0004_speakers`, section 14) stores the
 durable binding of each `(session_id, speaker_label)` to a person, so a manual assignment
 or a re-run of the voiceprint pipeline is idempotent (the `UNIQUE (session_id,

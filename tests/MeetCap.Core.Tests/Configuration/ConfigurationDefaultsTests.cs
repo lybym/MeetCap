@@ -90,6 +90,17 @@ public class ConfigurationDefaultsTests
     [Fact]
     public void Default_SpeakerIdentityContract()
     {
+        // Issue #49: the shipped 0.82 / 0.08 defaults are deliberately retained as an
+        // uncalibrated placeholder, NOT lowered to the measured 0.50 / 0.06 candidate.
+        // The 2026-11-05 field measurement (docs/ASR_STRATEGY.md section 10) showed
+        // same-speaker same-recording cosine is only ~0.656, so 0.82 over-filters and
+        // voiceprint attribution resolves nothing out of the box. The issue #49 review
+        // update (2026-11-06) gates the change behind issue #50 (candidate-score
+        // diagnostics) and held-out different-day calibration across multiple known
+        // speakers/impostors. Until that lands, 0.50/0.06 is an opt-in experiment profile
+        // only (docs/CONFIGURATION.md sections 9.2.1-9.2.2). These assertions lock the
+        // retained default so an accidental change is caught; the measured separation is
+        // documented separately in SpeakerThresholdCalibrationRegressionTests.
         var c = ConfigurationDefaults.Default();
 
         Assert.True(c.Asr.Volcengine.RequestSpeakerInfo);

@@ -57,7 +57,9 @@ public static class ConfigSchema
         // Cross-service authorization (speech_asr_prod -> TOS read): the optional role TRN
         // travels as audio.role_trn, and the presigned GET URL can be minted on the bucket's
         // internal endpoint so the provider-side fetch is billed as internal (free in
-        // cn-beijing/cn-shanghai) instead of public egress.
+        // cn-beijing/cn-shanghai) instead of public egress. The typed TosSection binding
+        // lands with the cross-service-auth feature; these schema keys keep the shipped
+        // example loadable without unknown-key warnings in the meantime (issue #59).
         "asr.tos.role_trn",
         "asr.tos.presign_endpoint",
         "speakers.enabled",

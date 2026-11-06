@@ -106,6 +106,11 @@ public sealed class SpeakerAttributionService
                     "A manual assignment applies to every segment with this label in the session.");
             }
 
+            // The identification attempt is captured for every label so the diagnostics
+            // block can record what the voiceprint path saw even when a manual lock later
+            // overrides it. Ambiguous labels are never scored (issue #45 invariant), and a
+            // manual-locked label is not attempted at all.
+            var attempt = IdentificationAttempt.Empty;
             SpeakerResolution resolution;
             if (manual is not null && (manual.Locked || manual.Source == SpeakerAssignmentSource.Manual))
             {
@@ -117,10 +122,12 @@ public sealed class SpeakerAttributionService
                 // Anonymous labels can be reused by independent ASR jobs. One session-wide
                 // identity would then name unrelated voices, so only an unambiguous label
                 // can reach the voiceprint provider.
-                IReadOnlyList<SpeakerCandidate> candidates = ambiguous ? [] : await IdentifySafelyAsync(
-                    label, labelSegments, sampleExtractor, enrolled, warnings, cancellationToken);
+                attempt = ambiguous
+                    ? IdentificationAttempt.Empty
+                    : await IdentifySafelyAsync(
+                        label, labelSegments, sampleExtractor, enrolled, warnings, cancellationToken);
 
-                resolution = SpeakerMatchingPolicy.Resolve(label, manual, candidates, _policy);
+                resolution = SpeakerMatchingPolicy.Resolve(label, manual, attempt.Candidates, _policy);
 
                 // Replace a prior automatic binding if a later job reuses its label.
                 // Manual assignments are written only by the assign command.
@@ -144,7 +151,11 @@ public sealed class SpeakerAttributionService
                 }
             }
 
-            entries.Add(resolution.ToEntry());
+            var reason = ComputeResolutionReason(ambiguous, enrolled, attempt, resolution, _policy);
+            var diagnostics = BuildDiagnostics(labelSegments, reason, attempt, _policy, enrolled);
+            EmitPerLabelSummary(warnings, label, labelSegments, reason, attempt);
+
+            entries.Add(resolution.ToEntry(diagnostics));
             resolutionByLabel[label] = resolution;
         }
 
@@ -199,7 +210,7 @@ public sealed class SpeakerAttributionService
         }
     }
 
-    private async Task<IReadOnlyList<SpeakerCandidate>> IdentifySafelyAsync(
+    private async Task<IdentificationAttempt> IdentifySafelyAsync(
         string label,
         IReadOnlyList<TranscriptSegment> labelSegments,
         SpeakerSampleExtractor sampleExtractor,
@@ -209,14 +220,20 @@ public sealed class SpeakerAttributionService
     {
         if (enrolled.Count == 0)
         {
-            return [];
+            // No enrolled speakers: no ranges are selected and no provider is called.
+            // The resolution reason distinguishes this (registry_empty) from a label that
+            // had speech but no eligible clean range (no_clean_ranges).
+            return IdentificationAttempt.Empty;
         }
 
         var ranges = CleanSampleSelector.Select(labelSegments, _sampleMinSeconds, _sampleMaxSeconds);
         if (ranges.Count == 0)
         {
-            return [];
+            return new IdentificationAttempt([], SpeakerSampleOutcome.NoRanges, [], NoAudioCount: 0, ProviderFailed: false);
         }
+
+        var noAudioCount = 0;
+        IReadOnlyList<SpeakerCandidate>? candidates = null;
 
         foreach (var range in ranges)
         {
@@ -229,28 +246,203 @@ public sealed class SpeakerAttributionService
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                warnings.Add($"audio sample extraction failed for {label} at {range.StartMs}-{range.EndMs}ms: {ex.Message}");
+                // An extraction failure is an audio-infrastructure failure, not a provider
+                // failure. It is folded into the single bounded per-label summary (issue #50
+                // review update) rather than warned per-attempt, and counted as unavailable
+                // audio so missing audio and lack of eligible speech stay distinct.
+                noAudioCount++;
                 continue;
             }
 
             if (sample is null)
             {
+                noAudioCount++;
                 continue;
             }
 
             try
             {
                 var probe = await _provider.ExtractAsync(sample, ct).ConfigureAwait(false);
-                return await _provider.IdentifyAsync(probe, enrolled, ct).ConfigureAwait(false);
+                candidates = await _provider.IdentifyAsync(probe, enrolled, ct).ConfigureAwait(false);
+                break;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 warnings.Add($"speaker identity provider failed for {label}: {ex.Message}");
-                return [];
+                return new IdentificationAttempt(
+                    ranges, SpeakerSampleOutcome.ProviderFailed, [], NoAudioCount: noAudioCount, ProviderFailed: true);
             }
         }
 
-        return [];
+        if (candidates is null)
+        {
+            // Every selected range was exhausted without a successful extraction and
+            // identification: audio was unavailable (null) or unreadable (threw) for all of them.
+            return new IdentificationAttempt(
+                ranges, SpeakerSampleOutcome.NoAudio, [], NoAudioCount: noAudioCount, ProviderFailed: false);
+        }
+
+        return new IdentificationAttempt(
+            ranges, SpeakerSampleOutcome.Extracted, candidates, NoAudioCount: noAudioCount, ProviderFailed: false);
+    }
+
+    /// <summary>
+    /// Determines the explicit <see cref="SpeakerResolutionReason"/> for one label from the
+    /// resolution outcome, the ambiguity flag, the registry, the identification attempt, and
+    /// the policy. This mirrors the decisions <see cref="SpeakerMatchingPolicy.Resolve"/>
+    /// already made, so it is read-only reasoning over the same inputs rather than a second
+    /// copy of the matching logic.
+    /// </summary>
+    private static SpeakerResolutionReason ComputeResolutionReason(
+        bool ambiguous,
+        IReadOnlyList<EnrolledSpeaker> enrolled,
+        IdentificationAttempt attempt,
+        SpeakerResolution resolution,
+        SpeakerMatchPolicy policy)
+    {
+        // Manual assignment always wins (whether or not the label is ambiguous).
+        if (resolution.Source == SpeakerAssignmentSource.Manual)
+        {
+            return SpeakerResolutionReason.ManualLocked;
+        }
+
+        // A colliding label is never voiceprint-scored (issue #45 invariant).
+        if (ambiguous)
+        {
+            return SpeakerResolutionReason.AmbiguousLabel;
+        }
+
+        if (resolution.Source == SpeakerAssignmentSource.Voiceprint)
+        {
+            return SpeakerResolutionReason.Matched;
+        }
+
+        // The label stayed unknown — classify why.
+        if (enrolled.Count == 0)
+        {
+            return SpeakerResolutionReason.RegistryEmpty;
+        }
+
+        if (attempt.SampleOutcome == SpeakerSampleOutcome.NoRanges)
+        {
+            return SpeakerResolutionReason.NoCleanRanges;
+        }
+
+        if (attempt.SampleOutcome == SpeakerSampleOutcome.NoAudio)
+        {
+            return SpeakerResolutionReason.AudioUnavailable;
+        }
+
+        if (attempt.ProviderFailed)
+        {
+            return SpeakerResolutionReason.ProviderFailed;
+        }
+
+        // Candidates existed but did not clear the policy. The policy accepts only when the
+        // best clears the threshold AND (it is the only candidate OR leads the runner-up by
+        // the margin), so a non-match with candidates is either below the threshold or a
+        // too-small margin.
+        if (attempt.Candidates.Count > 0)
+        {
+            return attempt.Candidates[0].Score < policy.Threshold
+                ? SpeakerResolutionReason.BelowThreshold
+                : SpeakerResolutionReason.MarginTooSmall;
+        }
+
+        // Defensive fallback: an unknown resolution with no candidates and no classified
+        // outcome is treated as having no clean range.
+        return SpeakerResolutionReason.NoCleanRanges;
+    }
+
+    /// <summary>Builds the additive per-label diagnostics block (issue #50).</summary>
+    private static SpeakerLabelDiagnostics BuildDiagnostics(
+        IReadOnlyList<TranscriptSegment> labelSegments,
+        SpeakerResolutionReason reason,
+        IdentificationAttempt attempt,
+        SpeakerMatchPolicy policy,
+        IReadOnlyList<EnrolledSpeaker> enrolled)
+    {
+        // Provider-job provenance: the single job id when the label is unambiguous, null
+        // when it spans multiple jobs or lacks provenance (issue #50 review update point 3).
+        var distinctJobs = labelSegments
+            .Select(s => s.ProviderJobId)
+            .Where(j => !string.IsNullOrWhiteSpace(j))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        var providerJob = distinctJobs.Count == 1 ? distinctJobs[0] : null;
+
+        // Top-N candidates with similarities. Speaker names plus ranked similarities are
+        // sensitive identity metadata kept in the local artifact; CLI printing is opt-in.
+        const int maxCandidates = 3;
+        var candidates = attempt.Candidates
+            .Take(maxCandidates)
+            .Select(c => new DiagnosticCandidate { SpeakerName = c.DisplayName, Similarity = c.Score })
+            .ToList();
+
+        var ranges = attempt.RangesConsidered
+            .Select(r => new DiagnosticSampleRange { StartMs = r.StartMs, EndMs = r.EndMs })
+            .ToList();
+
+        return new SpeakerLabelDiagnostics
+        {
+            ResolutionReason = SpeakerResolutionReasons.ToWire(reason),
+            RangesConsidered = ranges,
+            SampleOutcome = SpeakerSampleOutcomes.ToWire(attempt.SampleOutcome),
+            Candidates = candidates,
+            Threshold = policy.Threshold,
+            Margin = policy.Margin,
+            EnrolledSpeakers = enrolled.Count,
+            EnrolledEmbeddings = enrolled.Sum(e => e.Embeddings.Count),
+            ProviderJob = providerJob,
+        };
+    }
+
+    /// <summary>
+    /// Emits one bounded per-label summary warning (issue #50 review update: one per label,
+    /// not per failed sample attempt) for the non-match paths that were previously silent.
+    /// Provider failures are already warned inside <see cref="IdentifySafelyAsync"/> (which
+    /// holds the exception message), and ambiguous labels are already warned in
+    /// <see cref="BuildAsync"/>; below-threshold and margin failures are normal non-matches
+    /// surfaced only through the diagnostics artifact and the opt-in CLI summary.
+    /// </summary>
+    private static void EmitPerLabelSummary(
+        List<string> warnings,
+        string label,
+        IReadOnlyList<TranscriptSegment> labelSegments,
+        SpeakerResolutionReason reason,
+        IdentificationAttempt attempt)
+    {
+        switch (reason)
+        {
+            case SpeakerResolutionReason.RegistryEmpty:
+                warnings.Add(
+                    $"speaker attribution: label {label} left unknown — speaker registry is empty");
+                break;
+
+            case SpeakerResolutionReason.NoCleanRanges:
+                warnings.Add(
+                    $"speaker attribution: label {label} left unknown — no eligible clean speech range found across {labelSegments.Count} segment(s)");
+                break;
+
+            case SpeakerResolutionReason.AudioUnavailable:
+                {
+                    var sources = labelSegments.Select(s => s.Source)
+                        .Distinct(StringComparer.Ordinal).ToList();
+                    var sourceText = sources.Count == 1 ? sources[0] : "mixed";
+                    var firstRange = attempt.RangesConsidered.FirstOrDefault();
+                    var rangeText = firstRange is not null
+                        ? $" (first range {firstRange.StartMs}-{firstRange.EndMs}ms)"
+                        : string.Empty;
+                    warnings.Add(
+                        $"speaker attribution: label {label} left unknown — audio unavailable for " +
+                        $"{attempt.NoAudioCount} of {attempt.RangesConsidered.Count} sampled range(s) " +
+                        $"on source '{sourceText}'{rangeText}");
+                }
+                break;
+
+            // provider_failed, ambiguous_label: already warned elsewhere.
+            // below_threshold, margin_too_small, manual_locked, matched: no summary warning.
+        }
     }
 
     private SpeakerAssignment? PersistAutomaticAssignment(
@@ -281,6 +473,27 @@ public sealed class SpeakerAttributionService
             warnings.Add($"speaker assignment could not be persisted for {resolution.SpeakerLabel}: {ex.Message}");
             return null;
         }
+    }
+
+    /// <summary>
+    /// The captured result of attempting voiceprint identification for one label
+    /// (issue #50). Carries the ranges the selector produced, the sample outcome, the
+    /// ranked candidates (when the provider scored), how many ranges had no usable
+    /// audio, and whether the provider failed — everything the diagnostics block needs.
+    /// </summary>
+    private sealed record IdentificationAttempt(
+        IReadOnlyList<SpeakerSampleRange> RangesConsidered,
+        SpeakerSampleOutcome SampleOutcome,
+        IReadOnlyList<SpeakerCandidate> Candidates,
+        int NoAudioCount,
+        bool ProviderFailed)
+    {
+        /// <summary>
+        /// The attempt for a label that was not scored: no ranges selected, no candidates,
+        /// no audio failure, no provider failure. Used for manual-locked and ambiguous labels.
+        /// </summary>
+        public static IdentificationAttempt Empty { get; } = new(
+            [], SpeakerSampleOutcome.NoRanges, [], NoAudioCount: 0, ProviderFailed: false);
     }
 }
 
