@@ -455,16 +455,32 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
     /// <summary>
     /// The official Standard HTTP <c>request</c> object (Seed-ASR 2.0 recording-file).
     /// </summary>
-    private static JsonObject BuildProviderRequest(bool requestSpeakerInfo) => new()
+    private JsonObject BuildProviderRequest(bool requestSpeakerInfo)
     {
-        ["model_name"] = VolcengineAsrOptions.ModelName,
-        ["enable_itn"] = true,
-        ["enable_punc"] = true,
-        ["enable_ddc"] = true,
-        ["show_utterances"] = true,
-        // Anonymous speaker labels, requested per docs/ASR_STRATEGY.md section 10.
-        ["enable_speaker_info"] = requestSpeakerInfo,
-    };
+        var providerRequest = new JsonObject
+        {
+            ["model_name"] = VolcengineAsrOptions.ModelName,
+            ["enable_itn"] = true,
+            ["enable_punc"] = true,
+            ["enable_ddc"] = true,
+            ["show_utterances"] = true,
+            // Anonymous speaker labels, requested per docs/ASR_STRATEGY.md section 10.
+            ["enable_speaker_info"] = requestSpeakerInfo,
+        };
+
+        // The console hotword table belongs inside request.corpus, not at the top level.
+        // Use the same builder for the wire request and sanitized request.json metadata.
+        // When unset, keep the existing request shape with no corpus object at all.
+        if (!string.IsNullOrWhiteSpace(_options.HotwordTableId))
+        {
+            providerRequest["corpus"] = new JsonObject
+            {
+                ["boosting_table_id"] = _options.HotwordTableId,
+            };
+        }
+
+        return providerRequest;
+    }
 
     /// <summary>
     /// The request metadata persisted as <c>request.json</c>.
