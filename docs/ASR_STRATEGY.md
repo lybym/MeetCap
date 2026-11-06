@@ -314,6 +314,22 @@ Manual speaker assignment always wins over automatic inference.
 
 Hotword configuration must be possible without code changes. Raw ASR responses remain immutable.
 
+The configured `asr.volcengine.hotword_table_id` is the ID of a table already created
+in Volcengine's self-learning console. For a non-empty ID, MeetCap sends
+`request.corpus.boosting_table_id` on **each** file-ASR submission; an empty ID
+omits `corpus` entirely. The exact table ID also appears in the sanitized
+`asr/jobs/<job>/request.json` metadata (the API key and signed TOS URL do not).
+
+Seed-ASR 2.0 currently supports one boosting table per request. Console tables
+support up to 5,000 hotwords; individual words are limited to 10 characters;
+weights use the console's `word|N` syntax for N in 1–10. Enter digit words
+as Chinese character forms when preparing the table, per provider guidance.
+Provider acceptance of a real table must be tested with actual credentials;
+contract tests alone establish request shape, not a measurable recognition gain.
+
+Official references: [Standard HTTP task submission](https://docs.volcengine.com/docs/doubao-voice/task-submission-http-1?lang=zh)
+and [hotword self-learning console](https://docs.volcengine.com/docs/doubao-voice/hot-words?lang=zh).
+
 ## 12. Import behavior
 
 Imported media should prefer one provider file request when within provider limits. If splitting is required, preserve original timestamps and split mapping.
