@@ -187,6 +187,8 @@ whoops = true
             Assert.Empty(reloaded.UnknownKeys);
 
             Assert.Equal("sherpa_onnx_3dspeaker", reloaded.Configuration.Speakers.Identity.Provider);
+            // Issue #49: 0.82/0.08 round-trips as the retained uncalibrated placeholder default
+            // (not lowered to the 0.50/0.06 opt-in experiment profile pending issue #50).
             Assert.Equal(0.82, reloaded.Configuration.Speakers.Identity.MatchThreshold);
             Assert.Equal(0.08, reloaded.Configuration.Speakers.Identity.MatchMargin);
             Assert.Equal(5, reloaded.Configuration.Speakers.Identity.SampleMinSeconds);

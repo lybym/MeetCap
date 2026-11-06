@@ -452,6 +452,18 @@ using calibration only, then accepted 10/12 known test clips and falsely accepte
 unknown test clips. It is an evaluation profile for the tested base model, not a product
 default; see `SPEAKER_CALIBRATION.md` for selection, sample limits and evidence.
 
+The 2026-11-05 real-meeting deployment (issue #49) confirmed the 0.82 default is
+unattainable on meeting audio: even a person enrolled from a span of the *same* recording
+scored only ≈ 0.656 cosine against that person's embedding, so 0.82 sits above the
+same-speaker cosine this pipeline produces and voiceprint attribution resolves nothing out
+of the box. Per the issue #49 review update (2026-11-06) the default is **not** lowered to
+the measured 0.50/0.06 candidate yet: that value is published only as an opt-in experiment
+profile pending issue #50 (candidate-score diagnostics) and held-out different-day
+calibration across multiple known speakers and impostors. The measured same/different
+separation and the over-filter rationale are recorded in `docs/ASR_STRATEGY.md` section 10;
+the calibration procedure and margin interaction are documented in sections 9.2.1 and 9.2.2
+below.
+
 `speakers attribute` reads imported audio through the durable `session.json` source mapping,
 preferring the normalized artifact. Live samples are read from the transcript's source track.
 Only the requested WAV frames are loaded. A label occurring on multiple tracks or in separate
@@ -461,6 +473,65 @@ assignment schema cannot represent distinct people sharing that label. Manual as
 applies to every segment with that label in the session and remains locked.
 Embedding model name, version and dimension must match; equal dimensions alone do not imply
 compatibility. The actual dimension comes from the loaded model, not a hard-coded size.
+
+### 9.2.1 Calibration procedure
+
+The shipped `match_threshold = 0.82` is an uncalibrated placeholder, not a value proven on
+real meeting recordings (issue #49). It must be replaced by a value chosen from measured
+same/different-person score distributions, never by a single meeting's anecdote. The
+procedure:
+
+1. **Enroll** ≥ 3 clean 5–15 s spans per person from one meeting, one person at a time,
+   using the documented `sample_min_seconds` / `sample_max_seconds` window. Enrollments
+   are 16 kHz mono PCM16 WAV through the same runtime and model the deployment will match
+   against.
+2. **Attribute a known next-day recording.** Run `meetcap speakers attribute` on a
+   *separate, different-day* recording whose speakers are known, so same-speaker probes are
+   genuinely cross-recording (the distribution real attribution sees), not same-span.
+3. **Read back the candidate scores.** For each anonymous label, inspect the ranked
+   candidate scores against the enrolled gallery to see where same-person and
+   different-person scores actually sit. Position `match_threshold` inside the gap between
+   the *lowest* same-person score and the *highest* different-person score, and set
+   `match_margin` to a fraction of that gap so a close runner-up is rejected rather than
+   silently named.
+4. **Repeat across conditions.** Run the held-out attribution across multiple known
+   speakers **and** multiple known impostors, on different days, microphones and noise
+   conditions. Record the false-match and missed-match counts at several threshold+margin
+   pairs, and choose a conservative value with documented confidence limits — an overly
+   lenient default silently assigns wrong personal identities, which is more harmful than
+   leaving a label unknown.
+
+**Prerequisite — candidate-score diagnostics (issue #50).** Step 3 requires the per-label
+candidate scores and outcome reasons to be exposed by the attribution path. That surface is
+tracked by issue #50 and is **not** yet shipped, so until #50 lands the read-back step
+cannot be reproduced from `speakers attribute` output alone; calibration in the meantime
+relies on local probe/embedding dumps (see `docs/SPEAKER_CALIBRATION.md`). The shipped
+default is therefore held at `0.82 / 0.08` until #50 lands and the held-out different-day
+calibration above is documented. Per the issue #49 review update (2026-11-06), `0.50 / 0.06`
+is published only as an explicitly opt-in experiment profile, not as a new default or an
+unqualified recommendation.
+
+### 9.2.2 Margin interaction
+
+`match_threshold` and `match_margin` gate two different failure modes and are meant to be
+set together:
+
+- `match_threshold` gates **absolute** confidence: the best candidate's cosine must reach
+  it at all. Below it, the label stays unknown even with no runner-up.
+- `match_margin` gates **relative** confidence: unless the best candidate is the *only*
+  candidate, it must lead the runner-up by at least the margin. This is what keeps a close
+  second place from being silently named when two enrolled people sound similar.
+- A single candidate needs no margin (there is nothing to confuse it with), so a lone
+  above-threshold match is accepted.
+
+On real cross-recording data the same/different gap is thin (same-speaker ≈ 0.55–0.66,
+different-person ≤ 0.38 for the bundled ERes2Net model; see `docs/ASR_STRATEGY.md`
+section 10 and `docs/SPEAKER_CALIBRATION.md`). A thin gap argues for a *meaningful* margin
+even once the threshold is lowered: without it, two enrolled people whose embeddings drift
+into the same band would each be named on alternate runs. Lowering only the threshold and
+leaving the margin near zero trades missed matches for ambiguous ones.
+
+Low-confidence matches remain unknown.
 
 Validation rules:
 
