@@ -99,7 +99,7 @@ public class WatchRecorderTests : IDisposable
         // Cross-process ownership: while one session holds the recording surface, a second
         // TryStart returns null instead of publishing a concurrent recording.
         var service = NewService();
-        var recorder = new WatchRecorder(service, asrHost: null, new MeetCapConfiguration(), _dataRoot, NullLogger.Instance);
+        var recorder = new WatchRecorder(service, asrHost: null, new MeetCapConfiguration(), _dataRoot, TestNullLogger.Instance);
 
         var first = recorder.TryStart("first", Trigger());
         Assert.NotNull(first);
@@ -118,7 +118,7 @@ public class WatchRecorderTests : IDisposable
     public async Task TryStart_SucceedsAgainAfterPreviousSessionFinalizes()
     {
         var service = NewService();
-        var recorder = new WatchRecorder(service, asrHost: null, new MeetCapConfiguration(), _dataRoot, NullLogger.Instance);
+        var recorder = new WatchRecorder(service, asrHost: null, new MeetCapConfiguration(), _dataRoot, TestNullLogger.Instance);
 
         var first = recorder.TryStart("first", Trigger());
         Assert.NotNull(first);
