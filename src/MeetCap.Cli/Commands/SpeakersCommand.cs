@@ -208,6 +208,7 @@ internal static class SpeakersCommand
     public static async Task<int> AttributeAsync(
         CliContext context,
         string sessionId,
+        bool diagnostics,
         CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(sessionId))
@@ -326,7 +327,59 @@ internal static class SpeakersCommand
             context.Error.WriteLine($"warning: {warning}");
         }
 
+        // Opt-in per-label diagnostics summary (issue #50). Candidate scores and names are
+        // sensitive identity metadata, so this is off by default and written to stderr (the
+        // diagnostics stream) rather than stdout (which may be redirected to ordinary logs).
+        // The full candidate detail always lives in the local attribution.json artifact.
+        if (diagnostics)
+        {
+            WriteDiagnosticsSummary(context.Error, result.Artifact);
+        }
+
         return 0;
+    }
+
+    /// <summary>
+    /// Writes the opt-in per-label diagnostics summary (issue #50). One line per
+    /// unresolved label, to the given writer (stderr in production). Candidate names are
+    /// intentionally omitted from this line: the best similarity, threshold and reason are
+    /// enough to answer "why unknown" and to feed calibration (#49), while the named
+    /// candidate detail stays in the local <c>attribution.json</c> artifact. Extracted so
+    /// the opt-in rendering is testable without a full session.
+    /// </summary>
+    internal static void WriteDiagnosticsSummary(TextWriter writer, SpeakerAttributionArtifact artifact)
+    {
+        ArgumentNullException.ThrowIfNull(writer);
+        ArgumentNullException.ThrowIfNull(artifact);
+
+        writer.WriteLine("attribution diagnostics:");
+        foreach (var entry in artifact.Entries)
+        {
+            // Only labels that did not resolve to a person get a summary line.
+            if (entry.SpeakerId is not null)
+            {
+                continue;
+            }
+
+            var d = entry.Diagnostics;
+            if (d is null)
+            {
+                continue;
+            }
+
+            if (d.Candidates.Count > 0)
+            {
+                writer.WriteLine(
+                    $"  {entry.SpeakerLabel}: best {d.Candidates[0].Similarity:F3} " +
+                    $"(threshold {d.Threshold:F2}, reason: {d.ResolutionReason})");
+            }
+            else
+            {
+                writer.WriteLine(
+                    $"  {entry.SpeakerLabel}: no candidates " +
+                    $"(threshold {d.Threshold:F2}, reason: {d.ResolutionReason})");
+            }
+        }
     }
 
     // --- minimal WAV reader ---

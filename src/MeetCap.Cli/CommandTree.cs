@@ -311,16 +311,23 @@ internal static class CommandTree
             Description = "The session to attribute speakers for.",
         };
 
+        var attrDiagnostics = new Option<bool>("--diagnostics")
+        {
+            Description = "Print a per-label attribution diagnostics summary to stderr (candidate scores are sensitive identity metadata; off by default).",
+        };
+
         var attribute = new Command(
             "attribute",
             "Run the speaker attribution pipeline and write final.jsonl, final.md, and attribution.json.");
         attribute.Options.Add(attrSession);
+        attribute.Options.Add(attrDiagnostics);
         attribute.SetAction((parseResult, cancellationToken) =>
         {
             var context = CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory, asrHttpHandler);
             return SpeakersCommand.AttributeAsync(
                 context,
                 parseResult.GetValue(attrSession) ?? string.Empty,
+                parseResult.GetValue(attrDiagnostics),
                 cancellationToken);
         });
 
