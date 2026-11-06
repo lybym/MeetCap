@@ -65,7 +65,7 @@ public class WatchRecorderTests : IDisposable
     [Fact]
     public async Task TryStart_PublishesSessionAndWritesTriggerMetadata()
     {
-        var recorder = new WatchRecorder(NewService(), asrHost: null, new MeetCapConfiguration(), _dataRoot, NullLogger.Instance);
+        var recorder = new WatchRecorder(NewService(), asrHost: null, new MeetCapConfiguration(), _dataRoot, TestNullLogger.Instance);
 
         var handle = recorder.TryStart("CloudVideo 2026-11-07 09-00-00", Trigger());
 
@@ -142,7 +142,7 @@ public class WatchRecorderTests : IDisposable
         // With auto_asr = false the recorder is constructed with a null ASR host, so there
         // is no provider adapter and no network request can be made. This asserts the
         // recording still starts and finalizes through the capture stack alone.
-        var recorder = new WatchRecorder(NewService(), asrHost: null, new MeetCapConfiguration(), _dataRoot, NullLogger.Instance);
+        var recorder = new WatchRecorder(NewService(), asrHost: null, new MeetCapConfiguration(), _dataRoot, TestNullLogger.Instance);
 
         var handle = recorder.TryStart("recording-only", Trigger());
         Assert.NotNull(handle);
@@ -166,5 +166,33 @@ public class WatchRecorderTests : IDisposable
         }
 
         return await handle.Completion;
+    }
+
+    /// <summary>
+    /// A no-op <see cref="ILogger"/> for recorder tests. Defined locally because the
+    /// framework <c>NullLogger</c> is not in scope in this test project.
+    /// </summary>
+    private sealed class TestNullLogger : ILogger
+    {
+        public static readonly TestNullLogger Instance = new();
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => NullScope.Instance;
+
+        public bool IsEnabled(LogLevel logLevel) => false;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+        }
+
+        private sealed class NullScope : IDisposable
+        {
+            public static readonly NullScope Instance = new();
+            public void Dispose() { }
+        }
     }
 }

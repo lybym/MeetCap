@@ -108,7 +108,7 @@ public class MeetingWatcherTests
         // WeMeet exits but CloudVideo still running -> cohort alive, no finalize.
         probe.Set(cloudVideo);
         await watcher.StepAsync();
-        Assert.Equal(0, observer.Finalized.Count);
+        Assert.Empty(observer.Finalized);
         Assert.True(watcher.IsRecording);
 
         // CloudVideo exits -> debounce -> finalize. Exactly one session spanned the union.
@@ -157,7 +157,7 @@ public class MeetingWatcherTests
         probe.Set();
         await watcher.StepAsync();
         Assert.True(watcher.IsRecording);
-        Assert.Equal(0, observer.Finalized.Count);
+        Assert.Empty(observer.Finalized);
 
         // Within the debounce window, the app relaunches (new pid+start): cohort stays
         // alive, one session continues, no gap, no second session.
