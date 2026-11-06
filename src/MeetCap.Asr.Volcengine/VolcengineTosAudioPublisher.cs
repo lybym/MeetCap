@@ -144,9 +144,11 @@ public sealed class VolcengineTosAudioPublisher : IAsrAudioPublisher
         }
 
         var key = BuildObjectKey(request.JobId, DateTime.UtcNow);
+        ITosClient? client = null;
+        var uploaded = false;
         try
         {
-            var client = CreateClient(_options);
+            client = CreateClient(_options);
             await Task.Run(
                 () =>
                 {
@@ -169,6 +171,11 @@ public sealed class VolcengineTosAudioPublisher : IAsrAudioPublisher
                     });
                 },
                 cancellationToken).ConfigureAwait(false);
+
+            // The object now exists in the bucket. If a later step (presigning) fails, the
+            // caller never receives the transport identity, so no job row can record cleanup
+            // debt for it: ReleaseIfUploaded reclaims it best-effort before the error is thrown.
+            uploaded = true;
 
             // The presigned GET URL is minted on its own endpoint when one is configured
             // (asr.tos.presign_endpoint): PreSignedURL is a purely local signing operation,
@@ -203,10 +210,12 @@ public sealed class VolcengineTosAudioPublisher : IAsrAudioPublisher
         }
         catch (TosServerException ex)
         {
+            ReleaseIfUploaded(client, _options.Bucket, key, uploaded);
             throw ClassifyPublishFailure(ex);
         }
         catch (Exception ex) when (ex is IOException or TosClientException)
         {
+            ReleaseIfUploaded(client, _options.Bucket, key, uploaded);
             // TOS staging happens before any provider submit. No ASR task could have been
             // accepted; durable retries may safely try this job again.
             throw new AsrTransientException(
@@ -296,6 +305,42 @@ public sealed class VolcengineTosAudioPublisher : IAsrAudioPublisher
             "tos.request_rejected",
             $"{detail} TOS rejected the upload or presigned URL request. Verify [asr.tos] " +
             "bucket, region, endpoint and account policy.", error);
+    }
+
+    /// <summary>
+    /// Releases a staged object when a step after <see cref="ITosClient.PutObject"/> failed.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// On the signing-failure path the caller of <see cref="PublishAsync"/> never receives the
+    /// <see cref="AsrPublishedAudio"/> transport identity, so no job row can record cleanup debt
+    /// for the object that was just uploaded. Releasing it here, best-effort, is what prevents a
+    /// successful upload followed by a failed presign from leaving an unreferenced private object
+    /// that only the 3-day TOS lifecycle rule would eventually reclaim.
+    /// </para>
+    /// <para>
+    /// A delete that itself fails is swallowed: the object is private and under that lifecycle
+    /// rule, and a cleanup failure here must never turn a classified publish error into a
+    /// different exception or mask the original cause (<c>docs/ASR_STRATEGY.md</c>).
+    /// </para>
+    /// </remarks>
+    private static void ReleaseIfUploaded(ITosClient? client, string bucket, string key, bool uploaded)
+    {
+        if (!uploaded || client is null)
+        {
+            return;
+        }
+
+        try
+        {
+            client.DeleteObject(new DeleteObjectInput { Bucket = bucket, Key = key });
+        }
+        catch (Exception)
+        {
+            // The 3-day TOS object lifecycle is the backstop. A failed best-effort delete is
+            // neither a transcript failure nor a job failure, and must not mask the original
+            // classified publish error that is about to be thrown.
+        }
     }
 
     /// <summary>

@@ -84,6 +84,23 @@ public class VolcengineAsrProviderTests : IDisposable
             // not care about the transport boundary wants.
             signedUrl is null ? null : new FakePublisher(TosAudio(signedUrl)));
 
+    /// <summary>
+    /// Builds a provider whose audio publisher is an arbitrary test stub, for asserting how a
+    /// publish-stage failure propagates through the provider's own try/catch.
+    /// </summary>
+    private static VolcengineAsrProvider CreateWithPublisher(IAsrAudioPublisher publisher) =>
+        new(
+            new VolcengineAsrOptions
+            {
+                ApiKey = ApiKey,
+                BaseUrl = "https://asr.invalid/api/v3/auc/bigmodel",
+                MaxTransientAttempts = 3,
+                InitialBackoff = TimeSpan.FromMilliseconds(1),
+                HttpTimeout = TimeSpan.FromSeconds(5),
+            },
+            new StubHttpHandler(),
+            publisher);
+
     private static AsrPublishedAudio TosAudio(string signedUrl) => new()
     {
         Transport = AsrTransports.Tos,
@@ -427,6 +444,22 @@ public class VolcengineAsrProviderTests : IDisposable
             OnDelete?.Invoke(published);
             return Task.CompletedTask;
         }
+    }
+
+    /// <summary>
+    /// A publisher stub that faults <see cref="PublishAsync"/> with a fixed exception, so a test
+    /// can assert how a publish-stage failure propagates through the provider without reaching TOS
+    /// or the provider's HTTP boundary.
+    /// </summary>
+    private sealed class ThrowingPublisher(Exception publishError) : IAsrAudioPublisher
+    {
+        public Task<AsrPublishedAudio> PublishAsync(
+            AsrFileRequest request,
+            CancellationToken cancellationToken = default)
+            => Task.FromException<AsrPublishedAudio>(publishError);
+
+        public Task DeleteAsync(AsrPublishedAudio published, CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
     }
 
     [Fact]
@@ -793,6 +826,50 @@ public class VolcengineAsrProviderTests : IDisposable
 
         Assert.Equal("audio.missing", ex.Code);
         Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
+    public async Task Submit_TerminalTosAuthFailure_PropagatesUnwrappedToTheJobProcessor()
+    {
+        // Issue #51: a terminal TOS SDK error (403 SignatureDoesNotMatch) is translated by the
+        // publisher into AsrPermanentException("tos.auth_failed"). The provider's publish wrapper
+        // catches only AsrTransientException and IOException/UnauthorizedAccessException, so the
+        // permanent failure must reach AsrJobProcessor's terminal handling unchanged rather than
+        // being swallowed, re-wrapped, or escaped as an unhandled exception. No HTTP request is
+        // reached because staging fails before the provider submits.
+        var publisher = new ThrowingPublisher(new AsrPermanentException(
+            "tos.auth_failed",
+            "TOS HTTP 403, code=SignatureDoesNotMatch, request_id=tos-req-1. " +
+            "Check [asr.tos] access_key/secret_key."));
+        using var provider = CreateWithPublisher(publisher);
+
+        var ex = await Assert.ThrowsAsync<AsrPermanentException>(
+            () => provider.SubmitFileAsync(Request(WriteAudio())));
+
+        // The original classification survives the provider boundary: same code, same message.
+        Assert.Equal("tos.auth_failed", ex.Code);
+        Assert.Contains("[asr.tos]", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("tos-req-1", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Submit_TransportFailureFromPublishing_IsReWrappedAsNoSubmitTransient()
+    {
+        // The complementary path: a transient publish failure is caught by the provider and
+        // re-thrown as a no-submit transient (requestNotSent), so it lands in the durable
+        // retry budget rather than escaping. The provider scrubs the message on the way out.
+        var publisher = new ThrowingPublisher(new AsrTransientException(
+            "tos.transport_failed",
+            $"TOS upload failed for meetcap-asr/key; configured with key {ApiKey}."));
+        using var provider = CreateWithPublisher(publisher);
+
+        var ex = await Assert.ThrowsAsync<AsrTransientException>(
+            () => provider.SubmitFileAsync(Request(WriteAudio())));
+
+        Assert.Equal("tos.transport_failed", ex.Code);
+        Assert.True(ex.RequestNotSent);
+        // The API key must not survive the provider's scrub on the no-submit transient path.
+        Assert.DoesNotContain(ApiKey, ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]

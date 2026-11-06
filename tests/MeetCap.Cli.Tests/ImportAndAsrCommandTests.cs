@@ -293,6 +293,113 @@ public class ImportAndAsrCommandTests
         Assert.Contains("No ASR jobs need work", result.Output);
     }
 
+    [Fact]
+    public void Status_SurfacesAFailedTosAuthImportSoASubsequentCommandCanSeeIt()
+    {
+        // Issue #51 CLI gate: a terminal TOS auth failure (403 SignatureDoesNotMatch) must not
+        // leave an untracked orphan session. The session stays PROCESSING by existing
+        // recoverability semantics (the audio is intact and a fresh job can retry), the job is
+        // terminal failed with the classified tos.auth_failed code, and the failure is recorded
+        // in events.jsonl. A subsequent `meetcap status` must surface both the failed job and the
+        // degraded state rather than reporting a clean queue — which is what an orphan looks like
+        // to an operator. No "Unhandled exception" is produced because the failure is durable
+        // state, not an escaping exception.
+        using var harness = CliHarness.Create();
+        harness.WriteConfig(ValidProviderConfig);
+        const string sessionId = "ses_auth_1";
+        const string jobId = "job_auth_1";
+        SeedFailedTosImport(harness, sessionId, jobId);
+
+        var result = harness.Run("--data-root", harness.DataRoot, "status");
+
+        // status describes state and always exits 0; the point is what it reports.
+        Assert.Equal(0, result.ExitCode);
+        Assert.DoesNotContain("Unhandled exception", result.Error, StringComparison.Ordinal);
+
+        // The durable failed job is visible in the queue summary and the per-session line.
+        Assert.Contains("1 failed", result.Output, StringComparison.Ordinal);
+        Assert.Contains("behind", result.Output, StringComparison.Ordinal);
+        Assert.Contains(sessionId, result.Output, StringComparison.Ordinal);
+
+        // The classified failure is also durable in the session's own event log, so an operator
+        // (or `meetcap asr resume`) can find the actionable cause without a SQLite query.
+        var events = File.ReadAllText(Path.Combine(
+            harness.DataRoot, "sessions", sessionId, "events.jsonl"));
+        Assert.Contains("asr.job.failed", events, StringComparison.Ordinal);
+        Assert.Contains("tos.auth_failed", events, StringComparison.Ordinal);
+        Assert.Contains("[asr.tos]", events, StringComparison.Ordinal);
+
+        // The imported audio was retained: the session directory and its recording still exist.
+        Assert.True(File.Exists(Path.Combine(
+            harness.DataRoot, "sessions", sessionId, "audio", "import", "meeting.wav")));
+    }
+
+    /// <summary>
+    /// Seeds the durable state a terminal TOS auth failure during import leaves behind: a
+    /// PROCESSING session whose ASR job failed with the classified <c>tos.auth_failed</c> code,
+    /// the actionable error recorded in <c>events.jsonl</c>, and the imported audio retained.
+    /// </summary>
+    private static void SeedFailedTosImport(CliHarness harness, string sessionId, string jobId)
+    {
+        var db = Path.Combine(harness.DataRoot, "meetcap.db");
+        new MeetCap.Persistence.Storage.MeetCapDatabase(db).EnsureMigrated();
+
+        const string errorMessage =
+            "TOS HTTP 403, code=SignatureDoesNotMatch, request_id=tos-req-1. " +
+            "Check [asr.tos] access_key/secret_key, bucket permissions and region/endpoint; " +
+            "SignatureDoesNotMatch commonly indicates an incorrect or mis-copied secret.";
+
+        using var c = new Microsoft.Data.Sqlite.SqliteConnection(
+            new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder
+            {
+                DataSource = db,
+                Pooling = false,
+            }.ToString());
+        c.Open();
+
+        using (var session = new Microsoft.Data.Sqlite.SqliteCommand(
+                   "INSERT OR IGNORE INTO sessions (id, title, mode, source_type, status, created_at, updated_at) " +
+                   "VALUES (@sid, 'Imported', 'import', 'import', 'PROCESSING', @now, @now)",
+                   c))
+        {
+            session.Parameters.AddWithValue("@sid", sessionId);
+            session.Parameters.AddWithValue("@now", "2026-11-05T10:00:00Z");
+            session.ExecuteNonQuery();
+        }
+
+        using var job = new Microsoft.Data.Sqlite.SqliteCommand(
+            "INSERT INTO asr_jobs (id, session_id, source, tier, provider, input_artifact, status, " +
+            "provider_request_id, attempt_count, error_code, error_message, duration_ms, " +
+            "speaker_info_requested, estimated_cost_cny, created_at, updated_at) " +
+            "VALUES (@id, @sid, 'import', 'standard', 'volcengine', 'audio/import/meeting.wav', 'failed', " +
+            "@req, 1, 'tos.auth_failed', @msg, 60000, 1, 0.8, @now, @now)",
+            c);
+        job.Parameters.AddWithValue("@id", jobId);
+        job.Parameters.AddWithValue("@sid", sessionId);
+        job.Parameters.AddWithValue("@req", "req-" + jobId);
+        job.Parameters.AddWithValue("@msg", errorMessage);
+        job.Parameters.AddWithValue("@now", "2026-11-05T10:00:00Z");
+        job.ExecuteNonQuery();
+
+        // The session directory and its retained audio, plus the durable failure event.
+        var sessionDir = Path.Combine(harness.DataRoot, "sessions", sessionId);
+        var audioDir = Path.Combine(sessionDir, "audio", "import");
+        Directory.CreateDirectory(audioDir);
+        File.WriteAllBytes(Path.Combine(audioDir, "meeting.wav"), new byte[64]);
+
+        var failEvent = new System.Text.Json.Nodes.JsonObject
+        {
+            ["event"] = "asr.job.failed",
+            ["at_ms"] = 60000,
+            ["at"] = "2026-11-05T10:00:30Z",
+            ["job_id"] = jobId,
+            ["attempts"] = 1,
+            ["error_code"] = "tos.auth_failed",
+            ["error_message"] = errorMessage,
+        };
+        File.WriteAllText(Path.Combine(sessionDir, "events.jsonl"), failEvent.ToJsonString() + "\n");
+    }
+
     /// <summary>
     /// Seeds a succeeded TOS job whose object has not been released, which is the durable state a
     /// process that died before its delete leaves behind (<c>docs/DATA_MODEL.md</c> section 6.2).

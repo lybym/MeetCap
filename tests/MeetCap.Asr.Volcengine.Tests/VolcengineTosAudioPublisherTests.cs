@@ -315,6 +315,51 @@ public class VolcengineTosAudioPublisherTests : IDisposable
     }
 
     [Fact]
+    public async Task Publish_SigningFailsAfterUpload_ReleasesTheStagedObjectBeforeFailing()
+    {
+        // PutObject succeeds, then presigning fails with a terminal 403. The caller never
+        // receives the transport identity, so no job row can record cleanup debt: the publisher
+        // must reclaim the just-uploaded object best-effort before throwing the classified error,
+        // otherwise the private object is orphaned until the 3-day TOS lifecycle reclaims it.
+        var fake = new FakeTosClient
+        {
+            SignException = ServerError(403, "SignatureDoesNotMatch"),
+        };
+        var publisher = RecordingPublisher(fake);
+
+        var error = await Assert.ThrowsAsync<AsrPermanentException>(
+            () => publisher.PublishAsync(Request(WriteAudio(
+                VolcengineTosAudioPublisher.InlineThresholdBytes + 1))));
+
+        Assert.Equal("tos.auth_failed", error.Code);
+        Assert.Contains("[asr.tos]", error.Message, StringComparison.Ordinal);
+        // Exactly one upload happened, and exactly one best-effort delete followed it.
+        Assert.Single(fake.PutObjects);
+        Assert.Single(fake.DeletedObjects);
+        Assert.Equal(fake.PutObjects[0].Key, fake.DeletedObjects[0].Key);
+    }
+
+    [Fact]
+    public async Task Publish_UploadItselfFails_DoesNotAttemptACleanupDelete()
+    {
+        // When PutObject itself fails, nothing was staged, so there is nothing to release.
+        // A delete here would be a spurious call against a key that was never written.
+        var fake = new FakeTosClient
+        {
+            PutException = ServerError(403, "SignatureDoesNotMatch"),
+        };
+        var publisher = RecordingPublisher(fake);
+
+        var error = await Assert.ThrowsAsync<AsrPermanentException>(
+            () => publisher.PublishAsync(Request(WriteAudio(
+                VolcengineTosAudioPublisher.InlineThresholdBytes + 1))));
+
+        Assert.Equal("tos.auth_failed", error.Code);
+        Assert.Single(fake.PutObjects);
+        Assert.Empty(fake.DeletedObjects);
+    }
+
+    [Fact]
     public void ObjectKey_UsesTheMeetcapPrefixARandomShardAndNoUserIdentifyingText()
     {
         var now = new DateTimeOffset(2026, 9, 19, 10, 30, 0, TimeSpan.Zero);

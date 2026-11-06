@@ -446,6 +446,13 @@ messages nor signed URLs are persisted. A failed job retains its imported
 recording and remains visible in the queue; the session stays PROCESSING by
 existing recoverability semantics rather than receiving a new terminal status.
 Cleanup errors of all classes remain recorded debt, never a failed transcript.
+When `PutObject` succeeds but a later step (presigned URL signing) fails, the staged
+object's identity never reaches a job row, so no cleanup debt can be recorded for it:
+the publisher therefore issues a best-effort `DeleteObject` of the just-uploaded object
+before throwing the classified error. A delete that itself fails is swallowed — the
+private object remains under the 3-day TOS object lifecycle rule, which is the
+documented safety net rather than full accounting — and never masks the original
+classified publish failure.
 
 The first implementation uses ordinary SDK upload, not multipart upload: the TOS .NET SDK
 supports stream upload and its simple-upload ceiling is well above the Seed-ASR file range.
