@@ -31,7 +31,11 @@ public sealed record SpeakerResolution
     public bool IsResolved => SpeakerId is not null;
 
     /// <summary>Projects this resolution into an attribution entry.</summary>
-    public SpeakerAttributionEntry ToEntry() => new()
+    /// <param name="diagnostics">
+    /// The per-label diagnostics block (issue #50). Null only when reproducing a legacy
+    /// entry shape; the attribution service always supplies one for every label.
+    /// </param>
+    public SpeakerAttributionEntry ToEntry(SpeakerLabelDiagnostics? diagnostics = null) => new()
     {
         SpeakerLabel = SpeakerLabel,
         SpeakerId = SpeakerId,
@@ -39,5 +43,6 @@ public sealed record SpeakerResolution
         Confidence = Confidence,
         Source = Source,
         Locked = Locked,
+        Diagnostics = diagnostics,
     };
 }

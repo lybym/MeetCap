@@ -7,6 +7,12 @@ using System.Text.Json.Serialization;
 /// One entry in the per-session speaker attribution artifact
 /// (<c>docs/DATA_MODEL.md</c> section 10).
 /// </summary>
+/// <remarks>
+/// The top-level fields are the original contract and are never modified by diagnostics
+/// work. The <see cref="Diagnostics"/> block is additive (issue #50): it is nullable so
+/// an older <c>attribution.json</c> written without it still deserializes, and existing
+/// consumers that read only the top-level fields are unaffected.
+/// </remarks>
 public sealed record SpeakerAttributionEntry
 {
     public required string SpeakerLabel { get; init; }
@@ -20,6 +26,13 @@ public sealed record SpeakerAttributionEntry
     public required SpeakerAssignmentSource Source { get; init; }
 
     public bool Locked { get; init; }
+
+    /// <summary>
+    /// Per-label diagnostics (issue #50): sampled ranges, sample outcome, top-N candidates
+    /// with similarities, configured threshold/margin, and registry size — for every label,
+    /// resolved or not. Null only on artifacts written before issue #50.
+    /// </summary>
+    public SpeakerLabelDiagnostics? Diagnostics { get; init; }
 }
 
 /// <summary>

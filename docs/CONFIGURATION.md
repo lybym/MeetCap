@@ -501,15 +501,22 @@ procedure:
    lenient default silently assigns wrong personal identities, which is more harmful than
    leaving a label unknown.
 
-**Prerequisite — candidate-score diagnostics (issue #50).** Step 3 requires the per-label
-candidate scores and outcome reasons to be exposed by the attribution path. That surface is
-tracked by issue #50 and is **not** yet shipped, so until #50 lands the read-back step
-cannot be reproduced from `speakers attribute` output alone; calibration in the meantime
-relies on local probe/embedding dumps (see `docs/SPEAKER_CALIBRATION.md`). The shipped
-default is therefore held at `0.82 / 0.08` until #50 lands and the held-out different-day
+**Candidate-score diagnostics (issue #50).** Step 3 requires the per-label candidate scores
+and outcome reasons to be exposed by the attribution path. That surface is now shipped: every
+entry in `speakers/attribution.json` carries an additive `diagnostics` block recording the
+`resolution_reason`, sampled `ranges_considered`, `sample_outcome`, top-N `candidates` with
+similarities, the configured `threshold` / `margin`, the `enrolled_speakers` /
+`enrolled_embeddings` counts, and the `provider_job` provenance — for every label, resolved or
+not (see `docs/DATA_MODEL.md` section 10.1). `meetcap speakers attribute --diagnostics` opts
+in to one summary line per unresolved label on stderr (`speaker_2: best 0.571 (threshold 0.82,
+reason: below_threshold)`); candidate names are intentionally omitted from that line, because
+speaker names plus ranked similarities are sensitive identity metadata that lives in the local
+artifact, not in ordinary logs. The match threshold is unchanged by the diagnostics PR. The
+shipped default is therefore still held at `0.82 / 0.08` until the held-out different-day
 calibration above is documented. Per the issue #49 review update (2026-11-06), `0.50 / 0.06`
 is published only as an explicitly opt-in experiment profile, not as a new default or an
 unqualified recommendation.
+
 
 ### 9.2.2 Margin interaction
 

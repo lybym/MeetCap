@@ -54,6 +54,12 @@ public static class ConfigSchema
         "asr.tos.endpoint",
         "asr.tos.access_key",
         "asr.tos.secret_key",
+        // Cross-service authorization (speech_asr_prod -> TOS read): the optional role TRN
+        // and presign endpoint documented in config.example.toml (issue #59). The typed
+        // TosSection binding lands with the cross-service-auth feature; these schema keys
+        // keep the shipped example loadable without unknown-key warnings in the meantime.
+        "asr.tos.role_trn",
+        "asr.tos.presign_endpoint",
         "speakers.enabled",
         "speakers.owner_name",
         "speakers.auto_suggest",
