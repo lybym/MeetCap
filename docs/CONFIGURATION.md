@@ -242,13 +242,20 @@ Contract (issue #26):
 ```toml
 [asr.volcengine]
 api_key = "env:MEETCAP_VOLCENGINE_API_KEY"
-hotword_table_id = ""
+hotword_table_id = "" # optional: Volcengine console boosting table ID
 request_speaker_info = true
 cost_per_hour_cny = 0.8
 poll_interval_seconds = 5
 poll_timeout_seconds = 900
 http_timeout_seconds = 30
 ```
+
+A non-empty `hotword_table_id` adds `request.corpus.boosting_table_id` to
+Seed-ASR 2.0 file submissions and to sanitized job `request.json`. Leave it empty
+to omit the entire `corpus` object. Create the table in Volcengine's self-learning
+console first (one table per request; up to 5,000 entries, each word at most 10
+characters, optional `word|N` weights from 1 to 10); this setting takes a table
+ID, not an inline list of words. See ASR_STRATEGY section 11.
 
 Only the API key is user-supplied provider authentication. MeetCap fixes the rest of the wire
 contract to the official Seed-ASR 2.0 recording-file Standard HTTP interface:
