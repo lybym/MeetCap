@@ -185,13 +185,14 @@ M0 through M6 are implemented and automatically covered. Code is added milestone
 milestone according to `docs/ROADMAP.md`; agents should not implement later milestones
 opportunistically.
 
-The current source prepares **0.3.1**, with frame-based file-ASR windows, contiguous capture
-and ASR spans across gaps, and a shared QPC origin for online tracks. Legacy ambiguous
+The current source prepares **0.3.2**, with frame-based file-ASR windows, contiguous capture
+and ASR spans across gaps, a shared QPC origin for online tracks, and an optional
+cross-service-authorized internal TOS fetch for oversized file-ASR inputs. Legacy ambiguous
 batches are diagnosed before billing or timestamp normalization; original audio and raw
 provider responses remain recoverable. The [MVP gate matrix](docs/MVP_ACCEPTANCE.md) records
 the real Windows evidence, its versions and limits. Long capture/outage runs used the
 published 0.3.0 binary; focused later checks cover speech, local identity and timing fixes.
-This does not claim new two-hour soaks on the final 0.3.1 release binary.
+This does not claim new two-hour soaks on the final 0.3.2 release binary.
 
 Release **0.3.0** fixed three capture defects on top of 0.2.0: Windows process
 loopback is now placed by the QPC clock its stream actually reports instead of a device position it
