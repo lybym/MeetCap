@@ -141,6 +141,51 @@ public class VolcengineAsrProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task Submit_ConfiguredHotwordTable_IsSentAndRecordedInSanitizedMetadata()
+    {
+        var handler = new StubHttpHandler().Enqueue(HttpStatusCode.OK, apiStatus: "20000000");
+        using var provider = new VolcengineAsrProvider(
+            new VolcengineAsrOptions
+            {
+                ApiKey = ApiKey,
+                BaseUrl = "https://asr.invalid/api/v3/auc/bigmodel",
+                HotwordTableId = "hotword-table-123",
+            }, handler);
+
+        var submission = await provider.SubmitFileAsync(Request(WriteAudio()));
+
+        var sent = JsonNode.Parse(Assert.Single(handler.RequestBodies))!;
+        Assert.Equal("hotword-table-123",
+            sent["request"]!["corpus"]!["boosting_table_id"]!.GetValue<string>());
+        var persisted = JsonNode.Parse(submission.SanitizedRequestJson)!;
+        Assert.Equal("hotword-table-123",
+            persisted["request"]!["corpus"]!["boosting_table_id"]!.GetValue<string>());
+        Assert.DoesNotContain(ApiKey, submission.SanitizedRequestJson, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task Submit_UnsetHotwordTable_DoesNotAddCorpus(string tableId)
+    {
+        var handler = new StubHttpHandler().Enqueue(HttpStatusCode.OK, apiStatus: "20000000");
+        using var provider = new VolcengineAsrProvider(
+            new VolcengineAsrOptions
+            {
+                ApiKey = ApiKey,
+                BaseUrl = "https://asr.invalid/api/v3/auc/bigmodel",
+                HotwordTableId = tableId,
+            }, handler);
+
+        var submission = await provider.SubmitFileAsync(Request(WriteAudio()));
+
+        var sent = JsonNode.Parse(Assert.Single(handler.RequestBodies))!;
+        Assert.False(sent["request"]!.AsObject().ContainsKey("corpus"));
+        var persisted = JsonNode.Parse(submission.SanitizedRequestJson)!;
+        Assert.False(persisted["request"]!.AsObject().ContainsKey("corpus"));
+    }
+
+    [Fact]
     public async Task Submit_UsesEphemeralUrlWithoutPersistingSignedQuery()
     {
         var handler = new StubHttpHandler().Enqueue(HttpStatusCode.OK, apiStatus: "20000000");
