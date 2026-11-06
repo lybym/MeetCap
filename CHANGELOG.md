@@ -12,6 +12,27 @@ manual checklist in `docs/M1_WINDOWS_VALIDATION.md` has been run on real hardwar
 milestones are described as the former, never the latter
 (`docs/DEVELOPMENT.md` section 7).
 
+## [Unreleased]
+
+### Added
+
+- **Optional TOS cross-service authorization for the oversized file-ASR path**
+  ([#59](https://github.com/lybym/MeetCap/issues/59)). Two new keys in `[asr.tos]`:
+  `role_trn` (an IAM role TRN created by the cross-service authorization for
+  `speech_asr_prod`, e.g. the `AucAccessTosRole` flow, sent as `audio.role_trn`) and
+  `presign_endpoint` (an endpoint used only to mint the presigned GET URL, e.g. the
+  bucket's internal host `tos-cn-beijing.ivolces.com`). With both set, the provider-side
+  fetch of `audio.url` is authorized against the private bucket and billed as TOS internal
+  egress (free in cn-beijing/cn-shanghai) instead of public egress, which previously
+  equaled the full audio size per job. Both keys are optional, default empty, and leave
+  the existing behavior byte-identical when unset: the upload and the idempotent delete
+  keep using `endpoint`, and signing is a purely local operation, so the internal endpoint
+  never needs to be reachable from the MeetCap machine. The role TRN is a non-secret IAM
+  resource name and is recorded in `request.json` as `audio.tos_role_trn`; the signed URL
+  remains never-persisted. Validated live on 2026-11-06 against a cn-beijing private
+  bucket (100 s slice: submit accepted on the internal-host URL with `audio.role_trn`,
+  transcript identical to the public-URL run).
+
 ## [0.3.1] - 2026-10-12
 
 Patch preparation for the M0–M6 MVP gate in [#1](https://github.com/lybym/MeetCap/issues/1).

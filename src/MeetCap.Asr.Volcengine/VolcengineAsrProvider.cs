@@ -435,17 +435,28 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
 
     private string BuildRequestBody(AsrFileRequest request, AsrPublishedAudio audio)
     {
+        var audioObject = new JsonObject
+        {
+            ["format"] = request.AudioFormat,
+            [audio.Transport == AsrTransports.Inline ? "data" : "url"] =
+                audio.Transport == AsrTransports.Inline ? audio.InlineBase64 : audio.Url,
+        };
+
+        // Cross-service authorization (issue #59): with the optional role TRN configured,
+        // the provider-side fetch of audio.url is authorized against the TOS bucket and
+        // billed as internal egress instead of public. Non-secret, and only meaningful
+        // for the TOS transport.
+        if (audio.Transport == AsrTransports.Tos && !string.IsNullOrWhiteSpace(audio.RoleTrn))
+        {
+            audioObject["role_trn"] = audio.RoleTrn;
+        }
+
         var body = new JsonObject
         {
             // MeetCap-owned, non-secret: request.json is persisted locally, so the API key
             // must never be copied into user.uid (docs/CONFIGURATION.md section 8).
             ["user"] = new JsonObject { ["uid"] = VolcengineAsrOptions.UserId },
-            ["audio"] = new JsonObject
-            {
-                ["format"] = request.AudioFormat,
-                [audio.Transport == AsrTransports.Inline ? "data" : "url"] =
-                    audio.Transport == AsrTransports.Inline ? audio.InlineBase64 : audio.Url,
-            },
+            ["audio"] = audioObject,
             ["request"] = BuildProviderRequest(request.RequestSpeakerInfo),
         };
 
@@ -514,6 +525,9 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
                 ["inline_bytes"] = audio.Transport == AsrTransports.Inline ? audio.Bytes : null,
                 ["tos_bucket"] = audio.Bucket,
                 ["tos_object_key"] = audio.ObjectKey,
+                // Non-secret IAM resource name; recorded so a later reader can tell whether
+                // the provider-side fetch was cross-service authorized (internal egress).
+                ["tos_role_trn"] = string.IsNullOrWhiteSpace(audio.RoleTrn) ? null : audio.RoleTrn,
             },
             ["request"] = BuildProviderRequest(request.RequestSpeakerInfo),
         };
