@@ -258,3 +258,74 @@ public sealed class RetentionSection
 {
     public bool AutomaticDelete { get; set; } = false;
 }
+
+/// <summary>
+/// Process-lifecycle auto-capture (<c>meetcap watch</c>, issue #52). Watches a
+/// configurable list of meeting-app main processes and starts a recording session when
+/// one launches, stopping it when the whole watched cohort exits.
+/// </summary>
+/// <remarks>
+/// <para>
+/// This is <strong>process-lifecycle auto-capture, not meeting-state detection</strong>
+/// (review update 2026-11-06): a watched app may stay open outside a meeting, so
+/// presence only proves the process is running, never that a meeting is in progress.
+/// The section is opt-in (<see cref="Enabled"/> defaults to <c>false</c>) and the docs
+/// warn that non-meeting audio can be recorded.
+/// </para>
+/// <para>
+/// One active watched-process cohort produces exactly one session spanning the union of
+/// overlapping watched apps, not one session per app run. Trigger metadata (process
+/// name/ID/start time and stop reason) is persisted per session by the watcher.
+/// </para>
+/// <para>
+/// <see cref="AutoAsr"/> defaults to <c>false</c>: an auto-triggered recording must
+/// never silently incur provider billing, and no provider network request is made while
+/// <c>false</c>.
+/// </para>
+/// </remarks>
+public sealed class WatchSection
+{
+    /// <summary>
+    /// Whether <c>meetcap watch</c> is allowed to auto-capture. Off by default: the
+    /// operator must opt in because process presence is not a verified in-meeting signal.
+    /// </summary>
+    public bool Enabled { get; set; } = false;
+
+    /// <summary>
+    /// Main process names to watch (without the <c>.exe</c> extension), e.g.
+    /// <c>WeMeetApp</c>, <c>CloudVideo</c>. Helper/child processes never trigger or
+    /// extend a recording; only these exact main process names do. A trailing
+    /// <c>.exe</c> is stripped by the probe so a user-supplied value still matches.
+    /// </summary>
+    public List<string> Processes { get; set; } = new() { "WeMeetApp", "CloudVideo" };
+
+    /// <summary>How often the watcher polls for watched processes, in seconds.</summary>
+    public int PollIntervalSeconds { get; set; } = 5;
+
+    /// <summary>
+    /// Allowed: <c>offline</c>, <c>online</c>. The capture mode a watched session uses,
+    /// reusing the existing dual-track semantics (<c>online</c> = microphone + loopback).
+    /// </summary>
+    public string CaptureMode { get; set; } = "online";
+
+    /// <summary>
+    /// Whether watched recordings run live file-ASR. <c>false</c> by default so an
+    /// auto-triggered recording never makes a provider network request or incurs billing
+    /// without an explicit opt-in.
+    /// </summary>
+    public bool AutoAsr { get; set; } = false;
+
+    /// <summary>
+    /// Exit debounce in seconds. When every watched process is gone the watcher waits
+    /// this long before finalizing, so brief helper churn or an app relaunch within the
+    /// window keeps one cohort/session alive instead of producing a gap.
+    /// </summary>
+    public int ExitDebounceSeconds { get; set; } = 10;
+
+    /// <summary>
+    /// Session title template. <c>{app}</c> expands to the triggering process name and
+    /// <c>{start:format}</c> expands to the trigger observation time using a .NET date
+    /// format string, e.g. <c>{start:yyyy-MM-dd HH-mm-ss}</c>.
+    /// </summary>
+    public string TitleTemplate { get; set; } = "{app} {start:yyyy-MM-dd HH-mm-ss}";
+}

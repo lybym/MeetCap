@@ -63,6 +63,10 @@ internal static class CommandTree
 
         var stopCommand = new Command("stop", "Stop the recording session that is currently running.");
 
+        var watchCommand = new Command(
+            "watch",
+            "Auto-record when a configured meeting-app process launches; stop when the cohort exits (opt-in, [watch]).");
+
         var importCommand = BuildImport(secrets, loggerFactory, storeFactory, output, error, environment, asrHttpHandler);
         var asrCommand = BuildAsr(secrets, loggerFactory, storeFactory, output, error, environment, asrHttpHandler);
         var sessionCommand = BuildSession(secrets, loggerFactory, storeFactory, output, error, environment, platformFactory, asrHttpHandler);
@@ -73,6 +77,7 @@ internal static class CommandTree
         root.Subcommands.Add(devicesCommand);
         root.Subcommands.Add(startCommand);
         root.Subcommands.Add(stopCommand);
+        root.Subcommands.Add(watchCommand);
         root.Subcommands.Add(importCommand);
         root.Subcommands.Add(asrCommand);
         root.Subcommands.Add(sessionCommand);
@@ -94,6 +99,10 @@ internal static class CommandTree
                 parseResult.GetValue(modeOption)));
         stopCommand.SetAction((parseResult, _) =>
             StopCommand.Run(CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory, asrHttpHandler)));
+        watchCommand.SetAction((parseResult, cancellationToken) =>
+            WatchCommand.RunAsync(
+                CreateContext(parseResult, secrets, loggerFactory, storeFactory, output, error, environment, platformFactory, asrHttpHandler),
+                cancellationToken));
 
         return root;
     }

@@ -91,6 +91,7 @@ public static class ConfigurationValidator
         ValidateAsr(config, result);
         ValidateSpeakers(config, result);
         ValidateLogging(config, result);
+        ValidateWatch(config, result);
 
         return result;
     }
@@ -258,6 +259,59 @@ public static class ConfigurationValidator
             result.AddError(
                 $"logging.level='{config.Logging.Level}' is invalid. " +
                 "Allowed: Trace, Debug, Information, Warning, Error, Critical.");
+        }
+    }
+
+    private static void ValidateWatch(MeetCapConfiguration config, ValidationResult result)
+    {
+        var watch = config.Watch;
+
+        // The watcher is only meaningful with at least one main process to watch. An empty
+        // list is not a hard error (the section can stay present but disabled), but when the
+        // operator has opted in there is nothing to trigger on, so it is surfaced as a warning
+        // rather than silently doing nothing.
+        if (watch.Enabled && watch.Processes.Count == 0)
+        {
+            result.AddWarning(
+                "watch.enabled is true but watch.processes is empty; the watcher will not " +
+                "capture anything until at least one main process name is configured.");
+        }
+
+        // Bare names are the contract; a stray .exe would not match GetProcessesByName, so a
+        // configured name that still carries the extension is reported rather than silently
+        // never matching.
+        for (int i = 0; i < watch.Processes.Count; i++)
+        {
+            var name = watch.Processes[i];
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                result.AddError($"watch.processes[{i}] must not be empty.");
+            }
+            else if (name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+            {
+                result.AddWarning(
+                    $"watch.processes[{i}]='{name}' includes the .exe extension; the watcher " +
+                    "matches bare process names (e.g. 'WeMeetApp'), so the suffix will be stripped.");
+            }
+        }
+
+        if (!s_captureModes.Contains(watch.CaptureMode))
+        {
+            result.AddError(
+                $"watch.capture_mode='{watch.CaptureMode}' is invalid. Allowed: offline, online.");
+        }
+
+        RequirePositive(result, "watch.poll_interval_seconds", watch.PollIntervalSeconds);
+        RequireNonNegative(result, "watch.exit_debounce_seconds", watch.ExitDebounceSeconds);
+
+        // auto_asr = false keeps watched recordings local. When it is on, the provider is
+        // reached during capture, which is exactly the billing/privacy decision the default
+        // avoids; a warning makes the opt-in visible at validate time.
+        if (watch.AutoAsr && !config.Asr.Enabled)
+        {
+            result.AddWarning(
+                "watch.auto_asr is true while asr.enabled is false; watched recordings will not " +
+                "be transcribed until ASR is enabled.");
         }
     }
 

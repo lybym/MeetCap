@@ -1676,7 +1676,65 @@ This boundary is intentional: commodity capabilities should be imported; product
 
 ---
 
-## 24. External technical references
+## 24. Process-lifecycle auto-capture (`meetcap watch`)
+
+Issue #52 adds an opt-in daemon that starts a recording when a configured meeting-app
+main process launches and stops it when the whole watched cohort exits. It is
+**deliberately thin**: it reuses the entire existing capture/batch/session stack
+(sections 4, 9, 20) and only adds the trigger.
+
+> Process presence is **not** a trustworthy in-meeting signal (a watched app may stay open
+> outside a meeting). This is process-lifecycle auto-capture, not meeting-state detection;
+> it is opt-in and can record non-meeting audio. See `docs/CONFIGURATION.md` section 14.
+
+### Components
+
+- `IProcessProbe` / `ProcessProbe` — polls `Process.GetProcessesByName` for the configured
+  main process names every `watch.poll_interval_seconds`. Only main processes are ever
+  returned; helper/child processes are never queried and never trigger. Injected so the
+  state machine is deterministic under test.
+- `MeetingWatcher` — the cohort state machine (below). Holds no audio types; it drives an
+  `IWatchRecorder` and reads an `IClock`.
+- `IWatchRecorder` / `WatchRecorder` — starts a recording through the **same**
+  `CaptureService.PrepareSession` → `RecordingSession.RunAsync` path `meetcap start` uses,
+  and stops it by cancelling the run token (the same signal `meetcap stop`'s marker
+  produces internally). The cross-process ownership guard
+  (`CaptureService.FindActiveSession`) refuses to double-record alongside a manual `start`
+  or another watcher.
+
+### State machine
+
+```text
+idle ──(any NEW watched main process launch)──> recording ──(ALL watched processes gone, after exit debounce)──> finalize
+```
+
+- **One active watched-process cohort = one session** spanning the union of overlapping
+  watched apps (not one session per app run).
+- A process is fingerprinted by **PID + start time**. On watcher restart, processes
+  already running are seeded into the known set and do **not** trigger — only new launches
+  do. PID reuse by a different process instance (same PID, different start time) is
+  detected as a new launch.
+- Start fires on the first validated main-process observation (bounded by the poll
+  interval); **exit** is debounced (`watch.exit_debounce_seconds`) to absorb brief
+  helper/relaunch churn. App exit and app crash are the same signal: the process
+  disappears from the probe.
+- While recording, new watched-process launches are noted but do not start a second
+  recording. The watcher owns the recording in-process, so if it dies the recorder dies
+  with it and the existing crash-recovery scan (section 9.1) handles the session — the
+  same guarantee as manual mode. On clean shutdown it performs a fail-safe stop.
+
+### Reuse of the capture stack
+
+No new SQLite table and no schema migration are added: the watcher is a CLI command over
+the existing capture stack, and the only persisted state is the sessions it creates. Each
+watched session additionally carries a `watch.meta.json` sidecar with the trigger
+provenance (process name/ID/start time) and stop reason. The session's timestamps represent
+**capture** time, not verified meeting time. With `watch.auto_asr = false` (the default) no
+ASR host is built, so no provider network request is made during watched recordings.
+
+---
+
+## 25. External technical references
 
 - Microsoft WASAPI loopback recording: https://learn.microsoft.com/windows/win32/coreaudio/loopback-recording
 - NAudio: https://github.com/naudio/NAudio

@@ -82,6 +82,16 @@ public static class ConfigSchema
         "logging.level",
         "logging.session_log",
         "retention.automatic_delete",
+        // Issue #52: process-lifecycle auto-capture ([watch]). The watcher is a CLI
+        // command over the existing capture stack, so these are the only new persisted
+        // contract keys; no SQLite table or migration is added.
+        "watch.enabled",
+        "watch.processes",
+        "watch.poll_interval_seconds",
+        "watch.capture_mode",
+        "watch.auto_asr",
+        "watch.exit_debounce_seconds",
+        "watch.title_template",
     };
 
     /// <summary>Whether the given dotted leaf key is part of the schema.</summary>
