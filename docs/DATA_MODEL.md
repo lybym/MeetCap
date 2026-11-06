@@ -265,13 +265,15 @@ without ever mutating the user's original file:
       "stored_path": "C:\\...\\sessions\\ses_01...\\audio\\import\\meeting.m4a",
       "file_name": "meeting.m4a",
       "byte_length": 12345678,
+      "duration_ms": 754000,
       "sha256": "..."
     }
   ]
 }
 ```
 
-`role` is `original`, `normalized`, or `compressed`. The mapping lives in the durable session
+Each entry carries its inspected `duration_ms` (for the `compressed` role, the verified
+derivative duration). `role` is `original`, `normalized`, or `compressed`. The mapping lives in the durable session
 document rather than a new table: section 11 forbids creating tables ahead of their feature,
 and section 6 already indexes the artifact each ASR job consumed through `input_artifact`.
 

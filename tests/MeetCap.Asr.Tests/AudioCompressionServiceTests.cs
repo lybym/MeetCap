@@ -99,6 +99,8 @@ public class AudioCompressionServiceTests : IDisposable
         Assert.Equal(SourceArtifact.Roles.Compressed, result.Artifact!.Role);
         Assert.Equal(".mp3", Path.GetExtension(result.DerivativePath));
         Assert.False(string.IsNullOrEmpty(result.Artifact.Sha256));
+        // The compressed artifact carries its verified duration (P2 #3).
+        Assert.Equal(losslessMedia.DurationMs, result.Artifact.DurationMs);
         // Duration was verified equal within tolerance (the fake returns an exact match).
         Assert.True(MediaCompressionPlanner.DurationMatches(
             losslessMedia.DurationMs, result.DerivativeMedia!.DurationMs));

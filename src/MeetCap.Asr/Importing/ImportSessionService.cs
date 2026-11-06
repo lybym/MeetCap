@@ -228,7 +228,7 @@ public sealed class ImportSessionService
                 ["provider"] = _options.ProviderName,
             });
 
-        artifacts.Add(CopySourceArtifact(paths, sourcePath));
+        artifacts.Add(CopySourceArtifact(paths, sourcePath, sourceMedia.DurationMs));
         PersistSessionDocument();
         _artifacts.AppendEvent(
             paths,
@@ -261,7 +261,7 @@ public sealed class ImportSessionService
                     $"Normalized artifact '{normalizedPath}' is still not ASR-ready: {confirmed.Reason}.");
             }
 
-            artifacts.Add(BuildArtifact(SourceArtifact.Roles.Normalized, sourcePath, normalizedPath));
+            artifacts.Add(BuildArtifact(SourceArtifact.Roles.Normalized, sourcePath, normalizedPath, normalizedMedia.DurationMs));
             inputArtifactPath = normalizedPath;
             losslessArtifactMedia = normalizedMedia;
             // Only the normalized derivative (not the user's original source copy) may be
@@ -285,6 +285,14 @@ public sealed class ImportSessionService
         // Issue #53 Part A: encode a compressed archive derivative once from the complete
         // finalized lossless artifact. This runs off the capture callback and never while
         // capture is running; the lossless WAV is the encode input, never a live batch.
+        //
+        // The lossless WAV may only be deleted (keep_original = false) when the compressed
+        // derivative will actually be the ASR payload (compress_asr_transport = true). In
+        // Part A-only mode the WAV stays the job's input artifact, so deleting it here would
+        // leave the job pointing at a file that no longer exists — a data-loss + broken-job
+        // failure mode with no fallback. Coordinating deletion with payload selection is what
+        // closes that gap; the service itself stays generic (it deletes when told it is safe).
+        var mayDeleteLossless = canDeleteLossless && _options.Retention.CompressAsrTransport;
         var compression = await _compression.CompressAsync(
             inputArtifactPath,
             losslessArtifactMedia,
@@ -292,7 +300,7 @@ public sealed class ImportSessionService
             paths,
             paths.ImportAudioDirectory,
             "compressed",
-            canDeleteLossless,
+            mayDeleteLossless,
             atMs: 0,
             cancellationToken).ConfigureAwait(false);
 
@@ -388,7 +396,7 @@ public sealed class ImportSessionService
         return string.IsNullOrWhiteSpace(fromFile) ? _options.DefaultTitle : fromFile;
     }
 
-    private SourceArtifact CopySourceArtifact(SessionArtifactPaths paths, string sourcePath)
+    private SourceArtifact CopySourceArtifact(SessionArtifactPaths paths, string sourcePath, long durationMs)
     {
         var fileName = Path.GetFileName(sourcePath);
         var destination = paths.ImportAudioFile(fileName);
@@ -400,10 +408,10 @@ public sealed class ImportSessionService
         }
 
         File.Copy(sourcePath, destination, overwrite: false);
-        return BuildArtifact(SourceArtifact.Roles.Original, sourcePath, destination);
+        return BuildArtifact(SourceArtifact.Roles.Original, sourcePath, destination, durationMs);
     }
 
-    private static SourceArtifact BuildArtifact(string role, string originalPath, string storedPath)
+    private static SourceArtifact BuildArtifact(string role, string originalPath, string storedPath, long durationMs)
     {
         var info = new FileInfo(storedPath);
         return new SourceArtifact
@@ -413,6 +421,7 @@ public sealed class ImportSessionService
             StoredPath = storedPath,
             FileName = info.Name,
             ByteLength = info.Length,
+            DurationMs = durationMs,
             Sha256 = Sha256OfFile(storedPath),
         };
     }

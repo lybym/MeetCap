@@ -386,4 +386,20 @@ public class ConfigurationValidatorTests
         Assert.True(result.IsValid);
         Assert.DoesNotContain(result.Warnings, w => w.Contains("compress_asr_transport"));
     }
+
+    [Fact]
+    public void Validate_KeepOriginalFalseWithoutTransport_WarnsAboutTheContradiction()
+    {
+        // P1 follow-up (issue #53 review): keep_original = false + asr_transport = false is
+        // contradictory in Part A-only mode — the WAV stays the payload, so deletion is gated
+        // off and the flag has no effect. The combination stays valid (no data loss) but is
+        // surfaced as a warning so the operator knows the flag is inert.
+        var c = ConfigurationDefaults.Default();
+        c.Retention.Compress = "mp3";
+        c.Retention.CompressKeepOriginal = false;
+        c.Retention.CompressAsrTransport = false;
+        var result = ConfigurationValidator.Validate(c);
+        Assert.True(result.IsValid);
+        Assert.Contains(result.Warnings, w => w.Contains("compress_keep_original"));
+    }
 }

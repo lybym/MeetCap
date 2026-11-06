@@ -148,7 +148,8 @@ public sealed class AudioCompressionService
             var artifact = BuildArtifact(
                 SourceArtifact.Roles.Compressed,
                 losslessArtifactPath,
-                derivativePath);
+                derivativePath,
+                derivative.DurationMs);
 
             var originalDeleted = false;
             if (!retention.CompressKeepOriginal && canDeleteLossless)
@@ -209,7 +210,7 @@ public sealed class AudioCompressionService
         }
     }
 
-    private static SourceArtifact BuildArtifact(string role, string originalPath, string storedPath)
+    private static SourceArtifact BuildArtifact(string role, string originalPath, string storedPath, long durationMs)
     {
         var info = new FileInfo(storedPath);
         return new SourceArtifact
@@ -219,6 +220,7 @@ public sealed class AudioCompressionService
             StoredPath = storedPath,
             FileName = info.Name,
             ByteLength = info.Length,
+            DurationMs = durationMs,
             Sha256 = Sha256OfFile(storedPath),
         };
     }

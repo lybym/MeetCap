@@ -302,6 +302,24 @@ public static class ConfigurationValidator
                 "no compressed derivative is produced, so the compressed ASR transport has no " +
                 "effect. Set retention.compress to 'mp3' or 'aac' to enable it.");
         }
+
+        // keep_original = false deletes the lossless WAV only when the compressed derivative
+        // is the ASR payload (compress_asr_transport = true). In Part A-only mode the WAV
+        // stays the job's input artifact, so keep_original = false has no effect there:
+        // deleting the WAV the job still references would be a data-loss failure mode. The
+        // deletion is gated on the transport switch in ImportSessionService; this warning
+        // makes the ineffective combination visible at validate time (issue #53 P1 fix).
+        if (!retention.CompressKeepOriginal
+            && !string.Equals(retention.Compress, "none", StringComparison.Ordinal)
+            && !retention.CompressAsrTransport)
+        {
+            result.AddWarning(
+                "retention.compress_keep_original is false while retention.compress_asr_transport " +
+                "is false; the lossless WAV stays the ASR payload in Part A-only mode, so the " +
+                "original is kept (deletion is gated on the compressed transport). Set " +
+                "retention.compress_asr_transport = true to delete the WAV after a verified encode, " +
+                "or keep compress_keep_original = true.");
+        }
     }
 
     private static void ValidateWatch(MeetCapConfiguration config, ValidationResult result)
