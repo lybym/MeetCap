@@ -67,6 +67,13 @@ region = ""
 endpoint = ""
 access_key = ""
 secret_key = ""
+# Optional cross-service authorization (speech_asr_prod -> TOS read, issue #59): with both
+# keys set, the presigned GET URL is minted on the bucket's internal endpoint and travels
+# as audio.role_trn, so the provider-side fetch is billed as internal egress (free in
+# cn-beijing/cn-shanghai) instead of public. Signing is purely local; the upload and the
+# delete keep using endpoint. Both default empty (feature off).
+role_trn = ""
+presign_endpoint = ""
 
 [speakers]
 enabled = true
