@@ -310,6 +310,57 @@ This path is intended for enrollment, embedding extraction, verification, and id
 
 Manual speaker assignment always wins over automatic inference.
 
+### 10.1 Measured same/different-person separation (issue #49)
+
+The shipped default `match_threshold = 0.82` was calibrated on clean, single-condition
+enrollment audio, not on the cross-span / cross-recording distribution the bundled model
+produces on meeting recordings. The 2026-11-05 real-meeting deployment measured the
+following cosine distributions through the shipped sherpa-onnx runtime and the bundled
+ERes2Net model (512-dim, one self-consistent vector space):
+
+| Comparison | Cosine |
+| --- | --- |
+| Same person, **same recording**, different 15 s spans | ≈ 0.656 |
+| Same person, cross-recording (enrolled from other days) vs a session probe | 0.55 – 0.58 |
+| Different persons (probe vs 8 enrolled people) | ≤ 0.23 |
+| Different persons (probe vs an 18-speaker library) | ≤ 0.38 |
+
+The decisive control: enrolling a 16 s span *from session X itself* as a temporary speaker
+and re-running attribution on session X still resolved nothing at 0.82, while the same probe
+scored **0.656** against that person's embedding. The default therefore sits *above* the
+same-speaker same-recording cosine this pipeline produces, so voiceprint attribution is
+effectively disabled as shipped — every provider label resolved to unknown across all 17
+import sessions.
+
+### 10.2 Why a clean-condition threshold over-filters
+
+A threshold tuned on clean, same-condition audio assumes same-speaker cosine near 1.0: the
+enrollment and probe come from the same microphone, channel, noise floor and compression in
+the same sitting. Real cross-span and cross-recording embeddings drift lower because the
+probe spans a different chunk of a different recording — different gain, different mic
+position, different room and noise — even for the same person. A clean-condition threshold
+(0.82) then rejects the correct person: it asks the cross-recording probe to clear a bar the
+clean-condition enrollment barely clears itself.
+
+Lowering the threshold *without calibration* is not safe either: a too-lenient default
+silently assigns wrong personal identities, which is more harmful than leaving a label
+unknown. Issue #49's review update (2026-11-06) therefore gates the change: first land the
+candidate-score diagnostics (issue #50), then run held-out, different-day recordings across
+multiple known speakers **and** impostors, document false-match / missed-match counts at
+several threshold+margin pairs, and choose a conservative default with confidence limits.
+Until then `0.50 / 0.06` is published only as an explicitly opt-in experiment profile, not a
+new default; the shipped default stays `0.82 / 0.08`. The calibration procedure and the
+threshold/margin interaction are documented in `docs/CONFIGURATION.md` sections 9.2.1–9.2.2,
+and the exploratory base-model calibration evidence is in `docs/SPEAKER_CALIBRATION.md`.
+
+While the default remains uncalibrated, **manual assignment is the authoritative escape
+hatch**: a human-bound label is locked and is never overwritten by automatic inference, so a
+known speaker can always be named by hand even when the voiceprint path over-filters. A
+speaker label reused across independent provider jobs is never voiceprint-scored
+ambiguously — it stays unknown unless a manual assignment covers it — so a reused label
+cannot silently name two unrelated voices (see `SpeakerAttributionService` and the issue #49
+safety regression tests).
+
 ## 11. Hotwords
 
 Hotword configuration must be possible without code changes. Raw ASR responses remain immutable.

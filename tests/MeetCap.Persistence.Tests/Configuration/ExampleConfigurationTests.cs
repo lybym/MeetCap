@@ -75,6 +75,8 @@ public class ExampleConfigurationTests
 
             // The shipped example must be loadable as the contract, not only parseable.
             Assert.Equal("sherpa_onnx_3dspeaker", config.Speakers.Identity.Provider);
+            // Issue #49: 0.82 is retained as the uncalibrated placeholder default pending
+            // issue #50 + held-out calibration; the example mirrors the default unchanged.
             Assert.Equal(0.82, config.Speakers.Identity.MatchThreshold);
             Assert.Equal(5, config.Speakers.Identity.SampleMinSeconds);
             Assert.Equal(15, config.Speakers.Identity.SampleMaxSeconds);
