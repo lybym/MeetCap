@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Reflection;
 using MeetCap.Core.Asr;
 using TOS;
+using TOS.Error;
 using TOS.Model;
 using Xunit;
 
@@ -225,6 +226,92 @@ public class VolcengineTosAudioPublisherTests : IDisposable
         Assert.Contains("meetcap asr resume", ex.Message, StringComparison.Ordinal);
         // The cleanup failure must never be presented as a transcript problem.
         Assert.Contains("transcript is unaffected", ex.Message, StringComparison.Ordinal);
+    }
+
+    private static TosServerException ServerError(int statusCode, string code)
+    {
+        // The 2.1.8 SDK uses internal setters and constructor for response errors.
+        // Construct the same SDK type through reflection to exercise the actual catch.
+        var request = new RequestInfo();
+        typeof(RequestInfo).GetProperty(nameof(RequestInfo.StatusCode))!
+            .SetValue(request, statusCode);
+        typeof(RequestInfo).GetProperty(nameof(RequestInfo.RequestID))!
+            .SetValue(request, "tos-request-123");
+        var error = (TosServerException)Activator.CreateInstance(
+            typeof(TosServerException),
+            BindingFlags.Instance | BindingFlags.NonPublic,
+            binder: null,
+            args: new object[] { "SDK-sentinel-message-that-must-not-leak", request },
+            culture: null)!;
+        typeof(TosServerException).GetProperty(nameof(TosServerException.Code))!
+            .SetValue(error, code);
+        return error;
+    }
+
+    [Theory]
+    [InlineData(401, "InvalidAccessKeyId", "tos.auth_failed")]
+    [InlineData(403, "SignatureDoesNotMatch", "tos.auth_failed")]
+    [InlineData(400, "InvalidArgument", "tos.request_rejected")]
+    public async Task Publish_Tos4xx_ProducesActionablePermanentJobError(
+        int status, string sdkCode, string expectedCode)
+    {
+        var fake = new FakeTosClient { PutException = ServerError(status, sdkCode) };
+        var publisher = RecordingPublisher(fake);
+
+        var error = await Assert.ThrowsAsync<AsrPermanentException>(
+            () => publisher.PublishAsync(Request(WriteAudio(
+                VolcengineTosAudioPublisher.InlineThresholdBytes + 1))));
+
+        Assert.Equal(expectedCode, error.Code);
+        Assert.Contains("[asr.tos]", error.Message, StringComparison.Ordinal);
+        Assert.Contains("tos-request-123", error.Message, StringComparison.Ordinal);
+        Assert.Contains(sdkCode, error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("SDK-sentinel", error.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(503)]
+    [InlineData(429)]
+    [InlineData(408)]
+    public async Task Publish_TosTransientServerError_IsSafeForDurableRetry(int status)
+    {
+        var fake = new FakeTosClient
+        {
+            SignException = ServerError(status, "ServiceUnavailable"),
+        };
+        var publisher = RecordingPublisher(fake);
+
+        var error = await Assert.ThrowsAsync<AsrTransientException>(
+            () => publisher.PublishAsync(Request(WriteAudio(
+                VolcengineTosAudioPublisher.InlineThresholdBytes + 1))));
+
+        Assert.Equal("tos.transport_failed", error.Code);
+        Assert.True(error.RequestNotSent);
+        Assert.Single(fake.PutObjects);
+        Assert.DoesNotContain("SDK-sentinel", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Delete_TosAccessRejected_RemainsCleanupDebtRatherThanJobFailure()
+    {
+        var fake = new FakeTosClient
+        {
+            DeleteException = ServerError(403, "AccessDenied"),
+        };
+        var publisher = RecordingPublisher(fake);
+
+        var error = await Assert.ThrowsAsync<AsrTransientException>(
+            () => publisher.DeleteAsync(new AsrPublishedAudio
+            {
+                Transport = AsrTransports.Tos,
+                Bytes = VolcengineTosAudioPublisher.InlineThresholdBytes + 1,
+                Bucket = TestBucket,
+                ObjectKey = "meetcap-asr/test/test.wav",
+            }));
+
+        Assert.Equal("tos.cleanup_failed", error.Code);
+        Assert.Single(fake.DeletedObjects);
+        Assert.Contains("transcript is unaffected", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -490,6 +577,10 @@ public class VolcengineTosAudioPublisherTests : IDisposable
         /// <summary>Every <see cref="DeleteObjectInput"/> passed to <see cref="DeleteObject"/>, in order.</summary>
         public List<DeleteObjectInput> DeletedObjects { get; } = [];
 
+        public Exception? PutException { get; init; }
+        public Exception? SignException { get; init; }
+        public Exception? DeleteException { get; init; }
+
         /// <summary>
         /// Names of every multipart member that was reached. It stays empty because all of them
         /// throw, but the list makes "no multipart happened" directly assertable.
@@ -527,6 +618,8 @@ public class VolcengineTosAudioPublisherTests : IDisposable
                 input.Content,
                 input.Content is Stream,
                 input.Content?.GetType().FullName));
+            if (PutException is not null)
+                throw PutException;
 
             return new PutObjectOutput();
         }
@@ -535,6 +628,8 @@ public class VolcengineTosAudioPublisherTests : IDisposable
         {
             ArgumentNullException.ThrowIfNull(input);
             PreSignedUrls.Add(input);
+            if (SignException is not null)
+                throw SignException;
 
             // A distinct sentinel, not a real signature and not a URL MeetCap could have built
             // itself: a test that sees it in AsrPublishedAudio.Url has proven the value came from
@@ -557,6 +652,8 @@ public class VolcengineTosAudioPublisherTests : IDisposable
         {
             ArgumentNullException.ThrowIfNull(input);
             DeletedObjects.Add(input);
+            if (DeleteException is not null)
+                throw DeleteException;
             return new DeleteObjectOutput();
         }
 
