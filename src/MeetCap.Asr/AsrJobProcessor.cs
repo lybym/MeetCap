@@ -284,7 +284,8 @@ public sealed class AsrJobProcessor
         }
 
         return errorCode.StartsWith("http.", StringComparison.Ordinal)
-            || string.Equals(errorCode, "audio.unreadable", StringComparison.Ordinal);
+            || string.Equals(errorCode, "audio.unreadable", StringComparison.Ordinal)
+            || string.Equals(errorCode, "tos.transport_failed", StringComparison.Ordinal);
     }
 
     /// <summary>Advances one job by the smallest useful amount of work.</summary>

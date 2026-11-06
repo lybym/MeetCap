@@ -144,10 +144,11 @@ public sealed class VolcengineTosAudioPublisher : IAsrAudioPublisher
         }
 
         var key = BuildObjectKey(request.JobId, DateTime.UtcNow);
-        var client = CreateClient(_options);
-
+        ITosClient? client = null;
+        var uploaded = false;
         try
         {
+            client = CreateClient(_options);
             await Task.Run(
                 () =>
                 {
@@ -170,6 +171,11 @@ public sealed class VolcengineTosAudioPublisher : IAsrAudioPublisher
                     });
                 },
                 cancellationToken).ConfigureAwait(false);
+
+            // The object now exists in the bucket. If a later step (presigning) fails, the
+            // caller never receives the transport identity, so no job row can record cleanup
+            // debt for it: ReleaseIfUploaded reclaims it best-effort before the error is thrown.
+            uploaded = true;
 
             // The presigned GET URL is minted on its own endpoint when one is configured
             // (asr.tos.presign_endpoint): PreSignedURL is a purely local signing operation,
@@ -202,16 +208,22 @@ public sealed class VolcengineTosAudioPublisher : IAsrAudioPublisher
                 RoleTrn = _options.RoleTrn,
             };
         }
+        catch (TosServerException ex)
+        {
+            ReleaseIfUploaded(client, _options.Bucket, key, uploaded);
+            throw ClassifyPublishFailure(ex);
+        }
         catch (Exception ex) when (ex is IOException or TosClientException)
         {
-            // The local artifact is untouched, so this is a retryable transport failure and
-            // never a lost recording. The message names the bucket and key (neither is a
-            // credential) so an operator can find the object, but never the signed URL.
+            ReleaseIfUploaded(client, _options.Bucket, key, uploaded);
+            // TOS staging happens before any provider submit. No ASR task could have been
+            // accepted; durable retries may safely try this job again.
             throw new AsrTransientException(
-                "tos.unavailable",
-                $"TOS upload or URL signing failed for {_options.Bucket}/{key}. The local audio " +
-                "artifact remains durable and the ASR job can retry.",
-                ex);
+                "tos.transport_failed",
+                $"TOS upload or URL signing failed for {_options.Bucket}/{key}. " +
+                "Check the TOS endpoint and network; the local audio artifact is intact.",
+                ex,
+                requestNotSent: true);
         }
     }
 
@@ -234,9 +246,9 @@ public sealed class VolcengineTosAudioPublisher : IAsrAudioPublisher
                 "run 'meetcap asr resume' to finish the cleanup; the local transcript is unaffected.");
         }
 
-        var client = CreateClient(_options);
         try
         {
+            var client = CreateClient(_options);
             // Idempotent by contract: TOS DeleteObject succeeds for an absent key, so a retry
             // after a partial failure is always safe and never reports a phantom object.
             await Task.Run(
@@ -247,14 +259,87 @@ public sealed class VolcengineTosAudioPublisher : IAsrAudioPublisher
                 }),
                 cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is IOException or TosClientException)
+        catch (Exception ex) when (ex is IOException or TosClientException or TosServerException)
         {
+            // Even a permanent TOS access rejection must remain cleanup debt, never an
+            // ASR transcript failure. The operator can correct credentials and resume.
             throw new AsrTransientException(
                 "tos.cleanup_failed",
                 $"Releasing the staged TOS object {published.Bucket}/{published.ObjectKey} failed. " +
                 "The transcript is unaffected; the cleanup stays recorded on the job and is " +
                 "retried by a later 'meetcap asr resume'.",
                 ex);
+        }
+    }
+
+    /// <summary>
+    /// Translate TOS SDK service errors before they escape the durable ASR job taxonomy.
+    /// Only bounded response metadata is displayed: the SDK error message can contain
+    /// request details and must never be propagated to CLI / session artifacts verbatim.
+    /// </summary>
+    private static Exception ClassifyPublishFailure(TosServerException error)
+    {
+        var detail = $"TOS HTTP {error.StatusCode}, code={error.Code ?? "unknown"}, " +
+            $"request_id={error.RequestID ?? "unknown"}.";
+
+        if (error.StatusCode is 401 or 403)
+        {
+            return new AsrPermanentException(
+                "tos.auth_failed",
+                $"{detail} Check [asr.tos] access_key/secret_key, bucket permissions and " +
+                "region/endpoint; SignatureDoesNotMatch commonly indicates an incorrect " +
+                "or mis-copied secret.", error);
+        }
+
+        // Rate limiting and request timeouts can clear without configuration changes.
+        if (error.StatusCode is 408 or 429 || error.StatusCode >= 500 || error.StatusCode < 400)
+        {
+            return new AsrTransientException(
+                "tos.transport_failed",
+                $"{detail} TOS is temporarily unavailable; retry from the durable ASR queue.",
+                error,
+                requestNotSent: true);
+        }
+
+        return new AsrPermanentException(
+            "tos.request_rejected",
+            $"{detail} TOS rejected the upload or presigned URL request. Verify [asr.tos] " +
+            "bucket, region, endpoint and account policy.", error);
+    }
+
+    /// <summary>
+    /// Releases a staged object when a step after <see cref="ITosClient.PutObject"/> failed.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// On the signing-failure path the caller of <see cref="PublishAsync"/> never receives the
+    /// <see cref="AsrPublishedAudio"/> transport identity, so no job row can record cleanup debt
+    /// for the object that was just uploaded. Releasing it here, best-effort, is what prevents a
+    /// successful upload followed by a failed presign from leaving an unreferenced private object
+    /// that only the 3-day TOS lifecycle rule would eventually reclaim.
+    /// </para>
+    /// <para>
+    /// A delete that itself fails is swallowed: the object is private and under that lifecycle
+    /// rule, and a cleanup failure here must never turn a classified publish error into a
+    /// different exception or mask the original cause (<c>docs/ASR_STRATEGY.md</c>).
+    /// </para>
+    /// </remarks>
+    private static void ReleaseIfUploaded(ITosClient? client, string bucket, string key, bool uploaded)
+    {
+        if (!uploaded || client is null)
+        {
+            return;
+        }
+
+        try
+        {
+            client.DeleteObject(new DeleteObjectInput { Bucket = bucket, Key = key });
+        }
+        catch (Exception)
+        {
+            // The 3-day TOS object lifecycle is the backstop. A failed best-effort delete is
+            // neither a transcript failure nor a job failure, and must not mask the original
+            // classified publish error that is about to be thrown.
         }
     }
 
