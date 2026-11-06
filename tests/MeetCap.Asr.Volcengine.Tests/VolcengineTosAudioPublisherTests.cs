@@ -311,7 +311,7 @@ public class VolcengineTosAudioPublisherTests : IDisposable
 
         Assert.Equal("tos.cleanup_failed", error.Code);
         Assert.Single(fake.DeletedObjects);
-        Assert.Contains("transcript is unaffected", error.Message, StringComparison.Ordinal);
+        Assert.Contains("The transcript is unaffected", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]
