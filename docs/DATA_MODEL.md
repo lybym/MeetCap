@@ -265,15 +265,25 @@ without ever mutating the user's original file:
       "stored_path": "C:\\...\\sessions\\ses_01...\\audio\\import\\meeting.m4a",
       "file_name": "meeting.m4a",
       "byte_length": 12345678,
+      "duration_ms": 754000,
       "sha256": "..."
     }
   ]
 }
 ```
 
-`role` is `original` or `normalized`. The mapping lives in the durable session document
-rather than a new table: section 11 forbids creating tables ahead of their feature, and
-section 6 already indexes the artifact each ASR job consumed through `input_artifact`.
+Each entry carries its inspected `duration_ms` (for the `compressed` role, the verified
+derivative duration). `role` is `original`, `normalized`, or `compressed`. The mapping lives in the durable session
+document rather than a new table: section 11 forbids creating tables ahead of their feature,
+and section 6 already indexes the artifact each ASR job consumed through `input_artifact`.
+
+The `compressed` role (issue #53) is a lossy derivative encoded once from the complete
+finalized lossless WAV when `retention.compress` is not `none` and the artifact exceeds
+`retention.compress_min_seconds`. It carries its own SHA-256 and duration, and its
+`original_path` is the lossless WAV it was encoded from. When the compressed ASR transport
+(Part B) is enabled, `asr_jobs.input_artifact` points at the derivative rather than the WAV,
+so the job row already records which artifact was transcribed; the `compressed` artifact is
+the authoritative half of that mapping, exactly as `normalized` is for the WAV path.
 
 ## 4. `events.jsonl`
 

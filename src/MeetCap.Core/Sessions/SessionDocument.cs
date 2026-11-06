@@ -26,6 +26,14 @@ public sealed record SourceArtifact
 
     public long ByteLength { get; init; }
 
+    /// <summary>
+    /// Duration of the stored artifact in milliseconds. For the <c>compressed</c> role this
+    /// is the verified derivative duration (issue #53); for <c>original</c>/<c>normalized</c>
+    /// it is the inspected source/normalized duration. <c>0</c> for artifacts written by
+    /// older versions that did not record it.
+    /// </summary>
+    public long DurationMs { get; init; }
+
     /// <summary>SHA-256 of the stored artifact, for provenance and re-verification.</summary>
     public required string Sha256 { get; init; }
 
@@ -33,6 +41,14 @@ public sealed record SourceArtifact
     {
         public const string Original = "original";
         public const string Normalized = "normalized";
+
+        /// <summary>
+        /// A compressed lossy derivative of the normalized WAV (issue #53). Recorded
+        /// alongside <see cref="Original"/>/<see cref="Normalized"/> with its own SHA-256
+        /// and duration; the compressed file may be the ASR upload payload when the
+        /// compressed transport is enabled (<c>docs/ASR_STRATEGY.md</c> section 12.2).
+        /// </summary>
+        public const string Compressed = "compressed";
     }
 }
 

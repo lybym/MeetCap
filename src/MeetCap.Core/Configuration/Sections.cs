@@ -257,6 +257,65 @@ public sealed class LoggingSection
 public sealed class RetentionSection
 {
     public bool AutomaticDelete { get; set; } = false;
+
+    /// <summary>
+    /// Post-finalize archive compression for long audio artifacts
+    /// (<c>docs/CONFIGURATION.md</c> section 12, issue #53). Allowed: <c>none</c>,
+    /// <c>mp3</c>, <c>aac</c>. <c>none</c> (the default) leaves every artifact as the
+    /// lossless WAV the ASR path already produces, so behavior is byte-identical to
+    /// today.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The threshold (<see cref="CompressMinSeconds"/>) is mandatory only
+    /// <em>when compression is enabled</em>: with <c>compress = "none"</c> no artifact is
+    /// ever compressed, so the "over five minutes are always compressed" statement
+    /// applies solely while a codec is selected. Artifacts at or below the threshold are
+    /// never compressed even when a codec is enabled, so the live 300-second batch
+    /// window stays WAV-inline exactly as today.
+    /// </para>
+    /// <para>
+    /// Compression runs off the capture callback and only from a complete, finalized,
+    /// lossless artifact (the normalized WAV for imports). While capture is running the
+    /// authoritative chunk tree is never rewritten or deleted, so crash recovery is
+    /// unaffected (<c>docs/RELIABILITY.md</c> section 3).
+    /// </para>
+    /// </remarks>
+    public string Compress { get; set; } = "none";
+
+    /// <summary>
+    /// Target bitrate for the compressed derivative, in kbps. Used only when
+    /// <see cref="Compress"/> is not <c>none</c>. ASR accuracy against lossless WAV must
+    /// be measured before lowering this default (issue #53 review update).
+    /// </summary>
+    public int CompressBitrateKbps { get; set; } = 128;
+
+    /// <summary>
+    /// Artifacts at or below this many seconds are never compressed. Applies to a
+    /// complete finalized session/import derivative, not to 300-second live batches.
+    /// Default 300 means artifacts ≤ 5 minutes stay WAV.
+    /// </summary>
+    public int CompressMinSeconds { get; set; } = 300;
+
+    /// <summary>
+    /// Whether the lossless original is kept after a verified successful encode. Default
+    /// <c>true</c>: raw sources are kept by default and <c>false</c> deletion is deferred
+    /// until every consumer and recovery dependency has been audited (issue #53 review
+    /// update). Deletion only ever happens after the derivative's duration has been
+    /// verified equal to the source within tolerance.
+    /// </summary>
+    public bool CompressKeepOriginal { get; set; } = true;
+
+    /// <summary>
+    /// Whether the compressed derivative — not the lossless WAV — is the ASR upload
+    /// payload (issue #53 Part B). Default <c>false</c>: this is opt-in and must only be
+    /// enabled after a real Seed-ASR TOS/inline smoke test with a compressed payload. When
+    /// <c>false</c>, <see cref="Compress"/> still produces the archive derivative (Part A)
+    /// but the WAV remains the upload payload. When <c>true</c> and a derivative exists,
+    /// the job's input artifact points at the derivative so <c>audio.format</c>,
+    /// inline-vs-TOS selection, and <c>request.json</c> all reflect the compressed file.
+    /// </summary>
+    public bool CompressAsrTransport { get; set; } = false;
 }
 
 /// <summary>

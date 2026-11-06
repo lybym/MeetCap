@@ -311,4 +311,95 @@ public class ConfigurationValidatorTests
         c.Asr.FileBatchSeconds = 0;
         Assert.False(ConfigurationValidator.Validate(c).IsValid);
     }
+
+    [Fact]
+    public void Validate_DefaultCompression_IsDisabledAndValid()
+    {
+        // Issue #53: compression is off by default (compress = "none"), so the default
+        // config is valid and no artifact is ever compressed.
+        var c = ConfigurationDefaults.Default();
+        Assert.Equal("none", c.Retention.Compress);
+        Assert.True(c.Retention.CompressKeepOriginal);
+        Assert.False(c.Retention.CompressAsrTransport);
+        var result = ConfigurationValidator.Validate(c);
+        Assert.True(result.IsValid, string.Join(" | ", result.Errors));
+    }
+
+    [Theory]
+    [InlineData("mp3")]
+    [InlineData("aac")]
+    public void Validate_EnabledCompressionCodec_IsValid(string codec)
+    {
+        var c = ConfigurationDefaults.Default();
+        c.Retention.Compress = codec;
+        Assert.True(ConfigurationValidator.Validate(c).IsValid);
+    }
+
+    [Fact]
+    public void Validate_InvalidCompressionCodec_Errors()
+    {
+        var c = ConfigurationDefaults.Default();
+        c.Retention.Compress = "opus";
+        var result = ConfigurationValidator.Validate(c);
+        Assert.False(result.IsValid);
+        Assert.Contains(result.Errors, e => e.Contains("retention.compress"));
+    }
+
+    [Fact]
+    public void Validate_ZeroCompressionBitrate_Errors()
+    {
+        var c = ConfigurationDefaults.Default();
+        c.Retention.Compress = "mp3";
+        c.Retention.CompressBitrateKbps = 0;
+        Assert.False(ConfigurationValidator.Validate(c).IsValid);
+    }
+
+    [Fact]
+    public void Validate_NegativeCompressionThreshold_Errors()
+    {
+        var c = ConfigurationDefaults.Default();
+        c.Retention.CompressMinSeconds = -1;
+        Assert.False(ConfigurationValidator.Validate(c).IsValid);
+    }
+
+    [Fact]
+    public void Validate_CompressAsrTransportWithoutCodec_WarnsButStaysValid()
+    {
+        // Issue #53 review update: compress = "none" cannot coexist with "always
+        // compressed". Enabling the ASR-transport switch while compression is off is a
+        // contradiction surfaced as a warning (not an error), so the config stays loadable.
+        var c = ConfigurationDefaults.Default();
+        c.Retention.Compress = "none";
+        c.Retention.CompressAsrTransport = true;
+        var result = ConfigurationValidator.Validate(c);
+        Assert.True(result.IsValid);
+        Assert.Contains(result.Warnings, w => w.Contains("compress_asr_transport"));
+    }
+
+    [Fact]
+    public void Validate_CompressAsrTransportWithCodec_IsValidWithNoWarning()
+    {
+        var c = ConfigurationDefaults.Default();
+        c.Retention.Compress = "mp3";
+        c.Retention.CompressAsrTransport = true;
+        var result = ConfigurationValidator.Validate(c);
+        Assert.True(result.IsValid);
+        Assert.DoesNotContain(result.Warnings, w => w.Contains("compress_asr_transport"));
+    }
+
+    [Fact]
+    public void Validate_KeepOriginalFalseWithoutTransport_WarnsAboutTheContradiction()
+    {
+        // P1 follow-up (issue #53 review): keep_original = false + asr_transport = false is
+        // contradictory in Part A-only mode — the WAV stays the payload, so deletion is gated
+        // off and the flag has no effect. The combination stays valid (no data loss) but is
+        // surfaced as a warning so the operator knows the flag is inert.
+        var c = ConfigurationDefaults.Default();
+        c.Retention.Compress = "mp3";
+        c.Retention.CompressKeepOriginal = false;
+        c.Retention.CompressAsrTransport = false;
+        var result = ConfigurationValidator.Validate(c);
+        Assert.True(result.IsValid);
+        Assert.Contains(result.Warnings, w => w.Contains("compress_keep_original"));
+    }
 }

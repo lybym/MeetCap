@@ -630,6 +630,54 @@ writes `storage.disk_exhausted`, stops the session, and leaves every already clo
 readable. Older recordings are never deleted automatically
 (`retention.automatic_delete` stays `false` by default).
 
+## 11.1 Retention and archive compression (issue #53)
+
+```toml
+[retention]
+automatic_delete = false
+compress = "none"              # none | mp3 | aac
+compress_bitrate_kbps = 128
+compress_min_seconds = 300     # <= 5 min: never compressed
+compress_keep_original = true  # keep the lossless WAV after a verified encode
+compress_asr_transport = false # Part B: upload the compressed derivative for ASR
+```
+
+Post-finalize archive compression produces a lossy derivative of a long audio artifact next
+to the retention policy. It is split into two parts:
+
+- **Part A — archive derivative (always on when a codec is selected).** When `compress` is
+  not `none` and the finalized artifact exceeds `compress_min_seconds`, a single compressed
+  derivative is encoded once from the complete lossless WAV and recorded in `session.json`
+  with the `compressed` source-artifact role (its own SHA-256 and duration). Artifacts at or
+  below `compress_min_seconds` are never compressed, so the live 300 s batch window stays
+  WAV-inline exactly as today.
+- **Part B — compressed ASR transport (opt-in, off by default).** When
+  `compress_asr_transport` is `true` and a derivative exists, the compressed file — not the
+  WAV — is the ASR upload payload: `audio.format` is the derivative's container, and
+  inline-vs-TOS selection runs against the compressed size. Enable Part B only after a real
+  Seed-ASR TOS/inline smoke test with a compressed payload; documented format support alone
+  does not verify the transport contract.
+
+The threshold is mandatory **only when compression is enabled**: with `compress = "none"`
+(the default) no artifact is ever compressed, so "over five minutes are always compressed"
+applies solely while a codec is selected. A compressed derivative does not always avoid TOS:
+a very long recording can still exceed the 20 MiB inline cutoff as MP3 (≈22 min at 128 kbps,
+≈44 min at 64 kbps; a 2 h 40 m file is ≈154 MB at 128 kbps, ≈77 MB at 64 kbps — 2× and 4×
+the 16 kHz mono PCM16 source, not 4–16×).
+
+Compression runs off the capture callback and only from a complete finalized artifact;
+while capture is running the authoritative chunk tree is never rewritten or deleted, so
+crash recovery is unaffected. The derivative's duration is verified equal to the lossless
+source within a 500 ms tolerance (codec delay/padding) before it is published. Compression
+failure never blocks ASR: the WAV stays the upload payload, the original is kept, and one
+`audio.compress_failed` event is surfaced.
+
+`compress_keep_original` defaults to `true`: raw sources are kept by default. Setting it to
+`false` deletes the normalized lossless derivative only after a verified successful encode,
+and never the user's original source copy; defer that until every consumer and recovery
+dependency has been audited. ASR accuracy against lossless WAV must be measured before
+lowering `compress_bitrate_kbps`.
+
 ## 12. Reload behavior
 
 A running session uses a configuration snapshot captured at session start. Editing the file affects the next session only.

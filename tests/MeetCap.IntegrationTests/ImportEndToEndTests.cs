@@ -66,7 +66,8 @@ public class ImportEndToEndTests : IDisposable
         bool requestSpeakerInfo = true,
         bool writeMarkdown = true,
         FakeAsrProvider? provider = null,
-        string configSnapshotJson = "{\"config_version\":1}")
+        string configSnapshotJson = "{\"config_version\":1}",
+        RetentionSection? retention = null)
     {
         var database = new MeetCapDatabase(DatabasePath);
         database.EnsureMigrated();
@@ -106,6 +107,7 @@ public class ImportEndToEndTests : IDisposable
                 RequestSpeakerInfo = requestSpeakerInfo,
                 CostPerHourCny = 0.8,
                 ConfigSnapshotJson = configSnapshotJson,
+                Retention = retention ?? new RetentionSection(),
             });
 
         return (service, processor, provider, database);
@@ -700,5 +702,195 @@ public class ImportEndToEndTests : IDisposable
         Assert.Contains(SessionEvents.AsrJobSubmitted, events);
         Assert.Contains(SessionEvents.AsrJobCompleted, events);
         Assert.Contains(SessionEvents.SessionCompleted, events);
+    }
+
+    // ---- Issue #53: post-finalize archive compression + compressed ASR transport ----
+
+    private static RetentionSection Compression(string codec = "mp3", bool keepOriginal = true, bool asrTransport = false) => new()
+    {
+        Compress = codec,
+        CompressBitrateKbps = 128,
+        CompressMinSeconds = 300,
+        CompressKeepOriginal = keepOriginal,
+        CompressAsrTransport = asrTransport,
+    };
+
+    private static IReadOnlyList<string> SessionEventsOf(SessionArtifactPaths paths) =>
+        File.ReadAllLines(paths.EventsJsonl)
+            .Select(line => JsonDocument.Parse(line).RootElement.GetProperty("event").GetString())
+            .Where(name => name is not null)
+            .Select(name => name!)
+            .ToArray();
+
+    [Fact]
+    public async Task Import_CompressionEnabled_RecordsCompressedDerivativeAndKeepsTheWav()
+    {
+        // Part A: with a codec selected and the artifact over the threshold, a compressed
+        // derivative is produced and recorded in session.json with the compressed role,
+        // while the lossless WAV stays the upload payload (transport switch is off).
+        Migrate();
+        _media.SourceDescriptor = path => FakeMediaPipeline.Source(path, "mov,mp4,m4a,3gp,3g2,mj2", "aac", 44100, 2);
+        var (service, _, provider, _) = CreateService(retention: Compression(asrTransport: false));
+        provider.EnqueuePoll(AsrPollResult.Completed(new AsrCompletion(ProviderJson, "20000000")));
+
+        var result = await service.ImportAsync(new ImportRequest
+        {
+            SourcePath = _sourcePath,
+            SessionId = "ses_compress",
+            JobId = "job_compress",
+        });
+
+        Assert.True(result.Compressed);
+        Assert.False(result.CompressedAsrPayload);
+        Assert.Single(_media.Compressions);
+
+        var paths = new SessionArtifactPaths(_dataRoot, "ses_compress");
+        var document = new FileSessionArtifactWriter().ReadSessionDocument(paths);
+        Assert.NotNull(document);
+        var compressed = document!.SourceArtifacts.SingleOrDefault(a => a.Role == SourceArtifact.Roles.Compressed);
+        Assert.NotNull(compressed);
+        Assert.False(string.IsNullOrEmpty(compressed!.Sha256));
+
+        // Part A keeps the WAV as the upload payload.
+        var submitted = Assert.Single(provider.Submissions);
+        Assert.Equal("wav", submitted.AudioFormat);
+        Assert.EndsWith("normalized.wav", submitted.InputArtifactPath);
+
+        // The lossless WAV is kept (keep_original = true) and the event is recorded.
+        Assert.True(File.Exists(paths.ImportAudioFile("normalized.wav")));
+        Assert.Contains(SessionEvents.AudioCompressed, SessionEventsOf(paths));
+    }
+
+    [Fact]
+    public async Task Import_CompressedAsrTransport_UploadsTheDerivativeAndShiftsInline()
+    {
+        // Part B (opt-in): the compressed derivative — not the WAV — is the ASR upload
+        // payload. audio.format becomes mp3, and inline-vs-TOS selection runs against the
+        // compressed size, which is small enough to stay inline.
+        Migrate();
+        _media.SourceDescriptor = path => FakeMediaPipeline.Source(path, "mov,mp4,m4a,3gp,3g2,mj2", "aac", 44100, 2);
+        var (service, _, provider, _) = CreateService(retention: Compression(asrTransport: true));
+        provider.EnqueuePoll(AsrPollResult.Completed(new AsrCompletion(ProviderJson, "20000000")));
+
+        var result = await service.ImportAsync(new ImportRequest
+        {
+            SourcePath = _sourcePath,
+            SessionId = "ses_transport",
+            JobId = "job_transport",
+        });
+
+        Assert.True(result.Compressed);
+        Assert.True(result.CompressedAsrPayload);
+
+        var submitted = Assert.Single(provider.Submissions);
+        Assert.Equal("mp3", submitted.AudioFormat);
+        Assert.EndsWith("compressed.mp3", submitted.InputArtifactPath);
+
+        // Inline-threshold shift: the compressed payload is well under the 20 MiB inline
+        // cutoff, so a recording that would need TOS as WAV goes back to inline.
+        Assert.True(
+            new FileInfo(submitted.InputArtifactPath).Length <= VolcengineTosAudioPublisher.InlineThresholdBytes,
+            "the compressed payload should be under the inline threshold");
+    }
+
+    [Fact]
+    public async Task Import_CompressionFailure_FallsBackToWavAndSurfacesAnEvent()
+    {
+        // Compression failure never blocks ASR: the WAV stays the upload payload, the
+        // original is kept, and one audio.compress_failed event is surfaced.
+        Migrate();
+        _media.SourceDescriptor = path => FakeMediaPipeline.Source(path, "mov,mp4,m4a,3gp,3g2,mj2", "aac", 44100, 2);
+        _media.FailCompression = true;
+        var (service, _, provider, _) = CreateService(retention: Compression(asrTransport: true));
+        provider.EnqueuePoll(AsrPollResult.Completed(new AsrCompletion(ProviderJson, "20000000")));
+
+        var result = await service.ImportAsync(new ImportRequest
+        {
+            SourcePath = _sourcePath,
+            SessionId = "ses_fail",
+            JobId = "job_fail",
+        });
+
+        Assert.False(result.Compressed);
+        Assert.False(result.CompressedAsrPayload);
+        Assert.NotNull(result.CompressionFailureReason);
+
+        // The WAV is the payload, not the derivative.
+        var submitted = Assert.Single(provider.Submissions);
+        Assert.Equal("wav", submitted.AudioFormat);
+        Assert.EndsWith("normalized.wav", submitted.InputArtifactPath);
+
+        var paths = new SessionArtifactPaths(_dataRoot, "ses_fail");
+        var document = new FileSessionArtifactWriter().ReadSessionDocument(paths);
+        Assert.NotNull(document);
+        Assert.Null(document!.SourceArtifacts.SingleOrDefault(a => a.Role == SourceArtifact.Roles.Compressed));
+        Assert.True(File.Exists(paths.ImportAudioFile("normalized.wav")));
+        Assert.Contains(SessionEvents.AudioCompressFailed, SessionEventsOf(paths));
+        Assert.DoesNotContain(SessionEvents.AudioCompressed, SessionEventsOf(paths));
+    }
+
+    [Fact]
+    public async Task Import_KeepOriginalFalseWithoutTransport_KeepsTheWavAsPayload()
+    {
+        // P1 regression (issue #53 review): keep_original = false + asr_transport = false must
+        // NOT delete the normalized WAV, because the WAV stays the job's input artifact in
+        // Part A-only mode. Deleting it would leave the job pointing at a gone file. The
+        // deletion is gated on the compressed transport, so the WAV survives and ASR works.
+        Migrate();
+        _media.SourceDescriptor = path => FakeMediaPipeline.Source(path, "mov,mp4,m4a,3gp,3g2,mj2", "aac", 44100, 2);
+        var (service, _, provider, _) = CreateService(retention: Compression(keepOriginal: false, asrTransport: false));
+        provider.EnqueuePoll(AsrPollResult.Completed(new AsrCompletion(ProviderJson, "20000000")));
+
+        var result = await service.ImportAsync(new ImportRequest
+        {
+            SourcePath = _sourcePath,
+            SessionId = "ses_keep",
+            JobId = "job_keep",
+        });
+
+        // The archive derivative is produced (Part A), but the WAV stays the payload.
+        Assert.True(result.Compressed);
+        Assert.False(result.CompressedAsrPayload);
+
+        var submitted = Assert.Single(provider.Submissions);
+        Assert.Equal("wav", submitted.AudioFormat);
+        Assert.EndsWith("normalized.wav", submitted.InputArtifactPath);
+
+        // The lossless WAV the job references is NOT deleted, and ASR succeeded off it.
+        var paths = new SessionArtifactPaths(_dataRoot, "ses_keep");
+        Assert.True(File.Exists(paths.ImportAudioFile("normalized.wav")));
+        Assert.True(result.Succeeded);
+    }
+
+    [Fact]
+    public async Task Import_CompressedAsrTransportAac_UploadsTheAacDerivative()
+    {
+        // AAC wire-format coverage (issue #53 review): the second accepted codec maps to
+        // audio.format = "aac" and a .aac derivative as the upload payload.
+        Migrate();
+        _media.SourceDescriptor = path => FakeMediaPipeline.Source(path, "mov,mp4,m4a,3gp,3g2,mj2", "aac", 44100, 2);
+        var (service, _, provider, _) = CreateService(retention: Compression(codec: "aac", asrTransport: true));
+        provider.EnqueuePoll(AsrPollResult.Completed(new AsrCompletion(ProviderJson, "20000000")));
+
+        var result = await service.ImportAsync(new ImportRequest
+        {
+            SourcePath = _sourcePath,
+            SessionId = "ses_aac",
+            JobId = "job_aac",
+        });
+
+        Assert.True(result.Compressed);
+        Assert.True(result.CompressedAsrPayload);
+
+        var submitted = Assert.Single(provider.Submissions);
+        Assert.Equal("aac", submitted.AudioFormat);
+        Assert.EndsWith("compressed.aac", submitted.InputArtifactPath);
+
+        var paths = new SessionArtifactPaths(_dataRoot, "ses_aac");
+        var document = new FileSessionArtifactWriter().ReadSessionDocument(paths);
+        Assert.NotNull(document);
+        var compressed = document!.SourceArtifacts.Single(a => a.Role == SourceArtifact.Roles.Compressed);
+        // The compressed artifact records its verified duration in session.json (P2 #3).
+        Assert.Equal(754_000, compressed.DurationMs);
     }
 }

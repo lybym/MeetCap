@@ -134,6 +134,111 @@ public sealed class FFmpegMediaPipeline : IMediaPipeline
         }
     }
 
+    /// <summary>
+    /// Encodes a compressed lossy derivative from the lossless WAV (issue #53 Part A).
+    /// Encodes once from the complete finalized artifact; per-chunk re-encoding is
+    /// avoided. The caller re-inspects the output and asserts duration equality before
+    /// publishing it, so this method only owns the FFmpeg invocation.
+    /// </summary>
+    /// <remarks>
+    /// The derivative keeps the source's sample rate and channel count: the lossless input
+    /// is already the 16 kHz mono PCM the ASR path normalizes to, and changing those here
+    /// would be a second normalization. Only the codec and bitrate change. Constant bitrate
+    /// keeps the derivative's size predictable (the inline-vs-TOS selection and the sizing
+    /// estimates rely on it). The documented duration tolerance (500 ms) absorbs the codec's
+    /// inherent frame delay/padding (a LAME/AAC frame is ~23–26 ms); the bitexact flags below
+    /// suppress muxer-level optional metadata, not that encoder delay
+    /// (docs/ASR_STRATEGY.md section 12.2).
+    /// </remarks>
+    public async Task CompressAsync(
+        string inputPath,
+        string outputPath,
+        MediaCompressionPlan plan,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(inputPath);
+        ArgumentException.ThrowIfNullOrWhiteSpace(outputPath);
+        ArgumentNullException.ThrowIfNull(plan);
+
+        if (!plan.Required)
+        {
+            throw new InvalidOperationException(
+                "CompressAsync was called with a plan that does not require compression. " +
+                "Compression must run only when the threshold is exceeded and a codec is selected.");
+        }
+
+        var outputDirectory = Path.GetDirectoryName(outputPath);
+        if (!string.IsNullOrEmpty(outputDirectory))
+        {
+            Directory.CreateDirectory(outputDirectory);
+        }
+
+        Directory.CreateDirectory(_temporaryFolder);
+
+        // Atomic publication (issue #53 review update): encode to a .part sidecar, then move
+        // it onto the final name only after FFmpeg reports success. A crash or abort mid-encode
+        // leaves a partial .part (cleaned up on the failure path) rather than a half-written
+        // derivative at the final location. This mirrors the NormalizingAsrProvider pattern.
+        var partPath = outputPath + ".part";
+
+        try
+        {
+            try
+            {
+                var processed = await FFMpegArguments
+                    .FromFileInput(new FileInfo(inputPath), _ => { })
+                    .OutputToFile(partPath, overwrite: true, arguments => arguments
+                        // Drop any video track and select the first audio stream.
+                        .WithCustomArgument("-vn")
+                        .WithAudioCodec(plan.TargetAudioCodec)
+                        // Constant bitrate: the derivative's size must be predictable for the
+                        // inline-vs-TOS selection and the documented sizing estimates.
+                        .WithCustomArgument($"-b:a {plan.TargetBitrateKbps}k")
+                        // Suppress muxer-level optional metadata (most relevant to MOV/MP4);
+                        // the documented tolerance absorbs the codec's inherent frame padding.
+                        .WithCustomArgument("-fflags +bitexact")
+                        .WithCustomArgument("-flags +bitexact")
+                        .ForceFormat(plan.TargetFormat))
+                    .ProcessAsynchronously(throwOnError: true, CreateOptions())
+                    .ConfigureAwait(false);
+
+                if (!processed || !File.Exists(partPath))
+                {
+                    throw new MediaProbeException(
+                        $"FFmpeg did not produce a compressed artifact at '{outputPath}'.");
+                }
+
+                File.Move(partPath, outputPath, overwrite: true);
+            }
+            catch (Exception ex) when (ex is not MediaProbeException and not MediaToolingException)
+            {
+                throw new MediaProbeException(
+                    $"FFmpeg could not compress '{inputPath}': {ex.Message}", ex);
+            }
+        }
+        finally
+        {
+            // A leftover .part means the encode or the move did not complete; it must never
+            // survive as a stale partial derivative a later run could mistake for complete.
+            TryCleanupPart(partPath);
+        }
+    }
+
+    private static void TryCleanupPart(string partPath)
+    {
+        try
+        {
+            if (File.Exists(partPath))
+            {
+                File.Delete(partPath);
+            }
+        }
+        catch (IOException)
+        {
+            // Best-effort cleanup of a partial sidecar must not mask the original failure.
+        }
+    }
+
     private FFOptions CreateOptions() => new()
     {
         BinaryFolder = _binaries.BinaryFolder,

@@ -68,6 +68,7 @@ internal static class ImportCommand
             CostPerHourCny = configuration.Asr.Volcengine.CostPerHourCny,
             ConfigSnapshotJson = ImportSessionService.SnapshotJson(configuration),
             ConfigVersion = SchemaVersion.Current,
+            Retention = configuration.Retention,
         };
 
         var service = new ImportSessionService(

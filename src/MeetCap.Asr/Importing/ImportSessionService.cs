@@ -47,6 +47,13 @@ public sealed record ImportOptions
 
     public int ConfigVersion { get; init; } = SchemaVersion.Current;
 
+    /// <summary>
+    /// Retention/compression policy (issue #53). Defaults to a fresh
+    /// <see cref="RetentionSection"/> (<c>compress = "none"</c>), so imports that do not
+    /// pass a configured section behave byte-identically to today.
+    /// </summary>
+    public RetentionSection Retention { get; init; } = new();
+
     public TimeProvider TimeProvider { get; init; } = TimeProvider.System;
 }
 
@@ -77,6 +84,22 @@ public sealed record ImportResult
     public required bool Normalized { get; init; }
 
     public string? NormalizedArtifactPath { get; init; }
+
+    /// <summary>True when a compressed derivative was produced (issue #53 Part A).</summary>
+    public bool Compressed { get; init; }
+
+    /// <summary>Absolute path of the compressed derivative, when produced.</summary>
+    public string? CompressedArtifactPath { get; init; }
+
+    /// <summary>
+    /// True when the compressed derivative — not the WAV — is the ASR upload payload
+    /// (issue #53 Part B). False when compression is off, below threshold, failed, or the
+    /// transport switch is not enabled.
+    /// </summary>
+    public bool CompressedAsrPayload { get; init; }
+
+    /// <summary>Why compression failed, when it did (the WAV remained the payload).</summary>
+    public string? CompressionFailureReason { get; init; }
 
     public required double EstimatedCostCny { get; init; }
 
@@ -117,6 +140,7 @@ public sealed class ImportSessionService
     private readonly ITranscriptStore _transcripts;
     private readonly AsrJobProcessor _processor;
     private readonly ImportOptions _options;
+    private readonly AudioCompressionService _compression;
 
     public ImportSessionService(
         IMediaPipeline media,
@@ -134,6 +158,7 @@ public sealed class ImportSessionService
         _transcripts = transcripts ?? throw new ArgumentNullException(nameof(transcripts));
         _processor = processor ?? throw new ArgumentNullException(nameof(processor));
         _options = options ?? throw new ArgumentNullException(nameof(options));
+        _compression = new AudioCompressionService(media, artifacts);
         ArgumentException.ThrowIfNullOrWhiteSpace(options.DataRoot);
         ArgumentException.ThrowIfNullOrWhiteSpace(options.ProviderName);
     }
@@ -203,7 +228,7 @@ public sealed class ImportSessionService
                 ["provider"] = _options.ProviderName,
             });
 
-        artifacts.Add(CopySourceArtifact(paths, sourcePath));
+        artifacts.Add(CopySourceArtifact(paths, sourcePath, sourceMedia.DurationMs));
         PersistSessionDocument();
         _artifacts.AppendEvent(
             paths,
@@ -218,6 +243,8 @@ public sealed class ImportSessionService
             });
 
         var inputArtifactPath = artifacts[0].StoredPath;
+        MediaInfo losslessArtifactMedia = sourceMedia;
+        var canDeleteLossless = false;
         if (plan.Required)
         {
             var normalizedPath = paths.ImportAudioFile("normalized.wav");
@@ -234,8 +261,12 @@ public sealed class ImportSessionService
                     $"Normalized artifact '{normalizedPath}' is still not ASR-ready: {confirmed.Reason}.");
             }
 
-            artifacts.Add(BuildArtifact(SourceArtifact.Roles.Normalized, sourcePath, normalizedPath));
+            artifacts.Add(BuildArtifact(SourceArtifact.Roles.Normalized, sourcePath, normalizedPath, normalizedMedia.DurationMs));
             inputArtifactPath = normalizedPath;
+            losslessArtifactMedia = normalizedMedia;
+            // Only the normalized derivative (not the user's original source copy) may be
+            // deleted when compress_keep_original = false.
+            canDeleteLossless = true;
             PersistSessionDocument();
 
             _artifacts.AppendEvent(
@@ -251,6 +282,46 @@ public sealed class ImportSessionService
                 });
         }
 
+        // Issue #53 Part A: encode a compressed archive derivative once from the complete
+        // finalized lossless artifact. This runs off the capture callback and never while
+        // capture is running; the lossless WAV is the encode input, never a live batch.
+        //
+        // The lossless WAV may only be deleted (keep_original = false) when the compressed
+        // derivative will actually be the ASR payload (compress_asr_transport = true). In
+        // Part A-only mode the WAV stays the job's input artifact, so deleting it here would
+        // leave the job pointing at a file that no longer exists — a data-loss + broken-job
+        // failure mode with no fallback. Coordinating deletion with payload selection is what
+        // closes that gap; the service itself stays generic (it deletes when told it is safe).
+        var mayDeleteLossless = canDeleteLossless && _options.Retention.CompressAsrTransport;
+        var compression = await _compression.CompressAsync(
+            inputArtifactPath,
+            losslessArtifactMedia,
+            _options.Retention,
+            paths,
+            paths.ImportAudioDirectory,
+            "compressed",
+            mayDeleteLossless,
+            atMs: 0,
+            cancellationToken).ConfigureAwait(false);
+
+        // The job's input artifact is the lossless WAV by default. Part B (opt-in) makes the
+        // compressed derivative the ASR upload payload instead, so audio.format, inline-vs-TOS
+        // selection, and request.json all reflect the compressed file. Part A-only keeps the
+        // WAV as the payload while still producing the archive derivative.
+        var jobArtifactPath = inputArtifactPath;
+        var compressedAsrPayload = false;
+        if (compression.Artifact is not null)
+        {
+            artifacts.Add(compression.Artifact);
+            PersistSessionDocument();
+        }
+
+        if (compression.Compressed && _options.Retention.CompressAsrTransport)
+        {
+            jobArtifactPath = compression.DerivativePath!;
+            compressedAsrPayload = true;
+        }
+
         var job = new AsrJob
         {
             Id = jobId,
@@ -259,7 +330,7 @@ public sealed class ImportSessionService
             Provider = _options.ProviderName,
             StartMs = 0,
             EndMs = sourceMedia.DurationMs,
-            InputArtifact = paths.ToRelative(inputArtifactPath),
+            InputArtifact = paths.ToRelative(jobArtifactPath),
             Status = AsrJobStatus.Pending,
             ProviderRequestId = providerRequestId,
             DurationMs = (int)Math.Min(int.MaxValue, sourceMedia.DurationMs),
@@ -304,6 +375,10 @@ public sealed class ImportSessionService
             SourceMedia = sourceMedia,
             Normalized = plan.Required,
             NormalizedArtifactPath = plan.Required ? inputArtifactPath : null,
+            Compressed = compression.Compressed,
+            CompressedArtifactPath = compression.DerivativePath,
+            CompressedAsrPayload = compressedAsrPayload,
+            CompressionFailureReason = compression.FailureReason,
             EstimatedCostCny = processed.Job.EstimatedCostCny,
             ErrorCode = processed.Job.ErrorCode,
             ErrorMessage = processed.Message ?? processed.Job.ErrorMessage,
@@ -321,7 +396,7 @@ public sealed class ImportSessionService
         return string.IsNullOrWhiteSpace(fromFile) ? _options.DefaultTitle : fromFile;
     }
 
-    private SourceArtifact CopySourceArtifact(SessionArtifactPaths paths, string sourcePath)
+    private SourceArtifact CopySourceArtifact(SessionArtifactPaths paths, string sourcePath, long durationMs)
     {
         var fileName = Path.GetFileName(sourcePath);
         var destination = paths.ImportAudioFile(fileName);
@@ -333,10 +408,10 @@ public sealed class ImportSessionService
         }
 
         File.Copy(sourcePath, destination, overwrite: false);
-        return BuildArtifact(SourceArtifact.Roles.Original, sourcePath, destination);
+        return BuildArtifact(SourceArtifact.Roles.Original, sourcePath, destination, durationMs);
     }
 
-    private static SourceArtifact BuildArtifact(string role, string originalPath, string storedPath)
+    private static SourceArtifact BuildArtifact(string role, string originalPath, string storedPath, long durationMs)
     {
         var info = new FileInfo(storedPath);
         return new SourceArtifact
@@ -346,6 +421,7 @@ public sealed class ImportSessionService
             StoredPath = storedPath,
             FileName = info.Name,
             ByteLength = info.Length,
+            DurationMs = durationMs,
             Sha256 = Sha256OfFile(storedPath),
         };
     }

@@ -22,6 +22,21 @@ internal sealed class FakeMediaPipeline : IMediaPipeline
     /// <summary>When true, normalization fails, simulating an FFmpeg failure mid-import.</summary>
     public bool FailNormalization { get; set; }
 
+    /// <summary>Every compression the pipeline was asked to perform (issue #53).</summary>
+    public List<string> Compressions { get; } = new();
+
+    /// <summary>When true, compression fails, simulating an FFmpeg encode failure.</summary>
+    public bool FailCompression { get; set; }
+
+    /// <summary>
+    /// Offset added to the derivative's reported duration versus the source, so a test can
+    /// script a duration mismatch that exceeds the verification tolerance (issue #53).
+    /// </summary>
+    public long DerivativeDurationOffsetMs { get; set; }
+
+    private string? _lastDerivativePath;
+    private long _compressedSourceDurationMs;
+
     public static MediaInfo Source(
         string path,
         string format,
@@ -45,6 +60,14 @@ internal sealed class FakeMediaPipeline : IMediaPipeline
 
     public MediaInfo Inspect(string path)
     {
+        // The compressed derivative is recognized as the file CompressAsync just wrote, so its
+        // inspected shape reflects the codec the plan selected and a duration that matches the
+        // source within the verification tolerance.
+        if (_lastDerivativePath is not null && path == _lastDerivativePath)
+        {
+            return Source(path, "mp3", "mp3", 16000, 1, _compressedSourceDurationMs + DerivativeDurationOffsetMs);
+        }
+
         // The normalized derivative must satisfy the ASR target shape, otherwise the
         // import is expected to fail.
         if (string.Equals(Path.GetFileName(path), "normalized.wav", StringComparison.OrdinalIgnoreCase))
@@ -69,6 +92,27 @@ internal sealed class FakeMediaPipeline : IMediaPipeline
         Normalizations.Add($"{inputPath} -> {outputPath}");
         Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
         File.WriteAllBytes(outputPath, new byte[64]);
+        return Task.CompletedTask;
+    }
+
+    public Task CompressAsync(
+        string inputPath,
+        string outputPath,
+        MediaCompressionPlan plan,
+        CancellationToken cancellationToken = default)
+    {
+        if (FailCompression)
+        {
+            throw new MediaProbeException($"FFmpeg could not compress '{inputPath}': simulated failure");
+        }
+
+        Compressions.Add($"{inputPath} -> {outputPath} ({plan.Codec}/{plan.TargetBitrateKbps}kbps)");
+        Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
+        // A small "compressed" file: small enough that inline-vs-TOS selection (20 MiB) keeps
+        // it inline, which is what the inline-threshold-shift assertion relies on.
+        File.WriteAllBytes(outputPath, new byte[48]);
+        _compressedSourceDurationMs = Inspect(inputPath).DurationMs;
+        _lastDerivativePath = outputPath;
         return Task.CompletedTask;
     }
 }
