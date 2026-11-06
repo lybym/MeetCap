@@ -244,6 +244,8 @@ Contract (issue #26):
 [asr.volcengine]
 api_key = "env:MEETCAP_VOLCENGINE_API_KEY"
 hotword_table_id = "" # optional: Volcengine console boosting table ID
+hotwords = [] # optional: inline entries, e.g. ["海康大华|9", "结对子|6"]
+hotwords_file = "" # optional: absolute path to UTF-8 word|N lines
 request_speaker_info = true
 cost_per_hour_cny = 0.8
 poll_interval_seconds = 5
@@ -252,11 +254,34 @@ http_timeout_seconds = 30
 ```
 
 A non-empty `hotword_table_id` adds `request.corpus.boosting_table_id` to
-Seed-ASR 2.0 file submissions and to sanitized job `request.json`. Leave it empty
-to omit the entire `corpus` object. Create the table in Volcengine's self-learning
+Seed-ASR 2.0 file submissions and to sanitized job `request.json`. An empty
+ID omits the table field; `corpus` itself is omitted only when neither inline
+hotwords nor a table ID is configured. Create the table in Volcengine's self-learning
 console first (one table per request; up to 5,000 entries, each word at most 10
 characters, optional `word|N` weights from 1 to 10); this setting takes a table
 ID, not an inline list of words. See ASR_STRATEGY section 11.
+
+To avoid a console round-trip, configure `hotwords` or `hotwords_file` instead.
+Entries are `word` (default weight 4) or `word|N` (integer weight 1–10).
+The file is UTF-8, one entry per line, with empty lines and lines beginning with
+`#` ignored. An absolute path is required; relative working-directory paths
+are rejected. The array takes precedence over duplicate file words. Invalid
+entries (empty, longer than 10 characters, containing punctuation other than
+spaces, digit-only, or an out-of-range `|N` weight) fail provider construction.
+The merged distinct list is capped at 5,000 words by input order: the adapter
+keeps the first 5,000, drops the tail, and records a truncation warning in the
+sanitized `request.json` so the cap is observable rather than silent. If a
+console table is also set, the provider may truncate the combined corpus:
+MeetCap cannot inspect the table size and validation warns about this uncertainty.
+
+The adapter sends `request.corpus.context` as a JSON **string** containing
+`{"hotwords":[{"word":"海康大华","weight":9}]}`. Do **not** send
+`corpus.hotwords`: the live Seed-ASR 2.0 endpoint does not implement that
+parameter as a hotword array. Empty inline configuration and an empty table
+ID preserve the legacy request without `corpus`. The resolved inline words,
+including any sensitive people/customer/project names, are saved in the local
+sanitized `request.json` for reproducibility. Treat session artifacts as
+sensitive business data; do not publish them unredacted.
 
 Only the API key is user-supplied provider authentication. MeetCap fixes the rest of the wire
 contract to the official Seed-ASR 2.0 recording-file Standard HTTP interface:

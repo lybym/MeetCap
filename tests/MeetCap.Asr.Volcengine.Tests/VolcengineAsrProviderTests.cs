@@ -252,6 +252,88 @@ public class VolcengineAsrProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task Submit_InlineHotwords_ContextIsAJsonStringAndRecorded()
+    {
+        var handler = new StubHttpHandler().Enqueue(HttpStatusCode.OK, apiStatus: "20000000");
+        using var provider = new VolcengineAsrProvider(
+            new VolcengineAsrOptions
+            {
+                ApiKey = ApiKey,
+                BaseUrl = "https://asr.invalid/api/v3/auc/bigmodel",
+                Hotwords = new[]
+                {
+                    new VolcengineHotword("海康大华", 9),
+                    new VolcengineHotword("省战客", 4),
+                },
+            }, handler);
+
+        var submission = await provider.SubmitFileAsync(Request(WriteAudio()));
+        var sent = JsonNode.Parse(Assert.Single(handler.RequestBodies))!;
+        var corpus = sent["request"]!["corpus"]!;
+        Assert.False(corpus.AsObject().ContainsKey("hotwords"));
+        var contextText = corpus["context"]!.GetValue<string>();
+        var context = JsonNode.Parse(contextText)!;
+        Assert.Equal("海康大华", context["hotwords"]![0]!["word"]!.GetValue<string>());
+        Assert.Equal(9, context["hotwords"]![0]!["weight"]!.GetValue<int>());
+        Assert.Equal("省战客", context["hotwords"]![1]!["word"]!.GetValue<string>());
+        Assert.Equal(4, context["hotwords"]![1]!["weight"]!.GetValue<int>());
+
+        var persisted = JsonNode.Parse(submission.SanitizedRequestJson)!;
+        Assert.Equal(contextText, persisted["request"]!["corpus"]!["context"]!.GetValue<string>());
+        Assert.DoesNotContain(ApiKey, submission.SanitizedRequestJson, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Submit_TableAndInlineHotwords_CoexistInOneCorpus()
+    {
+        var handler = new StubHttpHandler().Enqueue(HttpStatusCode.OK, apiStatus: "20000000");
+        using var provider = new VolcengineAsrProvider(
+            new VolcengineAsrOptions
+            {
+                ApiKey = ApiKey,
+                BaseUrl = "https://asr.invalid/api/v3/auc/bigmodel",
+                HotwordTableId = "table-123",
+                Hotwords = new[] { new VolcengineHotword("结对子", 6) },
+            }, handler);
+
+        var submission = await provider.SubmitFileAsync(Request(WriteAudio()));
+        var sent = JsonNode.Parse(Assert.Single(handler.RequestBodies))!;
+        Assert.Equal("table-123", sent["request"]!["corpus"]!["boosting_table_id"]!.GetValue<string>());
+        var context = JsonNode.Parse(sent["request"]!["corpus"]!["context"]!.GetValue<string>())!;
+        Assert.Equal("结对子", context["hotwords"]![0]!["word"]!.GetValue<string>());
+        Assert.Equal("table-123",
+            JsonNode.Parse(submission.SanitizedRequestJson)!["request"]!["corpus"]!["boosting_table_id"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task Submit_HotwordWarnings_RecordedInSanitizedMetadataOnly()
+    {
+        // Truncation (or any other resolution warning) is MeetCap-internal metadata: it must
+        // be recorded in the sanitized request.json so the operator can see the corpus was
+        // capped, but it must never be sent to the provider wire request.
+        var handler = new StubHttpHandler().Enqueue(HttpStatusCode.OK, apiStatus: "20000000");
+        using var provider = new VolcengineAsrProvider(
+            new VolcengineAsrOptions
+            {
+                ApiKey = ApiKey,
+                BaseUrl = "https://asr.invalid/api/v3/auc/bigmodel",
+                Hotwords = new[] { new VolcengineHotword("海康大华", 9) },
+                HotwordWarnings = new[] { "the merged list was truncated to the first 5000 by input order." },
+            }, handler);
+
+        var submission = await provider.SubmitFileAsync(Request(WriteAudio()));
+        var sent = JsonNode.Parse(Assert.Single(handler.RequestBodies))!;
+        // The wire request carries only the provider contract, never internal warnings.
+        Assert.False(sent.AsObject().ContainsKey("hotword_warnings"));
+
+        var persisted = JsonNode.Parse(submission.SanitizedRequestJson)!;
+        var warnings = persisted["hotword_warnings"]!.AsArray();
+        var warning = Assert.Single(warnings);
+        Assert.Contains("truncated", warning!.GetValue<string>(), StringComparison.Ordinal);
+        Assert.DoesNotContain(ApiKey, submission.SanitizedRequestJson, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Submit_UsesEphemeralUrlWithoutPersistingSignedQuery()
     {
         var handler = new StubHttpHandler().Enqueue(HttpStatusCode.OK, apiStatus: "20000000");

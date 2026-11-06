@@ -44,6 +44,8 @@ public static class ConfigSchema
         // asr.volcengine.resource_id were removed and are now reported as legacy keys.
         "asr.volcengine.api_key",
         "asr.volcengine.hotword_table_id",
+        "asr.volcengine.hotwords",
+        "asr.volcengine.hotwords_file",
         "asr.volcengine.request_speaker_info",
         "asr.volcengine.cost_per_hour_cny",
         "asr.volcengine.poll_interval_seconds",

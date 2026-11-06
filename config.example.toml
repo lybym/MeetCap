@@ -52,6 +52,13 @@ final_full_session_pass = false
 # or service_tier to configure. May use an "env:NAME" reference.
 api_key = "env:MEETCAP_VOLCENGINE_API_KEY"
 hotword_table_id = ""
+# Optional inline request-level hotwords (issue #56), e.g. ["海康大华|9", "结对子|6"].
+# Each entry is "word" (default weight 4) or "word|N" (weight 1-10). Sent as
+# request.corpus.context; omitted (with hotword_table_id) when empty.
+hotwords = []
+# Optional absolute path to a UTF-8 file: one "word|N" per line, blank and "#"
+# comment lines ignored. Relative paths are rejected. Merged with hotwords.
+hotwords_file = ""
 request_speaker_info = true
 # Estimate-only hourly rate in CNY; provider pricing is not a product guarantee.
 cost_per_hour_cny = 0.8

@@ -59,6 +59,16 @@ public sealed record VolcengineAsrOptions
 
     public string HotwordTableId { get; init; } = string.Empty;
 
+    /// <summary>Validated inline hotwords resolved once at provider construction.</summary>
+    public IReadOnlyList<VolcengineHotword> Hotwords { get; init; } = Array.Empty<VolcengineHotword>();
+
+    /// <summary>
+    /// Advisory warnings from inline-hotword resolution (for example, that the merged
+    /// list exceeded the 5,000-word cap and was truncated). Recorded in the sanitized
+    /// request.json so truncation is observable without a logger.
+    /// </summary>
+    public IReadOnlyList<string> HotwordWarnings { get; init; } = Array.Empty<string>();
+
     /// <summary>Per-request HTTP timeout enforced by the Polly timeout strategy.</summary>
     public TimeSpan HttpTimeout { get; init; } = TimeSpan.FromSeconds(30);
 
@@ -126,10 +136,13 @@ public static class VolcengineAsrProviderFactory
             throw new AsrConfigurationException(ex.Message);
         }
 
+        var hotwords = VolcengineHotwords.Resolve(volcengine.Hotwords, volcengine.HotwordsFile);
         return new VolcengineAsrOptions
         {
             ApiKey = apiKey,
             HotwordTableId = volcengine.HotwordTableId,
+            Hotwords = hotwords.Words,
+            HotwordWarnings = hotwords.Warnings,
             HttpTimeout = TimeSpan.FromSeconds(volcengine.HttpTimeoutSeconds),
         };
     }

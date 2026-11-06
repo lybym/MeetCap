@@ -479,15 +479,33 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
             ["enable_speaker_info"] = requestSpeakerInfo,
         };
 
-        // The console hotword table belongs inside request.corpus, not at the top level.
-        // Use the same builder for the wire request and sanitized request.json metadata.
-        // When unset, keep the existing request shape with no corpus object at all.
+        // corpus.context is a JSON *string* on the wire (not a nested object and
+        // not corpus.hotwords). The same builder records the resolved values in
+        // request.json without persisting the credential or transport URL.
+        var corpus = new JsonObject();
         if (!string.IsNullOrWhiteSpace(_options.HotwordTableId))
         {
-            providerRequest["corpus"] = new JsonObject
+            corpus["boosting_table_id"] = _options.HotwordTableId;
+        }
+
+        if (_options.Hotwords.Count > 0)
+        {
+            var hotwords = new JsonArray();
+            foreach (var hotword in _options.Hotwords)
             {
-                ["boosting_table_id"] = _options.HotwordTableId,
-            };
+                hotwords.Add(new JsonObject
+                {
+                    ["word"] = hotword.Word,
+                    ["weight"] = hotword.Weight,
+                });
+            }
+
+            corpus["context"] = new JsonObject { ["hotwords"] = hotwords }.ToJsonString();
+        }
+
+        if (corpus.Count > 0)
+        {
+            providerRequest["corpus"] = corpus;
         }
 
         return providerRequest;
@@ -536,6 +554,20 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
             },
             ["request"] = BuildProviderRequest(request.RequestSpeakerInfo),
         };
+
+        // Inline-hotword resolution can emit advisory warnings (e.g. the merged list was
+        // truncated at 5,000). The adapter has no logger, so the sanitized request.json is
+        // the durable, observable surface: a later reader can tell the corpus was capped.
+        if (_options.HotwordWarnings.Count > 0)
+        {
+            var warnings = new JsonArray();
+            foreach (var warning in _options.HotwordWarnings)
+            {
+                warnings.Add(warning);
+            }
+
+            body["hotword_warnings"] = warnings;
+        }
 
         return Scrub(body.ToJsonString());
     }

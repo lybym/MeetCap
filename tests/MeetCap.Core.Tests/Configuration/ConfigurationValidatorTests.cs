@@ -255,6 +255,27 @@ public class ConfigurationValidatorTests
     }
 
     [Fact]
+    public void Validate_HotwordsFileRelativePath_Errors()
+    {
+        var config = ConfigurationDefaults.Default();
+        config.Asr.Volcengine.HotwordsFile = "words.txt";
+        var result = ConfigurationValidator.Validate(config);
+        Assert.False(result.IsValid);
+        Assert.Contains(result.Errors, e => e.Contains("asr.volcengine.hotwords_file", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Validate_CombinedHotwordSources_WarnsAboutUnknownTableCount()
+    {
+        var config = ConfigurationDefaults.Default();
+        config.Asr.Volcengine.HotwordTableId = "table-123";
+        config.Asr.Volcengine.Hotwords = new[] { "海康大华|9" };
+        var result = ConfigurationValidator.Validate(config);
+        Assert.True(result.IsValid);
+        Assert.Contains(result.Warnings, w => w.Contains("combined 5000-word cap", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void Validate_WrongSchemaVersion_Errors()
     {
         var c = ConfigurationDefaults.Default();

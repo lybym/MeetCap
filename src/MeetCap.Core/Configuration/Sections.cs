@@ -153,6 +153,12 @@ public sealed class VolcengineSection
 
     public string HotwordTableId { get; set; } = string.Empty;
 
+    /// <summary>Optional per-request hotwords in word or word|weight form.</summary>
+    public string[] Hotwords { get; set; } = Array.Empty<string>();
+
+    /// <summary>Optional absolute UTF-8 TXT path; one word or word|weight per line.</summary>
+    public string HotwordsFile { get; set; } = string.Empty;
+
     /// <summary>
     /// Ask the provider for anonymous speaker information. These labels are the default
     /// MVP diarization source and stay anonymous provider-job-scoped data, never

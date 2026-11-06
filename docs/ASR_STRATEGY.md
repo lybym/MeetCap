@@ -365,10 +365,45 @@ safety regression tests).
 
 Hotword configuration must be possible without code changes. Raw ASR responses remain immutable.
 
+Inline hotwords are supported from issue #56. The operator may set
+`asr.volcengine.hotwords` (TOML array), `asr.volcengine.hotwords_file`
+(absolute UTF-8 TXT path), or both. Each entry is `word` (default weight 4)
+or `word|N` (1–10), one entry per file line; blank and comment lines are
+ignored. The inline array wins when a word is also present in the file.
+The adapter resolves the list when constructed. Invalid individual terms (empty,
+longer than 10 characters, containing punctuation other than spaces, digit-only,
+or an out-of-range `|N` weight) are rejected before submission. The merged
+distinct list is capped at 5,000 words by input order: instead of refusing a
+long per-meeting vocabulary, the adapter keeps the first 5,000 distinct words,
+drops the tail, and records a truncation warning in the sanitized
+`request.json` so the cap is observable rather than silent.
+
+The actual wire field is `request.corpus.context` with a JSON **string** value,
+not a nested JSON object. Its decoded content is for example
+`{"hotwords":[{"word":"海康大华","weight":9}]}`.
+`corpus.hotwords` is not a supported array parameter: the real endpoint rejects
+an array and did not show an effect for CSV / JSON-encoded-string probes.
+The same builder creates the outbound request and local sanitized
+`asr/jobs/<job>/request.json`; resolved terms are retained there for audit
+and may include private people/customer/project names. No API key or TOS
+signed URL is stored. Raw audio/ASR results are untouched.
+
+The provider's combined limit includes words from the console table, whose
+size MeetCap cannot discover. When both forms are configured, validation warns
+that the operator must keep the combined number within 5,000; it cannot
+honestly guarantee which words the provider will retain. The provider docs
+also describe a 500-token context budget; the 5,000-word aggregate ceiling
+must not be interpreted as a guarantee that a very long inline context will
+be fully honored. Keep inline lists concise and verify the exact deployment
+with the real endpoint. Corpus usage cannot
+be combined with `request.enable_auto_lang`; MeetCap's fixed file-ASR request
+does not set that field.
+
 The configured `asr.volcengine.hotword_table_id` is the ID of a table already created
 in Volcengine's self-learning console. For a non-empty ID, MeetCap sends
-`request.corpus.boosting_table_id` on **each** file-ASR submission; an empty ID
-omits `corpus` entirely. The exact table ID also appears in the sanitized
+`request.corpus.boosting_table_id` on **each** file-ASR submission. When the
+ID is empty, only that field is omitted; `corpus` itself is absent only when
+both the table ID and inline hotwords are unset. The exact table ID also appears in the sanitized
 `asr/jobs/<job>/request.json` metadata (the API key and signed TOS URL do not).
 
 Seed-ASR 2.0 currently supports one boosting table per request. Console tables
