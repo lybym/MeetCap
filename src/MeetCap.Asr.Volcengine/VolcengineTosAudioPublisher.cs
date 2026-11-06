@@ -144,10 +144,9 @@ public sealed class VolcengineTosAudioPublisher : IAsrAudioPublisher
         }
 
         var key = BuildObjectKey(request.JobId, DateTime.UtcNow);
-        var client = CreateClient(_options);
-
         try
         {
+            var client = CreateClient(_options);
             await Task.Run(
                 () =>
                 {
@@ -202,16 +201,20 @@ public sealed class VolcengineTosAudioPublisher : IAsrAudioPublisher
                 RoleTrn = _options.RoleTrn,
             };
         }
+        catch (TosServerException ex)
+        {
+            throw ClassifyPublishFailure(ex);
+        }
         catch (Exception ex) when (ex is IOException or TosClientException)
         {
-            // The local artifact is untouched, so this is a retryable transport failure and
-            // never a lost recording. The message names the bucket and key (neither is a
-            // credential) so an operator can find the object, but never the signed URL.
+            // TOS staging happens before any provider submit. No ASR task could have been
+            // accepted; durable retries may safely try this job again.
             throw new AsrTransientException(
-                "tos.unavailable",
-                $"TOS upload or URL signing failed for {_options.Bucket}/{key}. The local audio " +
-                "artifact remains durable and the ASR job can retry.",
-                ex);
+                "tos.transport_failed",
+                $"TOS upload or URL signing failed for {_options.Bucket}/{key}. " +
+                "Check the TOS endpoint and network; the local audio artifact is intact.",
+                ex,
+                requestNotSent: true);
         }
     }
 
@@ -234,9 +237,9 @@ public sealed class VolcengineTosAudioPublisher : IAsrAudioPublisher
                 "run 'meetcap asr resume' to finish the cleanup; the local transcript is unaffected.");
         }
 
-        var client = CreateClient(_options);
         try
         {
+            var client = CreateClient(_options);
             // Idempotent by contract: TOS DeleteObject succeeds for an absent key, so a retry
             // after a partial failure is always safe and never reports a phantom object.
             await Task.Run(
@@ -247,8 +250,10 @@ public sealed class VolcengineTosAudioPublisher : IAsrAudioPublisher
                 }),
                 cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is IOException or TosClientException)
+        catch (Exception ex) when (ex is IOException or TosClientException or TosServerException)
         {
+            // Even a permanent TOS access rejection must remain cleanup debt, never an
+            // ASR transcript failure. The operator can correct credentials and resume.
             throw new AsrTransientException(
                 "tos.cleanup_failed",
                 $"Releasing the staged TOS object {published.Bucket}/{published.ObjectKey} failed. " +
@@ -256,6 +261,41 @@ public sealed class VolcengineTosAudioPublisher : IAsrAudioPublisher
                 "retried by a later 'meetcap asr resume'.",
                 ex);
         }
+    }
+
+    /// <summary>
+    /// Translate TOS SDK service errors before they escape the durable ASR job taxonomy.
+    /// Only bounded response metadata is displayed: the SDK error message can contain
+    /// request details and must never be propagated to CLI / session artifacts verbatim.
+    /// </summary>
+    private static Exception ClassifyPublishFailure(TosServerException error)
+    {
+        var detail = $"TOS HTTP {error.StatusCode}, code={error.Code ?? "unknown"}, " +
+            $"request_id={error.RequestID ?? "unknown"}.";
+
+        if (error.StatusCode is 401 or 403)
+        {
+            return new AsrPermanentException(
+                "tos.auth_failed",
+                $"{detail} Check [asr.tos] access_key/secret_key, bucket permissions and " +
+                "region/endpoint; SignatureDoesNotMatch commonly indicates an incorrect " +
+                "or mis-copied secret.", error);
+        }
+
+        // Rate limiting and request timeouts can clear without configuration changes.
+        if (error.StatusCode is 408 or 429 || error.StatusCode >= 500 || error.StatusCode < 400)
+        {
+            return new AsrTransientException(
+                "tos.transport_failed",
+                $"{detail} TOS is temporarily unavailable; retry from the durable ASR queue.",
+                error,
+                requestNotSent: true);
+        }
+
+        return new AsrPermanentException(
+            "tos.request_rejected",
+            $"{detail} TOS rejected the upload or presigned URL request. Verify [asr.tos] " +
+            "bucket, region, endpoint and account policy.", error);
     }
 
     /// <summary>
