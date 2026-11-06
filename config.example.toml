@@ -106,6 +106,26 @@ session_log = true
 
 [retention]
 automatic_delete = false
+# Issue #53: post-finalize archive compression for long audio artifacts, next to the
+# retention policy. The threshold is mandatory only when compression is enabled; with
+# compress = "none" (the default) no artifact is ever compressed and behavior is
+# byte-identical to today. Artifacts at or below compress_min_seconds are never
+# compressed even when a codec is enabled, so the live 300 s batch window stays
+# WAV-inline. Compression runs once from the complete finalized lossless artifact, off
+# the capture callback; the authoritative chunk tree is never rewritten while capture is
+# running.
+compress = "none"
+compress_bitrate_kbps = 128
+compress_min_seconds = 300
+# Raw sources are kept by default. Deletion (false) only ever removes the normalized
+# lossless derivative after a verified encode, never the user's original source copy;
+# defer setting false until every consumer/recovery dependency is audited.
+compress_keep_original = true
+# Whether the compressed derivative — not the WAV — is the ASR upload payload (Part B).
+# Opt-in and OFF by default: enable only after a real Seed-ASR TOS/inline smoke test with
+# a compressed payload. When false, compress still produces the archive derivative (Part A)
+# but the WAV remains the upload payload.
+compress_asr_transport = false
 
 # Issue #52: process-lifecycle auto-capture (meetcap watch). Opt-in: a watched meeting
 # app may stay open outside a meeting, so process presence is NOT a verified in-meeting

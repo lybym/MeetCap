@@ -38,6 +38,22 @@ public static class SessionEvents
     public const string MediaNormalized = "session.media.normalized";
 
     /// <summary>
+    /// A compressed lossy derivative was produced from the finalized lossless artifact
+    /// (issue #53 Part A). The derivative is recorded in <c>session.json</c> with the
+    /// <c>compressed</c> role; the lossless original is kept unless
+    /// <c>retention.compress_keep_original</c> is false and the encode was verified.
+    /// </summary>
+    public const string AudioCompressed = "audio.compressed";
+
+    /// <summary>
+    /// Producing the compressed derivative failed, so the lossless WAV remains the ASR
+    /// upload payload. Compression failure never blocks ASR: the original is kept and the
+    /// upload falls back to the WAV (issue #53). Same philosophy as
+    /// <see cref="AsrAudioReleaseFailed"/>.
+    /// </summary>
+    public const string AudioCompressFailed = "audio.compress_failed";
+
+    /// <summary>
     /// A closed chunk was materialized into a durable ASR batch artifact
     /// (<c>docs/ROADMAP.md</c> M4). Emitted before
     /// <see cref="AsrJobQueued"/>, because the durable batch is what the job names.

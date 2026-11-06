@@ -501,7 +501,9 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
     /// lives in the session directory, and copying it into the job metadata would
     /// duplicate user audio for no provenance benefit. Headers -- which carry the API
     /// key -- are never included, and the endpoint/resource id are recorded so a later
-    /// reader can tell which fixed contract produced the artifact.
+    /// reader can tell which fixed contract produced the artifact. The payload SHA-256
+    /// records the exact bytes uploaded (the compressed derivative when issue #53 Part B
+    /// is enabled, the WAV otherwise), so transport facts stay verifiable.
     /// </remarks>
     private string BuildSanitizedRequestJson(AsrFileRequest request, AsrPublishedAudio audio)
     {
@@ -522,6 +524,9 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
                 ["format"] = request.AudioFormat,
                 ["transport"] = audio.Transport,
                 ["bytes"] = audio.Bytes,
+                // SHA-256 of the actual upload payload (issue #53): records the derivative's
+                // transport facts so a later reader can verify which bytes were transcribed.
+                ["sha256"] = TrySha256(request.InputArtifactPath),
                 ["inline_bytes"] = audio.Transport == AsrTransports.Inline ? audio.Bytes : null,
                 ["tos_bucket"] = audio.Bucket,
                 ["tos_object_key"] = audio.ObjectKey,
@@ -533,6 +538,26 @@ public sealed class VolcengineAsrProvider : IAsrProvider, IDisposable
         };
 
         return Scrub(body.ToJsonString());
+    }
+
+    /// <summary>
+    /// Computes the SHA-256 of the upload payload, or <c>null</c> when the artifact is no
+    /// longer readable (it was already checked present in <see cref="SubmitFileAsync"/>, so
+    /// a missing file here is a race that must not crash the submit; the <c>null</c> is
+    /// recorded rather than a stale hash).
+    /// </summary>
+    private static string? TrySha256(string path)
+    {
+        try
+        {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
+                128 * 1024, FileOptions.SequentialScan);
+            return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(stream)).ToLowerInvariant();
+        }
+        catch (IOException)
+        {
+            return null;
+        }
     }
 
     /// <summary>Removes any occurrence of the API key from text that will be stored or logged.</summary>

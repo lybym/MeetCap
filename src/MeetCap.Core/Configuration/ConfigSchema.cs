@@ -82,6 +82,14 @@ public static class ConfigSchema
         "logging.level",
         "logging.session_log",
         "retention.automatic_delete",
+        // Issue #53: post-finalize archive compression next to the retention policy. The
+        // threshold is mandatory only when compression is enabled (compress != "none"); the
+        // ASR-transport switch (Part B) is opt-in and off by default.
+        "retention.compress",
+        "retention.compress_bitrate_kbps",
+        "retention.compress_min_seconds",
+        "retention.compress_keep_original",
+        "retention.compress_asr_transport",
         // Issue #52: process-lifecycle auto-capture ([watch]). The watcher is a CLI
         // command over the existing capture stack, so these are the only new persisted
         // contract keys; no SQLite table or migration is added.

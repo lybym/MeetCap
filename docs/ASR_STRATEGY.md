@@ -463,6 +463,49 @@ cleanup. Cleanup failure does not invalidate a successful transcript. Deployment
 configure a three-day TOS lifecycle expiration on the dedicated `meetcap-asr/` prefix as an
 orphan-cleanup safety net; MeetCap does not mutate bucket lifecycle policy itself.
 
+### 12.2 Compressed ASR transport (issue #53)
+
+Post-finalize compression is split into (A) a post-finalize archive derivative and (B) an
+optional compressed ASR transport, with the transport enabled only after a real Seed-ASR
+TOS/inline smoke test with a compressed payload.
+
+**Part A — archive derivative.** When `retention.compress` is not `none` and the finalized
+artifact exceeds `retention.compress_min_seconds` (default 300 s), a single lossy derivative
+is encoded once from the complete lossless WAV (`MediaCompressionPlanner` is the pure policy;
+`FFmpegMediaPipeline.CompressAsync` is the encode). The threshold applies to a complete
+finalized session/import derivative, **never** to a 300-second live batch. Encoding is off the
+capture callback and never rewrites or deletes authoritative chunks while capture is running,
+so crash recovery is unaffected. The derivative is recorded in `session.json` with the
+`compressed` role (its own SHA-256 and duration).
+
+**Part B — compressed ASR transport (opt-in).** When `retention.compress_asr_transport` is
+`true` and a derivative exists, the compressed file is the upload payload:
+
+```text
+normalized WAV (> compress_min_seconds, compress != "none")
+  -> encode once -> compressed.mp3 / .aac
+  -> verify duration == WAV within 500 ms tolerance (codec delay/padding)
+  -> publish the compressed file: audio.format = mp3|aac, rate/bits/channel = derivative's
+  -> inline-vs-TOS selection runs against the compressed size
+```
+
+The timeline-correctness guard is the verified duration equality: the provider's timestamps
+map onto the uploaded file's wall-clock timeline, so `StartOffsetMs`/merger assumptions stay
+valid. `request.json` records the derivative's transport facts (format, bytes, sha256) like it
+does today for WAV/TOS.
+
+**No-loss fallback.** Compression failure never blocks ASR: the WAV stays the upload payload,
+the original is kept, and one `audio.compress_failed` event is surfaced. The original WAV is
+deleted only after a verified successful encode and only when `compress_keep_original = false`
+(default `true`); only the normalized derivative is ever deleted, never the user's original
+source copy.
+
+**Sizing.** A compressed derivative does not always avoid TOS. Relative to 16 kHz mono PCM16
+(256 kbps), 128 kbps MP3 is ~2× smaller and 64 kbps ~4× — not universally 4–16×. A 2 h 40 m
+file is ≈154 MB at 128 kbps (not 55 MB) and ≈77 MB at 64 kbps (not 28 MB). A 20 MiB inline
+cutoff is ≈22 min at 128 kbps or ≈44 min at 64 kbps. ASR accuracy against lossless WAV must be
+measured before lowering the bitrate default.
+
 ## 13. Observability
 
 For every ASR job record:

@@ -33,6 +33,14 @@ public sealed record SourceArtifact
     {
         public const string Original = "original";
         public const string Normalized = "normalized";
+
+        /// <summary>
+        /// A compressed lossy derivative of the normalized WAV (issue #53). Recorded
+        /// alongside <see cref="Original"/>/<see cref="Normalized"/> with its own SHA-256
+        /// and duration; the compressed file may be the ASR upload payload when the
+        /// compressed transport is enabled (<c>docs/ASR_STRATEGY.md</c> section 12.2).
+        /// </summary>
+        public const string Compressed = "compressed";
     }
 }
 

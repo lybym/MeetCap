@@ -134,6 +134,77 @@ public sealed class FFmpegMediaPipeline : IMediaPipeline
         }
     }
 
+    /// <summary>
+    /// Encodes a compressed lossy derivative from the lossless WAV (issue #53 Part A).
+    /// Encodes once from the complete finalized artifact; per-chunk re-encoding is
+    /// avoided. The caller re-inspects the output and asserts duration equality before
+    /// publishing it, so this method only owns the FFmpeg invocation.
+    /// </summary>
+    /// <remarks>
+    /// The derivative keeps the source's sample rate and channel count: the lossless input
+    /// is already the 16 kHz mono PCM the ASR path normalizes to, and changing those here
+    /// would be a second normalization. Only the codec and bitrate change. Constant bitrate
+    /// keeps the derivative's size predictable (the inline-vs-TOS selection and the sizing
+    /// estimates rely on it), and the bitexact flags minimize codec delay/padding so the
+    /// probed duration stays within the documented tolerance (docs/ASR_STRATEGY.md section 12.2).
+    /// </remarks>
+    public async Task CompressAsync(
+        string inputPath,
+        string outputPath,
+        MediaCompressionPlan plan,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(inputPath);
+        ArgumentException.ThrowIfNullOrWhiteSpace(outputPath);
+        ArgumentNullException.ThrowIfNull(plan);
+
+        if (!plan.Required)
+        {
+            throw new InvalidOperationException(
+                "CompressAsync was called with a plan that does not require compression. " +
+                "Compression must run only when the threshold is exceeded and a codec is selected.");
+        }
+
+        var outputDirectory = Path.GetDirectoryName(outputPath);
+        if (!string.IsNullOrEmpty(outputDirectory))
+        {
+            Directory.CreateDirectory(outputDirectory);
+        }
+
+        Directory.CreateDirectory(_temporaryFolder);
+
+        try
+        {
+            var processed = await FFMpegArguments
+                .FromFileInput(new FileInfo(inputPath), _ => { })
+                .OutputToFile(outputPath, overwrite: true, arguments => arguments
+                    // Drop any video track and select the first audio stream.
+                    .WithCustomArgument("-vn")
+                    .WithAudioCodec(plan.TargetAudioCodec)
+                    // Constant bitrate: the derivative's size must be predictable for the
+                    // inline-vs-TOS selection and the documented sizing estimates.
+                    .WithCustomArgument($"-b:a {plan.TargetBitrateKbps}k")
+                    // Minimize encoder delay/padding so the probed duration stays within the
+                    // documented tolerance (docs/ASR_STRATEGY.md section 12.2).
+                    .WithCustomArgument("-fflags +bitexact")
+                    .WithCustomArgument("-flags +bitexact")
+                    .ForceFormat(plan.TargetFormat))
+                .ProcessAsynchronously(throwOnError: true, CreateOptions())
+                .ConfigureAwait(false);
+
+            if (!processed || !File.Exists(outputPath))
+            {
+                throw new MediaProbeException(
+                    $"FFmpeg did not produce a compressed artifact at '{outputPath}'.");
+            }
+        }
+        catch (Exception ex) when (ex is not MediaProbeException and not MediaToolingException)
+        {
+            throw new MediaProbeException(
+                $"FFmpeg could not compress '{inputPath}': {ex.Message}", ex);
+        }
+    }
+
     private FFOptions CreateOptions() => new()
     {
         BinaryFolder = _binaries.BinaryFolder,

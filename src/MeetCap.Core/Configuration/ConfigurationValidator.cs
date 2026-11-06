@@ -47,6 +47,13 @@ public static class ConfigurationValidator
         { "Trace", "Debug", "Information", "Warning", "Error", "Critical" };
 
     /// <summary>
+    /// Allowed post-finalize compression codecs (<c>docs/CONFIGURATION.md</c> section 12,
+    /// issue #53). <c>none</c> disables compression entirely.
+    /// </summary>
+    private static readonly HashSet<string> s_compressionCodecs = new(StringComparer.Ordinal)
+        { "none", "mp3", "aac" };
+
+    /// <summary>
     /// Validates values and reports unknown keys. Returns a result whose
     /// <see cref="ValidationResult.Errors"/> are actionable, user-facing strings.
     /// </summary>
@@ -91,6 +98,7 @@ public static class ConfigurationValidator
         ValidateAsr(config, result);
         ValidateSpeakers(config, result);
         ValidateLogging(config, result);
+        ValidateRetention(config, result);
         ValidateWatch(config, result);
 
         return result;
@@ -259,6 +267,40 @@ public static class ConfigurationValidator
             result.AddError(
                 $"logging.level='{config.Logging.Level}' is invalid. " +
                 "Allowed: Trace, Debug, Information, Warning, Error, Critical.");
+        }
+    }
+
+    private static void ValidateRetention(MeetCapConfiguration config, ValidationResult result)
+    {
+        var retention = config.Retention;
+
+        if (!s_compressionCodecs.Contains(retention.Compress))
+        {
+            result.AddError(
+                $"retention.compress='{retention.Compress}' is invalid. Allowed: none, mp3, aac.");
+        }
+
+        // A bitrate is only meaningful when a codec is selected, but it must always be a
+        // positive number so a later switch to a codec never silently encodes at zero.
+        RequirePositive(result, "retention.compress_bitrate_kbps", retention.CompressBitrateKbps);
+
+        // Zero is a supported value and means "never compress even when a codec is enabled",
+        // which is a deliberate degenerate configuration rather than a typo. A negative
+        // threshold has no meaning.
+        RequireNonNegative(result, "retention.compress_min_seconds", retention.CompressMinSeconds);
+
+        // The ASR-transport switch (Part B) is only meaningful when compression is enabled:
+        // with compress = "none" no derivative is ever produced, so publishing a compressed
+        // payload is impossible. Surfacing the contradiction as a warning (not an error)
+        // keeps a config that turns compression off while leaving the flag on loadable, while
+        // still telling the operator the flag has no effect (issue #53 review update:
+        // compress = none cannot coexist with "always compressed").
+        if (retention.CompressAsrTransport && string.Equals(retention.Compress, "none", StringComparison.Ordinal))
+        {
+            result.AddWarning(
+                "retention.compress_asr_transport is true while retention.compress is 'none'; " +
+                "no compressed derivative is produced, so the compressed ASR transport has no " +
+                "effect. Set retention.compress to 'mp3' or 'aac' to enable it.");
         }
     }
 

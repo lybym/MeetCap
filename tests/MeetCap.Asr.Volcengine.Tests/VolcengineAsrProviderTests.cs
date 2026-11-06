@@ -158,6 +158,33 @@ public class VolcengineAsrProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task Submit_CompressedPayload_MapsFormatToMp3AndRecordsShaInRequestJson()
+    {
+        // Issue #53 Part B: when the job's input artifact is the compressed derivative, the
+        // provider format label is the derivative's container (mp3), and request.json records
+        // the payload's transport facts including its SHA-256.
+        var handler = new StubHttpHandler().Enqueue(HttpStatusCode.OK, apiStatus: "20000000");
+        using var provider = Create(handler);
+
+        var path = WriteAudio(name: "compressed.mp3", bytes: 1800);
+        var submission = await provider.SubmitFileAsync(Request(path) with { AudioFormat = "mp3" });
+
+        // The wire body carries the derivative's container as audio.format.
+        var body = handler.RequestBodies[0];
+        Assert.Contains("\"format\":\"mp3\"", body, StringComparison.Ordinal);
+
+        // request.json records the derivative's transport facts: format, bytes, and sha.
+        var persisted = JsonNode.Parse(submission.SanitizedRequestJson)!;
+        Assert.Equal("mp3", persisted["audio"]!["format"]!.GetValue<string>());
+        Assert.Equal(1800, persisted["audio"]!["bytes"]!.GetValue<long>());
+
+        var recordedSha = persisted["audio"]!["sha256"]!.GetValue<string>();
+        var expectedSha = Convert.ToHexString(
+            System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(path))).ToLowerInvariant();
+        Assert.Equal(expectedSha, recordedSha);
+    }
+
+    [Fact]
     public async Task Submit_ConfiguredHotwordTable_IsSentAndRecordedInSanitizedMetadata()
     {
         var handler = new StubHttpHandler().Enqueue(HttpStatusCode.OK, apiStatus: "20000000");
