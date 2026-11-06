@@ -67,6 +67,14 @@ public sealed record AsrPublishedAudio
     /// <summary>Durable object key, or <c>null</c> for the inline transport.</summary>
     public string? ObjectKey { get; init; }
 
+    /// <summary>
+    /// Cross-service-authorization role TRN to send as <c>audio.role_trn</c> for the TOS
+    /// transport, or empty when the feature is not configured. A non-secret IAM resource
+    /// name, so it may reach <c>request.json</c>; it authorizes the provider-side fetch of
+    /// the presigned URL and is what makes that fetch internal-network billed.
+    /// </summary>
+    public string RoleTrn { get; init; } = string.Empty;
+
     /// <summary>True when a remote copy exists and must be released after the job is terminal.</summary>
     public bool HasRemoteCopy =>
         string.Equals(Transport, AsrTransports.Tos, StringComparison.Ordinal)

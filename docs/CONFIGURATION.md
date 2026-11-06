@@ -336,7 +336,27 @@ region = "cn-beijing"
 endpoint = "https://tos-cn-beijing.volces.com"
 access_key = "env:TOS_ACCESS_KEY"
 secret_key = "env:TOS_SECRET_KEY"
+# Optional cross-service authorization (speech_asr_prod -> TOS read): with both keys set,
+# the presigned GET URL is minted on the bucket's internal endpoint and travels as
+# audio.role_trn, so the provider-side fetch is billed as internal egress (free in
+# cn-beijing/cn-shanghai) instead of public. See issue #59.
+role_trn = "trn:iam::<account>:role/AucAccessTosRole"
+presign_endpoint = "tos-cn-beijing.ivolces.com"
 ```
+
+The two optional keys are independent of each other and both default to empty (feature off):
+
+- `role_trn` — the IAM role TRN created by the cross-service authorization (the role trusted
+  by `speech_asr_prod`, holding a read-only TOS policy). When set, the submit body carries
+  `audio.role_trn`; the fetch of `audio.url` is then authorized against the bucket and billed
+  as internal. It is a non-secret IAM resource name: it may reach `request.json` as
+  `audio.tos_role_trn`, unlike the signed URL, which is never persisted;
+- `presign_endpoint` — the endpoint used only to mint the presigned GET URL, typically the
+  bucket's internal host family (`tos-cn-beijing.ivolces.com`; the bucket domain is then
+  `<bucket>.tos-cn-beijing.ivolces.com`). Signing is a purely local operation, so this
+  endpoint does not need to be reachable from the MeetCap machine; the upload and the delete
+  keep using `endpoint`. Empty signs the URL on `endpoint` (public), which is the behavior
+  every release before this key shipped.
 
 Transport policy is fixed product behavior rather than additional tuning:
 

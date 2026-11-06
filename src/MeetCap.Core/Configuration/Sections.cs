@@ -120,6 +120,22 @@ public sealed class TosSection
     public string Endpoint { get; set; } = string.Empty;
     public string AccessKey { get; set; } = string.Empty;
     public string SecretKey { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Optional role TRN from the cross-service authorization (IAM role trusted by
+    /// <c>speech_asr_prod</c>, e.g. <c>AucAccessTosRole</c>). When set, it travels as
+    /// <c>audio.role_trn</c> so the provider-side fetch of <c>audio.url</c> is authorized
+    /// and billed as internal egress (free in cn-beijing/cn-shanghai) instead of public.
+    /// </summary>
+    public string RoleTrn { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Optional endpoint used only to mint the presigned GET URL, e.g. the bucket's
+    /// internal endpoint family (<c>tos-cn-beijing.ivolces.com</c>). The upload and the
+    /// delete keep using <see cref="Endpoint"/>; only the URL handed to the provider is
+    /// built on this host. Empty means "sign on <see cref="Endpoint"/>" (public).
+    /// </summary>
+    public string PresignEndpoint { get; set; } = string.Empty;
 }
 
 /// <summary>

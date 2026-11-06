@@ -161,7 +161,9 @@ public static class VolcengineAsrProviderFactory
         }
 
         // Any non-empty field means the operator intended to configure TOS, so every field is
-        // now required rather than silently ignored.
+        // now required rather than silently ignored. RoleTrn and PresignEndpoint are the
+        // optional cross-service-authorization pair (issue #59): they only take effect
+        // alongside a full configuration and never require each other.
         var env = environment ?? Environment.GetEnvironmentVariable;
         try
         {
@@ -170,7 +172,9 @@ public static class VolcengineAsrProviderFactory
                 Required("asr.tos.region", tos.Region),
                 Required("asr.tos.endpoint", tos.Endpoint),
                 RequiredSecret("asr.tos.access_key", tos.AccessKey, env),
-                RequiredSecret("asr.tos.secret_key", tos.SecretKey, env)));
+                RequiredSecret("asr.tos.secret_key", tos.SecretKey, env),
+                tos.RoleTrn.Trim(),
+                tos.PresignEndpoint.Trim()));
         }
         catch (CredentialResolutionException ex)
         {

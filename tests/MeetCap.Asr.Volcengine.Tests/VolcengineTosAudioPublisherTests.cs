@@ -382,6 +382,53 @@ public class VolcengineTosAudioPublisherTests : IDisposable
     }
 
     [Fact]
+    public async Task Publish_APresignEndpoint_MintsTheUrlOnItsOwnClientAndCarriesTheRoleTrn()
+    {
+        // The cross-service-authorization pair (issue #59): the presigned URL is signed on
+        // the bucket's internal endpoint (a purely local signing operation — the URL's host
+        // binds the signature, and the internal host is only reachable from the provider's
+        // network), and the role TRN rides on the published audio so the submit adds
+        // audio.role_trn.
+        var options = TosOptions() with
+        {
+            RoleTrn = "trn:iam::<account>:role/AucAccessTosRole",
+            PresignEndpoint = "tos-cn-beijing.ivolces.com",
+        };
+        var clients = new List<VolcengineTosOptions>();
+        var recorder = new FakeTosClient();
+        var publisher = new VolcengineTosAudioPublisher(options, o => { clients.Add(o); return recorder; });
+
+        var published = await publisher.PublishAsync(
+            Request(WriteAudio(VolcengineTosAudioPublisher.InlineThresholdBytes + 1), TestJobId));
+
+        // Two clients: the upload stays on the configured public endpoint, the presign runs
+        // on the internal override.
+        Assert.Equal(2, clients.Count);
+        Assert.Equal("tos-cn-beijing.volces.com", clients[0].Endpoint);
+        Assert.Equal("tos-cn-beijing.ivolces.com", clients[1].Endpoint);
+        Assert.Single(recorder.PreSignedUrls);
+        Assert.Equal("trn:iam::<account>:role/AucAccessTosRole", published.RoleTrn);
+        Assert.Equal(FakeSignedUrl, published.Url);
+    }
+
+    [Fact]
+    public async Task Publish_WithoutAPresignEndpoint_SignsOnTheSameClientAsTheUpload()
+    {
+        // Default behaviour is unchanged: one client serves the upload and the presign, and
+        // the published audio carries no role TRN when none is configured.
+        var clients = new List<VolcengineTosOptions>();
+        var recorder = new FakeTosClient();
+        var publisher = new VolcengineTosAudioPublisher(TosOptions(), o => { clients.Add(o); return recorder; });
+
+        var published = await publisher.PublishAsync(
+            Request(WriteAudio(VolcengineTosAudioPublisher.InlineThresholdBytes + 1), TestJobId));
+
+        var client = Assert.Single(clients);
+        Assert.Equal("tos-cn-beijing.volces.com", client.Endpoint);
+        Assert.Equal(string.Empty, published.RoleTrn);
+    }
+
+    [Fact]
     public async Task Delete_AfterAnOversizedPublish_ReleasesTheSameStableObject()
     {
         // Cleanup uses the durable identity (bucket plus key) and never the signed URL: the URL is

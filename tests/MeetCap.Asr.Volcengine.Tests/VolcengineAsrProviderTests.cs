@@ -204,6 +204,62 @@ public class VolcengineAsrProviderTests : IDisposable
     }
 
     [Fact]
+    public async Task Submit_CrossServiceRoleTrn_IsSentAndRecordedInSanitizedMetadata()
+    {
+        // The optional role TRN (issue #59) authorizes the provider-side fetch of audio.url
+        // against the TOS bucket (internal egress instead of public). It is a non-secret IAM
+        // resource name, so it is both sent on the wire and recorded in the sanitized
+        // request.json.
+        var handler = new StubHttpHandler().Enqueue(HttpStatusCode.OK, apiStatus: "20000000");
+        var publisher = new FakePublisher(new AsrPublishedAudio
+        {
+            Transport = "tos",
+            Url = "https://tos.invalid/object?X-Tos-Signature=secret",
+            Bytes = 22 * 1024 * 1024,
+            Bucket = "meetcap-asr",
+            ObjectKey = "meetcap-asr/shard/2026/11/06/job_1.wav",
+            RoleTrn = "trn:iam::<account>:role/AucAccessTosRole",
+        });
+        using var provider = new VolcengineAsrProvider(
+            new VolcengineAsrOptions { ApiKey = ApiKey, BaseUrl = "https://asr.invalid/api/v3/auc/bigmodel" },
+            handler,
+            publisher);
+
+        var submission = await provider.SubmitFileAsync(Request(WriteAudio()));
+
+        var sent = JsonNode.Parse(Assert.Single(handler.RequestBodies))!;
+        Assert.Equal(
+            "trn:iam::<account>:role/AucAccessTosRole",
+            sent["audio"]!["role_trn"]!.GetValue<string>());
+        var persisted = JsonNode.Parse(submission.SanitizedRequestJson)!;
+        Assert.Equal(
+            "trn:iam::<account>:role/AucAccessTosRole",
+            persisted["audio"]!["tos_role_trn"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task Submit_UnsetRoleTrn_DoesNotAddTheAudioParameter()
+    {
+        var handler = new StubHttpHandler().Enqueue(HttpStatusCode.OK, apiStatus: "20000000");
+        var publisher = new FakePublisher(new AsrPublishedAudio
+        {
+            Transport = "tos", Url = "https://tos.invalid/object", Bytes = 22 * 1024 * 1024,
+            Bucket = "meetcap-asr", ObjectKey = "meetcap-asr/shard/2026/11/06/job_1.wav",
+        });
+        using var provider = new VolcengineAsrProvider(
+            new VolcengineAsrOptions { ApiKey = ApiKey, BaseUrl = "https://asr.invalid/api/v3/auc/bigmodel" },
+            handler,
+            publisher);
+
+        var submission = await provider.SubmitFileAsync(Request(WriteAudio()));
+
+        var sent = JsonNode.Parse(Assert.Single(handler.RequestBodies))!;
+        Assert.False(sent["audio"]!.AsObject().ContainsKey("role_trn"));
+        var persisted = JsonNode.Parse(submission.SanitizedRequestJson)!;
+        Assert.Null(persisted["audio"]!["tos_role_trn"]);
+    }
+
+    [Fact]
     public async Task Submit_ReportsTheTransportIdentitySoTheCallerCanPersistAndReleaseIt()
     {
         // The submission is the only place the caller can learn that a remote copy exists: the

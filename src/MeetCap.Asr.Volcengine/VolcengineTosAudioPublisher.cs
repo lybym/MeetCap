@@ -171,8 +171,19 @@ public sealed class VolcengineTosAudioPublisher : IAsrAudioPublisher
                 },
                 cancellationToken).ConfigureAwait(false);
 
+            // The presigned GET URL is minted on its own endpoint when one is configured
+            // (asr.tos.presign_endpoint): PreSignedURL is a purely local signing operation,
+            // so the internal-endpoint client never needs to be reachable from this
+            // machine. The signature binds the URL's host, so the provider-side fetch of
+            // that URL resolves over the bucket's internal network and is billed as
+            // internal egress (free in cn-beijing/cn-shanghai) instead of public. Without
+            // the override the URL is signed on the same endpoint the upload used.
+            var presignClient = string.IsNullOrWhiteSpace(_options.PresignEndpoint)
+                ? client
+                : CreateClient(_options with { Endpoint = _options.PresignEndpoint });
+
             var signed = await Task.Run(
-                () => client.PreSignedURL(new PreSignedURLInput
+                () => presignClient.PreSignedURL(new PreSignedURLInput
                 {
                     Bucket = _options.Bucket,
                     Key = key,
@@ -188,6 +199,7 @@ public sealed class VolcengineTosAudioPublisher : IAsrAudioPublisher
                 Bytes = info.Length,
                 Bucket = _options.Bucket,
                 ObjectKey = key,
+                RoleTrn = _options.RoleTrn,
             };
         }
         catch (Exception ex) when (ex is IOException or TosClientException)
@@ -310,9 +322,20 @@ public sealed class VolcengineTosAudioPublisher : IAsrAudioPublisher
 /// secret key are resolved through the shared secret resolver and are redacted from
 /// <c>config show</c> and the log sinks (<c>docs/CONFIGURATION.md</c> sections 8 and 9).
 /// </summary>
+/// <remarks>
+/// <para>
+/// <see cref="RoleTrn"/> and <see cref="PresignEndpoint"/> are the optional cross-service
+/// authorization pair (issue #59): with an IAM role trusted by <c>speech_asr_prod</c> (the
+/// <c>AucAccessTosRole</c> flow) and a presign endpoint on the bucket's internal host, the
+/// provider-side fetch of <c>audio.url</c> is authorized and billed as internal egress
+/// instead of public. Both are non-secret; the TRN may reach <c>request.json</c>.
+/// </para>
+/// </remarks>
 public sealed record VolcengineTosOptions(
     string Bucket,
     string Region,
     string Endpoint,
     string AccessKey,
-    string SecretKey);
+    string SecretKey,
+    string RoleTrn = "",
+    string PresignEndpoint = "");
