@@ -718,6 +718,8 @@ public class ImportEndToEndTests : IDisposable
     private static IReadOnlyList<string> SessionEventsOf(SessionArtifactPaths paths) =>
         File.ReadAllLines(paths.EventsJsonl)
             .Select(line => JsonDocument.Parse(line).RootElement.GetProperty("event").GetString())
+            .Where(name => name is not null)
+            .Select(name => name!)
             .ToArray();
 
     [Fact]
@@ -752,7 +754,7 @@ public class ImportEndToEndTests : IDisposable
         // Part A keeps the WAV as the upload payload.
         var submitted = Assert.Single(provider.Submissions);
         Assert.Equal("wav", submitted.AudioFormat);
-        Assert.True(submitted.InputArtifactPath.EndsWith("normalized.wav", StringComparison.OrdinalIgnoreCase));
+        Assert.EndsWith("normalized.wav", submitted.InputArtifactPath);
 
         // The lossless WAV is kept (keep_original = true) and the event is recorded.
         Assert.True(File.Exists(paths.ImportAudioFile("normalized.wav")));
@@ -782,7 +784,7 @@ public class ImportEndToEndTests : IDisposable
 
         var submitted = Assert.Single(provider.Submissions);
         Assert.Equal("mp3", submitted.AudioFormat);
-        Assert.True(submitted.InputArtifactPath.EndsWith("compressed.mp3", StringComparison.OrdinalIgnoreCase));
+        Assert.EndsWith("compressed.mp3", submitted.InputArtifactPath);
 
         // Inline-threshold shift: the compressed payload is well under the 20 MiB inline
         // cutoff, so a recording that would need TOS as WAV goes back to inline.
@@ -816,12 +818,12 @@ public class ImportEndToEndTests : IDisposable
         // The WAV is the payload, not the derivative.
         var submitted = Assert.Single(provider.Submissions);
         Assert.Equal("wav", submitted.AudioFormat);
-        Assert.True(submitted.InputArtifactPath.EndsWith("normalized.wav", StringComparison.OrdinalIgnoreCase));
+        Assert.EndsWith("normalized.wav", submitted.InputArtifactPath);
 
         var paths = new SessionArtifactPaths(_dataRoot, "ses_fail");
         var document = new FileSessionArtifactWriter().ReadSessionDocument(paths);
         Assert.NotNull(document);
-        Assert.DoesNotContain(document!.SourceArtifacts, a => a.Role == SourceArtifact.Roles.Compressed);
+        Assert.Null(document!.SourceArtifacts.SingleOrDefault(a => a.Role == SourceArtifact.Roles.Compressed));
         Assert.True(File.Exists(paths.ImportAudioFile("normalized.wav")));
         Assert.Contains(SessionEvents.AudioCompressFailed, SessionEventsOf(paths));
         Assert.DoesNotContain(SessionEvents.AudioCompressed, SessionEventsOf(paths));
